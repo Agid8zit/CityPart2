@@ -1,0 +1,159 @@
+local Command        = require(script.Parent.Command)
+local S3             = game:GetService("ServerScriptService")
+local Bld            = S3.Build
+local Dist           = Bld.Districts
+local Stats          = Dist.Stats
+local Zone           = Bld.Zones
+local ZoneMgr        = Zone.ZoneManager
+
+local ZoneManager    = require(ZoneMgr.ZoneManager)
+local ZoneTracker    = require(ZoneMgr.ZoneTracker)
+local ZoneDisplay    = require(ZoneMgr.ZoneDisplay)
+
+local EconomyService = require(ZoneMgr.EconomyService)
+local XPManager      = require(Stats.XPManager)
+local PlayerDataInterfaceService = require(S3.Services.PlayerDataInterfaceService)
+
+local RS             = game:GetService("ReplicatedStorage")
+local BindableEvents = RS:WaitForChild("Events"):WaitForChild("BindableEvents")
+local ZoneRemovedEvt = BindableEvents:WaitForChild("ZoneRemoved")
+local ZoneCreatedEvt = BindableEvents:WaitForChild("ZoneCreated")
+local ConfirmDelete  = RS.Events.RemoteEvents:WaitForChild("ConfirmDeleteZone")
+
+local DeleteZoneCommand  = {}
+DeleteZoneCommand.__index     = DeleteZoneCommand
+DeleteZoneCommand.__className = "DeleteZoneCommand"
+setmetatable(DeleteZoneCommand, Command)
+
+local COIN_REFUND_WINDOW = 60
+local DEBUG = true
+local function d(...) if DEBUG then print("[DeleteZoneCommand]", ...) end end
+
+--------------------------------------------------------------------- ctor
+function DeleteZoneCommand.new(player, zoneId)
+	local self = setmetatable({}, DeleteZoneCommand)
+	self.player     = player
+	self.zoneId     = zoneId
+	self.zoneData   = nil   -- filled in execute()
+	self.skipQueue  = true  -- run immediately like BuildZoneCommand
+	-- bookkeeping to support symmetric undo
+	self._refundedCoins = false
+	self._returnedExclusive = 0
+	return self
+end
+
+--------------------------------------------------------------------- helpers
+local function computeAgeSeconds(self)
+	-- Prefer a server-authored createdAt on the zone record; fall back to XP timestamp; else "infinite"
+	local createdAt = self.zoneData and self.zoneData.createdAt
+	if type(createdAt) == "number" and createdAt > 0 then
+		return os.time() - createdAt
+	end
+	local t0 = XPManager.getZoneAwardTimestamp(self.player, self.zoneId)
+	if type(t0) == "number" and t0 > 0 then
+		return os.time() - t0
+	end
+	return math.huge
+end
+
+local function removeZone(self)
+	-- ① remove from managers / trackers
+	if ZoneManager.onRemoveZone(self.player, self.zoneId) then
+		-- Trigger XP auto-undo window in XPManager
+		ZoneRemovedEvt:Fire(self.player, self.zoneId, self.zoneData.mode, self.zoneData.gridList)
+
+		-- Server visuals cleanup
+		ZoneDisplay.removeZonePart(self.player, self.zoneId)
+
+		-- ② Financials & exclusives per policy
+		if self.zoneData then
+			local mode     = self.zoneData.mode
+			local gridList = (type(self.zoneData.gridList) == "table") and self.zoneData.gridList or {}
+			local cost     = EconomyService.getCost(mode, #gridList)
+			local age      = computeAgeSeconds(self)
+
+			-- Coins: refund only if within window and it was a coin-priced placement
+			if cost ~= "ROBUX" and type(cost) == "number" and cost > 0 and age <= COIN_REFUND_WINDOW then
+				EconomyService.adjustBalance(self.player, cost)
+				self._refundedCoins = true
+				d(("Coins refunded %d (age=%ds ≤ %ds)"):format(cost, age, COIN_REFUND_WINDOW))
+			else
+				d(("Coins not refunded (cost=%s, age=%ds)"):format(tostring(cost), age))
+			end
+
+			-- Robux-exclusive: ALWAYS return 1 for this delete
+			if EconomyService.isRobuxExclusiveBuilding(mode) then
+				PlayerDataInterfaceService.IncrementExclusiveLocation(self.player, mode, 1)
+				self._returnedExclusive += 1
+				d(("Returned exclusive '%s' x1"):format(tostring(mode)))
+			end
+		end
+
+		-- Client confirmation / FX
+		ConfirmDelete:FireAllClients(self.zoneId, true)
+		self._removed = true
+	else
+		error("DeleteZoneCommand: could not delete "..self.zoneId)
+	end
+end
+
+local function rebuildZone(self)
+	if not self._removed then return end
+
+	-- ① register again (server state)
+	assert(ZoneManager.onAddZone(
+		self.player, self.zoneId, self.zoneData.mode, self.zoneData.gridList),
+		"DeleteZoneCommand: failed restore")
+
+	-- ② fire creation so XPManager awards again (single source of XP)
+	ZoneCreatedEvt:Fire(
+		self.player,
+		self.zoneId,
+		self.zoneData.mode,
+		self.zoneData.gridList,
+		self.zoneData.buildings or {},
+		0
+	)
+
+	-- ③ re-apply *only* what we actually refunded/returned
+	-- Coins: charge back only if we had refunded during delete
+	if self._refundedCoins then
+		local mode     = self.zoneData.mode
+		local gridList = (type(self.zoneData.gridList) == "table") and self.zoneData.gridList or {}
+		local cost     = EconomyService.getCost(mode, #gridList)
+		if type(cost) == "number" and cost > 0 then
+			EconomyService.chargePlayer(self.player, cost)
+			d(("Charged back %d coins on undo"):format(cost))
+		end
+	end
+
+	-- Robux-exclusive: if we returned one on delete, re-consume it now
+	if self._returnedExclusive > 0 then
+		PlayerDataInterfaceService.IncrementExclusiveLocation(self.player, self.zoneData.mode, -self._returnedExclusive)
+		d(("Re-consumed exclusive '%s' x%d on undo"):format(self.zoneData.mode, self._returnedExclusive))
+	end
+
+	self._removed = false
+end
+
+--------------------------------------------------------------------- Command API
+function DeleteZoneCommand:execute()
+	d("execute", self.player.Name, self.zoneId)
+
+	-- cache everything we will need for undo *once*, before deletion
+	self.zoneData = ZoneTracker.getZoneById(self.player, self.zoneId)
+	assert(self.zoneData, "Zone not found: "..tostring(self.zoneId))
+
+	removeZone(self)
+end
+
+function DeleteZoneCommand:undo()
+	d("undo", self.zoneId)
+	rebuildZone(self)
+end
+
+function DeleteZoneCommand:containsZone(z)
+	return z == self.zoneId
+end
+
+return DeleteZoneCommand
