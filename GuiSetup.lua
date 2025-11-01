@@ -1,4 +1,4 @@
--- GuiSetup.client.lua (local script)
+-- GuiSetup.client.lua (enhanced, resilient to late GUI cloning)
 
 -- Init Modules (safe requires)
 local function safeRequire(path: Instance)
@@ -35,6 +35,7 @@ local GUI_TO_INITIALIZE: {[string]: boolean} = {
 	Credits = false,
 	UnlockGui = false,
 	CityName = false,
+	Notifications = true,
 }
 
 -- Tunables
@@ -98,7 +99,18 @@ local function initializeGui(guiName: string, defaultVisible: boolean)
 	if not mod then
 		warn(("[GuiSetup] %s has no usable Logic module"):format(guiName))
 	end
-
+	
+	if guiName == "Notifications" then
+		pcall(function()
+			screenGui.ResetOnSpawn   = false
+			screenGui.IgnoreGuiInset = true
+			screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+			if screenGui.DisplayOrder < 1000 then
+				screenGui.DisplayOrder = 1000
+			end
+		end)
+	end
+	
 	-- Call Init if present
 	try(mod, "Init", screenGui)
 

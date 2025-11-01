@@ -20,36 +20,14 @@ local Balance   = require(Balancing:WaitForChild("BalanceEconomy"))
 -- Events folders (race-proof; create-or-get singletons)
 ---------------------------------------------------------------------
 local EventsFolder = ReplicatedStorage:FindFirstChild("Events")
-if not EventsFolder then
-	EventsFolder = Instance.new("Folder")
-	EventsFolder.Name = "Events"
-	EventsFolder.Parent = ReplicatedStorage
-end
-
 local RemoteEventsFolder = EventsFolder:FindFirstChild("RemoteEvents")
-if not RemoteEventsFolder then
-	RemoteEventsFolder = Instance.new("Folder")
-	RemoteEventsFolder.Name = "RemoteEvents"
-	RemoteEventsFolder.Parent = EventsFolder
-end
-
 local BindableFolder = EventsFolder:FindFirstChild("BindableEvents")
-if not BindableFolder then
-	BindableFolder = Instance.new("Folder")
-	BindableFolder.Name = "BindableEvents"
-	BindableFolder.Parent = EventsFolder
-end
 
 ---------------------------------------------------------------------
 -- Remotes / Bindables API (normalize types)
 ---------------------------------------------------------------------
 -- Client -> Server: menu-driven unlock requests
 local UnlockEvent = RemoteEventsFolder:FindFirstChild("UnlockEvent")
-if not UnlockEvent then
-	UnlockEvent = Instance.new("RemoteEvent")
-	UnlockEvent.Name = "UnlockEvent"
-	UnlockEvent.Parent = RemoteEventsFolder
-end
 
 -- Enforce: RequestAllUnlocks must be a RemoteFunction
 do
@@ -60,41 +38,21 @@ do
 	end
 end
 local RequestAllUnlocks = RemoteEventsFolder:FindFirstChild("RequestAllUnlocks")
-if not RequestAllUnlocks then
-	RequestAllUnlocks = Instance.new("RemoteFunction")
-	RequestAllUnlocks.Name = "RequestAllUnlocks"
-	RequestAllUnlocks.Parent = RemoteEventsFolder
-end
+
 
 -- Server -> Client push when unlocks change
 local UnlocksUpdated = RemoteEventsFolder:FindFirstChild("UnlocksUpdated")
-if not UnlocksUpdated then
-	UnlocksUpdated = Instance.new("RemoteEvent")
-	UnlocksUpdated.Name = "UnlocksUpdated"
-	UnlocksUpdated.Parent = RemoteEventsFolder
-end
+
 
 -- Bindables SaveManager expects
 local GetUnlocksForPlayer = BindableFolder:FindFirstChild("GetUnlocksForPlayer")
-if not GetUnlocksForPlayer then
-	GetUnlocksForPlayer = Instance.new("BindableFunction")
-	GetUnlocksForPlayer.Name = "GetUnlocksForPlayer"
-	GetUnlocksForPlayer.Parent = BindableFolder
-end
+
 
 local SetUnlocksForPlayer = BindableFolder:FindFirstChild("SetUnlocksForPlayer")
-if not SetUnlocksForPlayer then
-	SetUnlocksForPlayer = Instance.new("BindableFunction")
-	SetUnlocksForPlayer.Name = "SetUnlocksForPlayer"
-	SetUnlocksForPlayer.Parent = BindableFolder
-end
+
 
 local UnlockChanged = BindableFolder:FindFirstChild("UnlockChanged")
-if not UnlockChanged then
-	UnlockChanged = Instance.new("BindableEvent")
-	UnlockChanged.Name = "UnlockChanged"
-	UnlockChanged.Parent = BindableFolder
-end
+
 
 -- Optional BE from PlotAssigner
 local PlotAssignedBE = BindableFolder:FindFirstChild("PlotAssignedBE")

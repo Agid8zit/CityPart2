@@ -61,6 +61,13 @@ local _tombstones = {}  -- [userId][zoneId] = os.clock()
 
 local function _uid(p) return p and p.UserId end
 
+local OVERLAY_SILENT_DEFAULT = {
+	power = true, water = true, pipe = true,
+	metro = true, metrotunnel = true, tunnel = true,
+	powerlines = true, powerline = true, waterpipe = true,
+	utility = true,
+}
+
 function ZoneTrackerModule.tombstoneZone(player, zoneId)
 	local uid = _uid(player); if not uid or type(zoneId)~="string" then return end
 	_tombstones[uid] = _tombstones[uid] or {}
@@ -319,6 +326,22 @@ function ZoneTrackerModule.removeZoneById(player, zoneId)
 	return true
 end
 
+-- Canonical wipe: remove every zone via removeZoneById (fires ZoneRemoved with mode+gridList)
+function ZoneTrackerModule.removeAllZonesForPlayer(player)
+	if not isValidPlayer(player) then return 0 end
+	local list = {}
+	for id, _ in pairs(ZoneTrackerModule.getAllZones(player)) do
+		list[#list+1] = id
+	end
+	local removed = 0
+	for _, id in ipairs(list) do
+		if ZoneTrackerModule.removeZoneById(player, id) then
+			removed += 1
+		end
+	end
+	return removed
+end
+
 function ZoneTrackerModule.removeZone(player, zoneId, _mode, _gridList)
 	-- ignore _mode/_gridList; use stored truth
 	return ZoneTrackerModule.removeZoneById(player, zoneId)
@@ -504,28 +527,39 @@ function ZoneTrackerModule.markGridOccupied(player, x, z, occupantType, occupant
 	debugPrint(string.format("Grid (%d, %d) now has occupant '%s' by '%s'.", x, z, occupantType, occupantId))
 end
 
-function ZoneTrackerModule.unmarkGridOccupied(player, x, z, occupantType, occupantId)
+function ZoneTrackerModule.unmarkGridOccupied(player, x, z, occupantType, occupantId, opts)
 	if not (isValidPlayer(player)) then
 		warn("ZoneTrackerModule:unmarkGridOccupied - Invalid player provided.")
 		return
 	end
 	if not (type(x) == "number" and type(z) == "number" and type(occupantType) == "string" and type(occupantId) == "string") then
-		warn("ZoneTrackerModule:unmarkGridOccupied - Invalid parameters. Expected (Player, number, number, string, string).")
+		warn("ZoneTrackerModule:unmarkGridOccupied - Invalid parameters. Expected (Player, number, number, string, string[, table]).")
 		return
 	end
+
+	opts = opts or {}
+	local occTypeLower = string.lower(occupantType)
+	-- Default: overlays quiet; zones/buildings/roads loud unless opts.silent = true.
+	local silentDefault = (occupantType ~= "zone" and occupantType ~= "building" and occTypeLower ~= "road")
+	local silent = (opts.silent == true) or (opts.silent == nil and (OVERLAY_SILENT_DEFAULT[occTypeLower] or silentDefault))
 
 	local userId = player.UserId
 	local grid   = ZoneTrackerModule.occupiedGrid[userId]
 	if not grid then
-		warn("ZoneTrackerModule:unmarkGridOccupied - No occupied grids found for player:", player.Name)
+		if not silent then
+			warn("ZoneTrackerModule:unmarkGridOccupied - No occupied grids found for player:", player.Name)
+		end
 		return
 	end
 
 	local key   = tostring(x)..","..tostring(z)
 	local stack = grid[key]
-	if not stack or #stack == 0 then return end
+	if not stack or #stack == 0 then
+		-- idempotent: nothing to remove
+		return
+	end
 
-	-- First try exact match (old behavior).
+	-- First try exact match.
 	local removed = removeOccupantFromStack(grid, x, z, occupantType, occupantId)
 
 	-- Helper: robust match (prefix-tolerant for zone/building)
@@ -535,40 +569,34 @@ function ZoneTrackerModule.unmarkGridOccupied(player, x, z, occupantType, occupa
 		if type(occId) ~= "string" then return false end
 		if occId == occupantId then return true end
 
-		-- Prefix tolerance:
-		--  - zones often get suffixes (e.g., internal sub-IDs)
-		--  - buildings often carry model/stage suffixes ("/Stage1", "/ResM8", etc.)
 		if occupantType == "zone" then
+			-- Accept prefix match for zones.
 			return occId:sub(1, #occupantId) == occupantId
 		elseif occupantType == "building" then
-			-- Be slightly more forgiving for building IDs:
-			-- accept either occId starts with occupantId OR occupantId starts with occId
-			-- (handles callsites that pass truncated or fully-qualified forms)
+			-- Accept either direction for buildings.
 			return (occId:sub(1, #occupantId) == occupantId) or (occupantId:sub(1, #occId) == occId)
 		end
 		return false
 	end
 
-	-- If exact failed, sweep with tolerant matching
-	if not removed then
+	-- If exact failed, sweep with tolerant matching (zones/buildings only).
+	if not removed and (occupantType == "zone" or occupantType == "building") then
 		for i = #stack, 1, -1 do
 			if matches(stack[i]) then
 				table.remove(stack, i)
 				removed = true
-				-- don't break; in case duplicates exist, clear them all
 			end
 		end
 	end
 
 	if removed then
 		-- prune empty cell
-		if #stack == 0 then
-			grid[key] = nil
-		end
+		if #stack == 0 then grid[key] = nil end
 	else
-		-- Keep the warning (useful signal) but now it’s truly “no stack entry matched”
-		warn(("ZoneTrackerModule:unmarkGridOccupied - No matching occupant at grid: %d %d (wanted %s/%s)")
-			:format(x, z, occupantType, occupantId))
+		if not silent then
+			warn(("ZoneTrackerModule:unmarkGridOccupied - No matching occupant at grid: %d %d (wanted %s/%s)")
+				:format(x, z, occupantType, occupantId))
+		end
 	end
 end
 

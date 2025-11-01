@@ -26,6 +26,7 @@ local BindableEvents       = ReplicatedStorage:WaitForChild("Events"):WaitForChi
 local RemoteEvents         = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents")
 local zoneCreatedEvent     = BindableEvents:WaitForChild("ZoneCreated")
 local notifyZoneCreatedEvt = RemoteEvents:WaitForChild("NotifyZoneCreated")
+local zonePopulatedEvent   = BindableEvents:WaitForChild("ZonePopulated")
 
 --================================================================================
 -- Constructor / (De)Serialization
@@ -41,6 +42,7 @@ function BuildRoadCommand.new(player, startCoord, endCoord, mode)
 	self.cost       = 0
 	self.wasCharged = false
 	self.snapshot   = nil   -- << exact replay payload (segments + decorations)
+	self._zpConn    = nil
 	return self
 end
 
@@ -101,6 +103,16 @@ function BuildRoadCommand:execute()
 			self.snapshot = RoadGeneratorModule.getSnapshot(self.player, self.roadId) or self.snapshot
 		end
 
+		-- one-shot: capture exact snapshot when the generator finishes populating
+		if not self._zpConn then
+			self._zpConn = zonePopulatedEvent.Event:Connect(function(plr, zId)
+				if plr == self.player and zId == self.roadId then
+					self:captureSnapshotNow() -- stores into RoadGenerator + self.snapshot
+					if self._zpConn then self._zpConn:Disconnect(); self._zpConn = nil end
+				end
+			end)
+		end
+
 		notifyZoneCreatedEvt:FireClient(self.player, self.roadId, self.gridList)
 		return
 	end
@@ -155,6 +167,7 @@ function BuildRoadCommand:undo()
 	else
 		warn("[BuildRoadCommand] No roadId to undo.")
 	end
+	if self._zpConn then self._zpConn:Disconnect(); self._zpConn = nil end
 end
 
 --================================================================================

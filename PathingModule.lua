@@ -5,18 +5,18 @@ local ZoneTrackerModule = require(game.ServerScriptService.Build.Zones.ZoneManag
 local GridConfig = require(game.ReplicatedStorage.Scripts.Grid.GridConfig)
 local GridUtil = require(game.ReplicatedStorage.Scripts.Grid.GridUtil)
 
+-- ===================== CONFIG =====================
+-- How should parallel, colinear roads from different groups stitch together?
+--   "never"     -> never stitch parallel/colinear (hard shield)
+--   "endpoints" -> stitch only when BOTH sides are endpoints (default)
+--   "anywhere"  -> stitch at any node (the relaxed behavior that caused the regression)
+local PARALLEL_CONNECT_POLICY = "endpoints"
+-- ==================================================
+
 -- Debug flag + helpers
 local DEBUG = false
-local function dprint(...)
-	if DEBUG then
-		print(...)
-	end
-end
-local function dwarn(...)
-	if DEBUG then
-		warn(...)
-	end
-end
+local function dprint(...) if DEBUG then print(...) end end
+local function dwarn(...)  if DEBUG then warn(...)  end end
 
 -- We'll store zone data in 'roadNetworks'
 -- Also store a 'globalAdjacency' table for BFS across all zones
@@ -103,7 +103,7 @@ end
 
 -- Axis helpers for “parallel shielding”
 local function axisOfStep(a, b)
-	-- EW if x changes, NS if z changes (your roads are ortho)
+	-- EW if x changes, NS if z changes (roads are ortho)
 	if a.x ~= b.x then return "EW" else return "NS" end
 end
 local function axisOfCell(list, i)
@@ -115,6 +115,25 @@ local function isLateralNeighbor(axis, dx, dz)
 	-- For an EW segment, lateral neighbors are up/down (dz≠0).
 	-- For an NS segment, lateral neighbors are left/right (dx≠0).
 	return (axis == "EW" and dz ~= 0) or (axis == "NS" and dx ~= 0)
+end
+
+-- NEW: policy gate for parallel stitching (colinear)
+local function shouldConnectParallel(eMeta, nMeta)
+	if PARALLEL_CONNECT_POLICY == "anywhere" then
+		return true
+	elseif PARALLEL_CONNECT_POLICY == "endpoints" then
+		return (eMeta.role == "End") and (nMeta.role == "End")
+	else -- "never"
+		return false
+	end
+end
+
+-- NEW: allow **lateral** stitches between parallel roads *only at endpoints*.
+-- This is the key fix: let endpoints form Turns/3-Ways with a side-by-side neighbor.
+local function shouldConnectLateralAtEndpoints(eMeta, nMeta)
+	-- If caller sets policy to "never", respect it fully (no lateral even at endpoints).
+	if PARALLEL_CONNECT_POLICY == "never" then return false end
+	return (eMeta.role == "End") or (nMeta.role == "End")
 end
 
 -- NEW: fillLineBetweenCoords (ensures no skipped cells along straight segments)
@@ -146,11 +165,10 @@ local function fillLineBetweenCoords(coords)
 end
 
 -- INTERNAL: addToNetwork
--- Merges new road cells into adjacency for BFS. ENHANCED stitching:
--- * inside-path consecutive edges (as before)
--- * cross-path joins:
---     - perpendicular: allowed anywhere
---     - parallel: allowed when colinear (not lateral), at ANY node (not only endpoints)
+-- Merges new road cells into adjacency for BFS. Stitching policy:
+--   * PERPENDICULAR: allow anywhere
+--   * PARALLEL colinear: policy gate (see shouldConnectParallel)
+--   * PARALLEL lateral: **allow only at endpoints** (see shouldConnectLateralAtEndpoints)
 local function addToNetwork(zoneId, roadCoords)
 	dprint(string.format("[PathingModule] Adding road segments for Road ID '%s'", zoneId))
 
@@ -194,7 +212,7 @@ local function addToNetwork(zoneId, roadCoords)
 		addEdge(nodeKey(roadCoords[i]), nodeKey(roadCoords[i + 1]))
 	end
 
-	-- ENHANCED: stitch to OTHER paths around *every* node with policy described above
+	-- STITCH: to OTHER paths around every node
 	for i, e in ipairs(roadCoords) do
 		local eKey  = nodeKey(e)
 		local eMeta = nodeMeta[eKey]
@@ -211,14 +229,23 @@ local function addToNetwork(zoneId, roadCoords)
 			if nAdj and nMeta and nMeta.groupId ~= eMeta.groupId then
 				local dx, dz = n.x - e.x, n.z - e.z
 				local axesParallel = (nMeta.axis == eMeta.axis)
+
 				if not axesParallel then
-					-- Perpendicular => allow T / 4-way joins
+					-- Perpendicular => allow T/4‑way joins anywhere
 					addEdge(eKey, nKey)
 				else
-					-- Parallel: allow only if colinear (not lateral). No endpoint restriction now.
+					-- Parallel
 					local lateral = isLateralNeighbor(eMeta.axis, dx, dz)
-					if not lateral then
-						addEdge(eKey, nKey)
+					if lateral then
+						-- NEW: allow lateral stitches ONLY at endpoints (one side or both)
+						if shouldConnectLateralAtEndpoints(eMeta, nMeta) then
+							addEdge(eKey, nKey)
+						end
+					else
+						-- Colinear: policy gate
+						if shouldConnectParallel(eMeta, nMeta) then
+							addEdge(eKey, nKey)
+						end
 					end
 				end
 			end
@@ -343,6 +370,41 @@ function PathingModule.findNearestRoadNode(coord, maxManhattan)
 	return best
 end
 
+-- NEW: pass to add lateral stitches at endpoints across ALL currently known networks.
+-- Useful after loading old saves or toggling policy.
+function PathingModule.stitchEndpointLaterals()
+	for eKey, _ in pairs(globalAdjacency) do
+		local eMeta = nodeMeta[eKey]
+		if eMeta then
+			local ex, ez = splitKey(eKey)
+			local candidates
+			if eMeta.axis == "EW" then
+				candidates = {
+					{ x = ex, z = ez - 1 },
+					{ x = ex, z = ez + 1 },
+				}
+			else -- "NS"
+				candidates = {
+					{ x = ex - 1, z = ez },
+					{ x = ex + 1, z = ez },
+				}
+			end
+			for _, n in ipairs(candidates) do
+				local nKey  = nodeKey(n)
+				local nMeta = nodeMeta[nKey]
+				-- Only stitch to another group; require same axis (parallel) and endpoint on either side
+				if nMeta and nMeta.groupId ~= eMeta.groupId and nMeta.axis == eMeta.axis then
+					if shouldConnectLateralAtEndpoints(eMeta, nMeta) then
+						addEdge(eKey, nKey)
+					end
+				end
+			end
+		end
+	end
+	-- graph changed: drop caches
+	PathingModule._ownedDeadEndsCache = {}
+end
+
 -- MAIN ENTRY: we fill missing cells, then add to adjacency, then store direction.
 function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoord)
 	dprint(string.format("[PathingModule] Registering road '%s' of type '%s' with grid coordinates:", zoneId, mode))
@@ -350,6 +412,10 @@ function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoo
 
 	local filledCoords = fillLineBetweenCoords(gridCoords)
 	addToNetwork(zoneId, filledCoords)
+
+	-- NEW: after adding this network, stitch endpoint laterals globally so
+	-- endpoints next to side-by-side roads become connected.
+	PathingModule.stitchEndpointLaterals()
 
 	local overallDirection = PathingModule.determineOverallDirection(startCoord, endCoord)
 	dprint(string.format("[PathingModule] Road '%s' is built in direction: %s", zoneId, overallDirection))

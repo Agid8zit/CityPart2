@@ -677,7 +677,14 @@ function MainGui.Init()
 
 	-- Helper: set city name safely
 	local function _setCityName(name)
-		UI_CityNameLabel.Text = tostring(name or "Unnamed City")
+		local text = ""
+		if typeof(name) == "string" then
+			text = name:gsub("^%s+", ""):gsub("%s+$", "")
+		end
+		if text == "" then
+			text = "Unnamed City"
+		end
+		UI_CityNameLabel.Text = text
 	end
 	_setCityName("...")
 

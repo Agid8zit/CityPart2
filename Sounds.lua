@@ -65,7 +65,7 @@ local AllSounds = {
 		},
 		["PurchaseFail"] = {
 			SoundId = "rbxassetid://4612385808",
-			Volume = 0.7,
+			Volume = 0.2,
 			RollOffMaxDistance = 1,
 			RollOffMinDistance = 1
 		},
@@ -74,7 +74,74 @@ local AllSounds = {
 			Volume = 1,
 			RollOffMaxDistance = 500,
 			RollOffMinDistance = 20
+		},
+		["Build"] = {
+			SoundId = "rbxassetid://6339604994",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["CarHorn"] = {
+			SoundId = "rbxassetid://5945905639",
+			Volume = 0.2,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Siren"] = {
+			SoundId = "rbxassetid://9065275258",
+			Volume = 0.2,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Construction"] = {
+			SoundId = "rbxassetid://922634581",
+			Volume = 0.2,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["CarAmbiance"] = {
+			SoundId = "rbxassetid://115479531446660",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Upgrade"] = {
+			SoundId = "rbxassetid://90007756301452",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Downgrade"] = {
+			SoundId = "rbxassetid://100910483233315",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Error"] = {
+			SoundId = "rbxassetid://91800555512422",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Windmill"] = {
+			SoundId = "rbxassetid://8506795592",
+			Volume = 0.3,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["AirplaneLand"] = {
+			SoundId = "rbxassetid://5037983034",
+			Volume = 0.5,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
+		},
+		["Factory"] = {
+			SoundId = "rbxassetid://125290674958012",
+			Volume = 0.2,
+			RollOffMaxDistance = 500,
+			RollOffMinDistance = 20
 		}
+
 	},
 }
 

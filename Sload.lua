@@ -5,7 +5,7 @@ local DataSizes    = require(script.Parent.DataSizes)
 
 local Sload = {}
 
--- Save: Module → Compressor-encoded → Buffer → (string)
+-- Save: Module → Buffer → (string)
 function Sload.Save(moduleName: string, rawTable: { [number]: table }): string
 	local schema = DataSizes[moduleName]
 	assert(schema, "No DataSizes defined for module: " .. moduleName)
@@ -17,7 +17,7 @@ function Sload.Save(moduleName: string, rawTable: { [number]: table }): string
 			local def = schema[field]
 			local val = entry[field]
 
-			-- Compress value if encoder is defined
+			-- Compress (encode) if requested by schema
 			if def.encode and Compressor[def.encode] then
 				val = Compressor[def.encode](val, def.order or nil)
 			end
@@ -32,11 +32,11 @@ function Sload.Save(moduleName: string, rawTable: { [number]: table }): string
 		end
 	end
 
-	local binary = writer:GetBuffer()
-	return binary
+	return writer:GetBuffer()
 end
 
--- Load helpers (local to this module)
+-- Helpers -----------------------------------------------------
+
 local function _readFixedRowBytes(schema)
 	local bytes = 0
 	for _, field in ipairs(schema.order) do
@@ -48,10 +48,9 @@ local function _readFixedRowBytes(schema)
 	return bytes
 end
 
--- Validate a u8-list that is supposed to be wealth enums (0..2)
+-- Plausibility checks for optional u8 lists -------------------
+
 local function _isPlausibleWealthList(u8list: {number}, coordsCount: number?): boolean
-	-- Accept empty (older saves) or exactly coordsCount entries,
-	-- all values in {0,1,2}.
 	if type(u8list) ~= "table" then return false end
 	local n = #u8list
 	if n == 0 then return true end
@@ -65,8 +64,6 @@ local function _isPlausibleWealthList(u8list: {number}, coordsCount: number?): b
 	return true
 end
 
--- Validate a u8-list that is supposed to be tileFlags.
--- Accept empty (older saves) or exactly coordsCount entries.
 local function _isPlausibleTileFlagsList(u8list: {number}, coordsCount: number?): boolean
 	if type(u8list) ~= "table" then return false end
 	local n = #u8list
@@ -75,40 +72,83 @@ local function _isPlausibleTileFlagsList(u8list: {number}, coordsCount: number?)
 	return true
 end
 
--- Attempt to read a dynamic u8List field; if decode fails or looks implausible,
--- rewind the reader and return nil to signal "absent in this save".
+-- Dynamic string readers -------------------------------------
+
+local function _tryReadDynamicString(reader, countType)
+	local prefixPos = reader._pos
+	local len = reader:ReadAuto(countType)
+	if type(len) ~= "number" or len < 0 then
+		reader._pos = prefixPos
+		return nil
+	end
+
+	local payloadEnd = reader._pos + len - 1
+	if payloadEnd > reader._len then
+		reader._pos = prefixPos
+		return nil
+	end
+
+	return reader:ReadString(len)
+end
+
+-- CRITICAL FIX:
+-- • Try primary countType; if that fails, try legacyCountType (if provided).
+-- • If both fail, DO NOT consume the remaining buffer. Return "" and leave cursor at original position.
+local function _readDynamicStringWithFallback(reader, def, fieldName)
+	local primary = def.countType or "u16"
+	local legacy  = def.legacyCountType
+	local pos0    = reader._pos
+
+	-- Try primary
+	local s = _tryReadDynamicString(reader, primary)
+	if s ~= nil then
+		return s
+	end
+
+	-- Try legacy if specified
+	if legacy and legacy ~= primary then
+		reader._pos = pos0
+		local s2 = _tryReadDynamicString(reader, legacy)
+		if s2 ~= nil then
+			return s2
+		end
+	end
+
+	-- Do not corrupt stream: rewind and return empty
+	reader._pos = pos0
+	warn(("[Sload] Failed to read dynamic string field '%s' (primary=%s, legacy=%s). Treating as empty string.")
+		:format(tostring(fieldName or "?"), tostring(primary), tostring(legacy)))
+	return ""
+end
+
+-- Optional u8List reader with plausibility guard --------------
 local function _tryReadOptionalU8List(reader, def, plausibilityFn, coordsCount)
 	local pos0 = reader._pos
 
-	-- Read raw u8List (with the correct countType)
+	-- Read raw u8List (with specified countType)
 	local okRead, raw = pcall(function()
 		local countType = def.countType or "u16"
 		return reader:ReadAuto(def.type, countType)
 	end)
 	if not okRead then
-		-- Couldn't read a sane list; rewind and treat as absent
 		reader._pos = pos0
 		return nil
 	end
 
-	-- If a decoder exists, decode defensively
+	-- Attempt to decode via Compressor if decoder exists
 	local decoded = raw
 	if def.decode and Compressor[def.decode] then
 		local okDec, out = pcall(Compressor[def.decode], raw, def.order or nil)
 		if okDec then
 			decoded = out
 		else
-			-- Decoder rejected it; plausibility check on raw numbers next
 			decoded = nil
 		end
 	end
 
-	-- If we decoded into strings successfully, accept immediately
+	-- If decoded successfully, minimally check length for wealth lists
 	if decoded and type(decoded) == "table" then
-		-- For wealth, decoded will be strings; for tileFlags, booleans-table list.
-		-- We still sanity-check length when coordsCount is known.
 		if plausibilityFn == _isPlausibleWealthList then
-			-- We decoded to strings; length must match or be zero.
 			if coordsCount and #decoded > 0 and #decoded ~= coordsCount then
 				reader._pos = pos0
 				return nil
@@ -117,9 +157,8 @@ local function _tryReadOptionalU8List(reader, def, plausibilityFn, coordsCount)
 		return decoded
 	end
 
-	-- Fall back to plausibility check on the raw numeric list (pre-decode)
+	-- Fall back to plausibility check on raw numeric list
 	if plausibilityFn(raw, coordsCount) then
-		-- Try decode again but let errors bubble if it's "plausible"
 		if def.decode and Compressor[def.decode] then
 			decoded = Compressor[def.decode](raw, def.order or nil)
 		else
@@ -128,12 +167,11 @@ local function _tryReadOptionalU8List(reader, def, plausibilityFn, coordsCount)
 		return decoded
 	end
 
-	-- Not plausible (likely an older save without this field) → rewind & skip
 	reader._pos = pos0
 	return nil
 end
 
--- Load: Buffer → Reader → Compressor-decoded → Module
+-- Load: Buffer → Reader → rows -------------------------------
 function Sload.Load(moduleName: string, buffer: string): { [number]: table }
 	local schema = DataSizes[moduleName]
 	assert(schema, "No DataSizes defined for module: " .. moduleName)
@@ -141,7 +179,6 @@ function Sload.Load(moduleName: string, buffer: string): { [number]: table }
 	local reader = BufferReader.new(buffer)
 	local out = {}
 
-	-- Bytes needed for the fixed-width portion of one row (guard only)
 	local totalRowBytes = _readFixedRowBytes(schema)
 
 	while reader._pos + totalRowBytes - 1 <= reader._len do
@@ -151,24 +188,21 @@ function Sload.Load(moduleName: string, buffer: string): { [number]: table }
 		for _, field in ipairs(schema.order) do
 			local def = schema[field]
 
-			-- Back-compat: for Zone rows, wealth and tileFlags may be absent in older saves.
+			-- Back-compat for optional u8 lists (older saves may not have them)
 			if moduleName == "Zone" and def.type == "u8List" and (field == "wealth" or field == "tileFlags") then
 				local plausibility = (field == "wealth") and _isPlausibleWealthList or _isPlausibleTileFlagsList
 				local decoded = _tryReadOptionalU8List(reader, def, plausibility, coordsCount)
-
-				if decoded == nil then
-					-- Treat as absent for this row; leave row[field] as an empty list
-					row[field] = {}
-				else
-					row[field] = decoded
-				end
+				row[field] = decoded or {}
 
 			else
-				-- Normal path
 				local val
 				if def.size == "dynamic" then
-					local readSize = def.countType or "u16"
-					val = reader:ReadAuto(def.type, readSize)
+					if def.type == "string" then
+						val = _readDynamicStringWithFallback(reader, def, field)
+					else
+						local readSize = def.countType or "u16"
+						val = reader:ReadAuto(def.type, readSize)
+					end
 				else
 					val = reader:ReadAuto(def.type, def.size)
 				end
@@ -179,14 +213,13 @@ function Sload.Load(moduleName: string, buffer: string): { [number]: table }
 
 				row[field] = val
 
-				-- Track coords length for plausibility checks that follow
 				if field == "coords" and type(val) == "table" then
 					coordsCount = #val
 				end
 			end
 		end
 
-		table.insert(out, row)
+		out[#out+1] = row
 	end
 
 	return out

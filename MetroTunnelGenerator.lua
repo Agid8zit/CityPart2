@@ -36,12 +36,12 @@ zonePopulatedEvent.Name = "ZonePopulated"
 ---------------------------------------------------------------------
 --  Config / constants
 ---------------------------------------------------------------------
--- NOTE: Set this negative if you want the tunnel visually below grade (e.g. -3)
-local Y_OFFSET             = 1
-local OCCUPANT_TYPE        = "metro"         -- distinct occupant type for ZoneTracker
-local ZONE_TYPE            = "MetroTunnel"   -- zone mode label for this generator
-local RES_TTL              = 8.0             -- seconds for per-cell reservation
-local BUILD_INTERVAL       = 0.05            -- gentle yield between placements
+-- Force a single global Y for all metro pieces (independent of terrain/gb)
+local Y_TARGET             = 1.4           -- ALWAYS clamp to this Y
+local OCCUPANT_TYPE        = "metro"       -- distinct occupant type for ZoneTracker
+local ZONE_TYPE            = "MetroTunnel" -- zone mode label for this generator
+local RES_TTL              = 8.0           -- seconds for per-cell reservation
+local BUILD_INTERVAL       = 0.05          -- gentle yield between placements
 
 -- Asset locations (per your provided paths)
 --  - MetroTunnel4 : 4-way/cross (or junction) piece
@@ -88,6 +88,12 @@ end
 local function _uid(p) return p and p.UserId end
 local function _occId(zoneId, gx, gz) return ("%s_metro_%d_%d"):format(zoneId, gx, gz) end
 
+-- Preserve rotation, overwrite Y translation
+local function _withY(cf: CFrame, y: number): CFrame
+	local pos = cf.Position
+	return CFrame.new(pos.X, y, pos.Z) * (cf - cf.Position)
+end
+
 -- Idempotent per-zone pre-clear: remove visuals + zone/quad occupancy for this zone only
 local function _clearZoneFolderAndFootprint(player, zoneId, zoneFolder)
 	for _, child in ipairs(zoneFolder:GetChildren()) do
@@ -106,10 +112,10 @@ local function _clearZoneFolderAndFootprint(player, zoneId, zoneFolder)
 	end
 end
 
--- Return world center for grid cell using global bounds/terrains
+-- Return world center for grid cell using global bounds/terrains (Y clamped)
 local function _cellWorldCenter(plot, gx, gz, gb, terrains)
-	local wx, wy, wz = GridUtils.globalGridToWorldPosition(gx, gz, gb, terrains)
-	return Vector3.new(wx, wy + Y_OFFSET, wz)
+	local wx, _, wz = GridUtils.globalGridToWorldPosition(gx, gz, gb, terrains)
+	return Vector3.new(wx, Y_TARGET, wz)
 end
 
 -- Place a single segment model at a world position, stamp attrs, mark occupancy
@@ -123,12 +129,12 @@ local function _placeSegment(player, zoneId, zoneFolder, prefab, worldPos, gx, g
 
 	if seg:IsA("Model") then
 		if seg.PrimaryPart then
-			seg:SetPrimaryPartCFrame(CFrame.new(worldPos))
+			seg:SetPrimaryPartCFrame(_withY(CFrame.new(worldPos), Y_TARGET))
 		else
-			seg:PivotTo(CFrame.new(worldPos))
+			seg:PivotTo(_withY(CFrame.new(worldPos), Y_TARGET))
 		end
 	else
-		seg.Position = worldPos
+		seg.Position = Vector3.new(worldPos.X, Y_TARGET, worldPos.Z)
 	end
 	seg.Parent = zoneFolder
 
@@ -244,7 +250,6 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 	for _, coord in ipairs(pathCoords or {}) do
 		local handle = select(1, _reserveCell(player, zoneId, coord.x, coord.z))
 		if handle then
-			local key = Vector3.new(coord.x, 0, coord.z)
 			local L = PathSet[Vector3.new(coord.x - 1, 0, coord.z)] or false
 			local R = PathSet[Vector3.new(coord.x + 1, 0, coord.z)] or false
 			local F = PathSet[Vector3.new(coord.x, 0, coord.z + 1)] or false
@@ -269,14 +274,14 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 				seg:SetAttribute("OccId",  _occId(zoneId, coord.x, coord.z))
 
 				if seg:IsA("Model") then
-					local cframe = CFrame.new(pos)
+					local base = _withY(CFrame.new(pos), Y_TARGET)
 					if (L or R) and not (F or B) then
-						seg:PivotTo(cframe * CFrame.Angles(0, math.rad(90), 0)) -- X-axis
+						seg:PivotTo(base * CFrame.Angles(0, math.rad(90), 0)) -- X-axis
 					else
-						seg:PivotTo(cframe) -- Z-axis
+						seg:PivotTo(base) -- Z-axis
 					end
 				else
-					seg.Position = pos
+					seg.Position = Vector3.new(pos.X, Y_TARGET, pos.Z)
 				end
 				seg.Parent = zoneFolder
 
@@ -354,10 +359,11 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 			replacement:SetAttribute("OccId",  occId)
 
 			local pivot = model:GetPivot()
+			local base  = _withY(pivot, Y_TARGET)
 			if isXAxis then
-				replacement:PivotTo(pivot * CFrame.Angles(0, math.rad(90), 0))
+				replacement:PivotTo(base * CFrame.Angles(0, math.rad(90), 0))
 			else
-				replacement:PivotTo(pivot)
+				replacement:PivotTo(base)
 			end
 			replacement.Parent = model.Parent
 			MetroByCoord[coordVec3] = replacement
@@ -371,10 +377,22 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 			replacement:SetAttribute("GridZ",  gz)
 			replacement:SetAttribute("OccId",  occId)
 
-			replacement:PivotTo(model:GetPivot())
+			replacement:PivotTo(_withY(model:GetPivot(), Y_TARGET))
 			replacement.Parent = model.Parent
 			MetroByCoord[coordVec3] = replacement
 			model:Destroy()
+		end
+	end
+
+	-----------------------------------------------------------------
+	-- Final snap: hard-clamp every child to Y_TARGET (defensive)
+	-----------------------------------------------------------------
+	for _, m in ipairs(zoneFolder:GetChildren()) do
+		if m:IsA("Model") then
+			m:PivotTo(_withY(m:GetPivot(), Y_TARGET))
+		elseif m:IsA("BasePart") then
+			local p = m.Position
+			m.Position = Vector3.new(p.X, Y_TARGET, p.Z)
 		end
 	end
 

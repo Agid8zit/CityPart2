@@ -1,3 +1,6 @@
+--!strict
+-- CityNameEndpoints.server.lua
+
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local TextService         = game:GetService("TextService")
@@ -46,8 +49,10 @@ local function ensureRF(name: string): RemoteFunction
 	return rf
 end
 
-local RF_FilterCityName: RemoteFunction  = ensureRF("FilterCityName")
-local RF_ConfirmCityName: RemoteFunction = ensureRF("ConfirmCityName")
+-- Remotes
+local RF_FilterCityName: RemoteFunction      = ensureRF("FilterCityName")
+local RF_ConfirmCityName: RemoteFunction     = ensureRF("ConfirmCityName")
+local RF_FilterNameForViewer: RemoteFunction = ensureRF("FilterNameForViewer") -- NEW (per-viewer)
 
 -- Save hook
 local ManualSaveBE: BindableEvent = (function()
@@ -68,7 +73,7 @@ type ConfirmOk = { ok: true, slotId: string, cityName: string, lastPlayed: numbe
 type ConfirmErr = { ok: false, reason: string, min: number?, max: number? }
 type ConfirmResult = ConfirmOk | ConfirmErr
 
--- Mutex per player
+-- Mutex per player ------------------------------------------------------
 local busy: {[Player]: boolean} = {}
 
 local function withMutex<T>(plr: Player, fn: () -> T, fallback: T): T
@@ -82,92 +87,127 @@ local function withMutex<T>(plr: Player, fn: () -> T, fallback: T): T
 	end
 end
 
--- Filter + validation --------------------------------------------------
-local function filterText(raw: string, fromUserId: number): string
-	if raw == "" then return "" end
-	local ok, result = pcall(function()
-		local res = TextService:FilterStringAsync(raw, fromUserId)
-		return res:GetNonChatStringForBroadcastAsync()
-	end)
-	if ok and typeof(result) == "string" then
-		return result
-	end
-	return ""
-end
-
+-- Validation + Filtering helpers ---------------------------------------
 local MIN_LEN = 3
 local MAX_LEN = 32
-local function isBadName(filtered: string): boolean
-	if filtered == "" then return true end
-	local trimmed = filtered:gsub("^%s+", ""):gsub("%s+$", "")
-	if trimmed:gsub("%s+", "") == "" then return true end
-	local n = #trimmed
+
+local function trimAndNormalize(raw: string): string
+	-- remove control chars, trim ends, collapse whitespace
+	local s = tostring(raw or "")
+	s = s:gsub("[%z\1-\31]", "")             -- strip ASCII control chars
+	s = s:gsub("^%s+", ""):gsub("%s+$", "")  -- trim ends
+	s = s:gsub("%s+", " ")                   -- collapse runs of whitespace
+	return s
+end
+
+local function isBadName(candidate: string): boolean
+	if candidate == "" then return true end
+	local n = (utf8.len(candidate) :: number?) or #candidate
 	return (n < MIN_LEN) or (n > MAX_LEN)
 end
 
--- Remotes --------------------------------------------------------------
+local function looksFiltered(s: string): boolean
+	-- Roblox typically replaces disallowed characters with '#', and may return empty.
+	return (s == "") or (s:find("#") ~= nil)
+end
+
+local function filterBroadcast(raw: string, fromUserId: number): (boolean, string)
+	-- Use PublicChat context when the text will be visible to everyone.
+	if raw == "" then return true, "" end
+	local ok, outOrErr = pcall(function()
+		local res = TextService:FilterStringAsync(raw, fromUserId, Enum.TextFilterContext.PublicChat)
+		return res:GetNonChatStringForBroadcastAsync()
+	end)
+	if not ok then
+		warn("[CityNameEndpoints] filterBroadcast failed: ", outOrErr)
+		return false, ""
+	end
+	return true, outOrErr :: string
+end
+
+local function filterForUser(raw: string, fromUserId: number, toUserId: number): (boolean, string)
+	-- Useful when the text might vary by viewer (age/region).
+	if raw == "" then return true, "" end
+	local ok, outOrErr = pcall(function()
+		local res = TextService:FilterStringAsync(raw, fromUserId, Enum.TextFilterContext.PublicChat)
+		return res:GetNonChatStringForUserAsync(toUserId)
+	end)
+	if not ok then
+		warn("[CityNameEndpoints] filterForUser failed: ", outOrErr)
+		return false, ""
+	end
+	return true, outOrErr :: string
+end
+
+local function ensureSlot(pd: any, plr: Player): string
+	local slotId: string = pd.currentSaveFile or "1"
+	if pd.savefiles and pd.savefiles[slotId] == nil then
+		local fresh = DefaultData.newSaveFile()
+		PlayerDataService.ModifyData(plr, "savefiles/"..slotId, fresh)
+	end
+	return slotId
+end
+
+-- Remotes ---------------------------------------------------------------
 RF_FilterCityName.OnServerInvoke = function(player: Player, raw: any): string
-	local s = tostring(raw or "")
-	return filterText(s, player.UserId)
+	local normalized = trimAndNormalize(tostring(raw or ""))
+	local ok, filtered = filterBroadcast(normalized, player.UserId)
+	if not ok then
+		return ""
+	end
+	return filtered
 end
 
 RF_ConfirmCityName.OnServerInvoke = function(player: Player, rawName: any)
-	-- mutex wrapper you already had, simplified here for brevity:
-	local PlayerDataService: any = require(ServerScriptService.Services.PlayerDataService)
-	local DefaultData: any       = PlayerDataService.GetDefaultData()
+	return withMutex(player, function(): ConfirmResult
+		local pd = PlayerDataService.GetData(player)
+		if not pd then
+			return { ok = false, reason = "no-playerdata" }
+		end
 
-	local function filterText(raw: string, fromUserId: number): string
-		local TextService = game:GetService("TextService")
-		if raw == "" then return "" end
-		local ok, result = pcall(function()
-			local res = TextService:FilterStringAsync(raw, fromUserId)
-			return res:GetNonChatStringForBroadcastAsync()
+		local normalized = trimAndNormalize(tostring(rawName or ""))
+
+		if isBadName(normalized) then
+			return { ok = false, reason = "BAD_NAME", min = MIN_LEN, max = MAX_LEN }
+		end
+
+		-- Strict, non-chat, visible-to-all filtering
+		local okFilter, filtered = filterBroadcast(normalized, player.UserId)
+		if not okFilter or looksFiltered(filtered) then
+			-- Reject rather than saving "####" as the city name.
+			return { ok = false, reason = "REJECTED_BY_FILTER", min = MIN_LEN, max = MAX_LEN }
+		end
+
+		local slotId = ensureSlot(pd, player)
+		local now = os.time()
+
+		-- Compatibility: keep filtered `cityName`, but also store raw+author for re-filtering later.
+		PlayerDataService.ModifySaveData(player, "cityName",            filtered)         -- legacy/compat
+		PlayerDataService.ModifySaveData(player, "cityNameRaw",         normalized)       -- NEW
+		PlayerDataService.ModifySaveData(player, "cityNameAuthorId",    player.UserId)    -- NEW
+		PlayerDataService.ModifySaveData(player, "lastPlayed",          now)
+
+		print(("[CityNameEndpoints] ConfirmCityName OK by %s: '%s' (slot %s)")
+			:format(player.Name, filtered, slotId))
+
+		-- Slight delay to avoid overlapping the SwitchToSlot save in progress
+		task.delay(0.35, function()
+			ManualSaveBE:Fire(player)
 		end)
-		return (ok and typeof(result) == "string") and (result :: string) or ""
+
+		return { ok = true, slotId = slotId, cityName = filtered, lastPlayed = now }
+	end, { ok = false, reason = "busy" })
+end
+
+-- NEW: per-viewer filter you can call to safely display any stored raw text to a specific viewer
+RF_FilterNameForViewer.OnServerInvoke = function(viewer: Player, rawName: any, authorUserId: any): string
+	local normalized = trimAndNormalize(tostring(rawName or ""))
+	local fromId = tonumber(authorUserId) or viewer.UserId
+	local ok, filtered = filterForUser(normalized, fromId, viewer.UserId)
+	if not ok then
+		return ""
 	end
-
-	local MIN_LEN, MAX_LEN = 3, 32
-	local function isBadName(s: string): boolean
-		if s == "" then return true end
-		local t = s:gsub("^%s+",""):gsub("%s+$","")
-		if t:gsub("%s+","") == "" then return true end
-		local n = #t
-		return (n < MIN_LEN) or (n > MAX_LEN)
-	end
-
-	local pd = PlayerDataService.GetData(player)
-	if not pd then
-		return { ok = false, reason = "no-playerdata" }
-	end
-
-	local filtered = filterText(tostring(rawName or ""), player.UserId)
-	if isBadName(filtered) then
-		return { ok = false, reason = "BAD_NAME", min = MIN_LEN, max = MAX_LEN }
-	end
-
-	local slotId: string = pd.currentSaveFile or "1"
-	if pd.savefiles[slotId] == nil then
-		local fresh = DefaultData.newSaveFile()
-		PlayerDataService.ModifyData(player, "savefiles/"..slotId, fresh)
-	end
-
-	local now = os.time()
-	PlayerDataService.ModifySaveData(player, "cityName",   filtered)
-	PlayerDataService.ModifySaveData(player, "lastPlayed", now)
-
-	print(("[CityNameEndpoints] ConfirmCityName OK by %s: '%s' (slot %s)")
-		:format(player.Name, filtered, slotId))
-
-	-- Slight delay to avoid overlapping the SwitchToSlot save in progress
-	local EventsFolder = ReplicatedStorage:WaitForChild("Events")
-	local BindableEvents = EventsFolder:WaitForChild("BindableEvents")
-	local ManualSaveBE = BindableEvents:WaitForChild("ManualSave") :: BindableEvent
-
-	task.delay(0.35, function()
-		ManualSaveBE:Fire(player)
-	end)
-
-	return { ok = true, slotId = slotId, cityName = filtered, lastPlayed = now }
+	return filtered
 end
 
 Players.PlayerRemoving:Connect(function(plr: Player)

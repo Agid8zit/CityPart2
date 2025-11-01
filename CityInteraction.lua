@@ -34,7 +34,8 @@ local _applyLock: { [Player]: { [string]: boolean } } = {}
 local _pendingWealth: { [Player]: { [string]: { [string]: string } } } = {}
 
 -- ==== Tunables / Guardrails ====
-local ADJACENCY_RADIUS = 5 -- default square side (cells) for proximity checks
+local ADJACENCY_RADIUS = 5 -- interpreted as *diameter in cells*; the circular radius is floor(ADJACENCY_RADIUS/2)
+local BULK_REBUILD_THRESHOLD = 4
 
 local DOWNGRADE_GRACE_SEC = 20
 local HYSTERESIS = {
@@ -253,9 +254,14 @@ end
 
 
 local function isNearby(tileA: GridTile, tileB: GridTile, sideLen: number): boolean
-	local half = math.floor(sideLen / 2)
-	return math.abs(tileA.x - tileB.x) <= half
-		and math.abs(tileA.z - tileB.z) <= half
+	-- Convert legacy "side length in cells" to a radius in cells.
+	-- (Keeping existing configs untouched: sideLen is still passed everywhere.)
+	local r = math.max(0, math.floor(sideLen * 0.5))
+
+	-- Euclidean disc test on grid centers: dx^2 + dz^2 <= r^2
+	local dx = tileA.x - tileB.x
+	local dz = tileA.z - tileB.z
+	return (dx*dx + dz*dz) <= (r*r)
 end
 
 local function getWealthThresholdsForMode(mode: string): { Medium: number, Wealthy: number }
@@ -269,6 +275,88 @@ end
 -- ===== Refill queue helpers (ensure single _refillZoneGaps per zone) =====
 local function _cellKey(x: number, z: number): string
 	return tostring(x).."|"..tostring(z)
+end
+
+-- ==== Seed Clustering (proximity-based batching) ====
+local SEED_CLUSTERING = {
+	enabled       = true,   -- turn off to revert to old behavior
+	max_cluster   = 64,     -- hard cap per cluster (your “max bucket size”)
+	diagonal      = false,  -- 4-neighbor connectivity; set true for 8-neighbor
+	yield_between = 0.02,   -- short cooperative yield after each cluster
+}
+
+local function _neighborsFor(x: number, z: number, diagonal: boolean)
+	if diagonal then
+		return {
+			{x+1, z}, {x-1, z}, {x, z+1}, {x, z-1},
+			{x+1, z+1}, {x-1, z+1}, {x+1, z-1}, {x-1, z-1},
+		}
+	else
+		return { {x+1, z}, {x-1, z}, {x, z+1}, {x, z-1} }
+	end
+end
+
+-- Returns { { {x=..,z=..}, ... }, ... } clusters, each <= max_cluster and connected by grid adjacency.
+local function _clusterSeedCells(cells: { {x: number, z: number} }, cfg): { { {x: number, z: number} } }
+	if not (cells and #cells > 0) then return {} end
+	cfg = cfg or SEED_CLUSTERING
+	local diag = cfg.diagonal == true
+	local maxN = math.max(1, math.floor(tonumber(cfg.max_cluster or 64) or 64))
+
+	-- Build a presence map for O(1) membership & a deterministic visit order.
+	local remain: { [string]: {x: number, z: number} } = {}
+	for _, c in ipairs(cells) do remain[_cellKey(c.x, c.z)] = { x = c.x, z = c.z } end
+
+	local clusters = {}
+
+	-- Stable traversal: sort by x,z so runs are deterministic across servers.
+	table.sort(cells, function(a,b) return (a.x < b.x) or (a.x == b.x and a.z < b.z) end)
+
+	for _, seed in ipairs(cells) do
+		local key = _cellKey(seed.x, seed.z)
+		local start = remain[key]
+		if start then
+			remain[key] = nil
+			local queue  = { start }
+			local cursor = 1
+			local pack   = {}
+
+			while cursor <= #queue do
+				local p = queue[cursor]; cursor += 1
+				table.insert(pack, p)
+
+				-- Split oversized components into fixed-size sub-clusters
+				if #pack >= maxN then
+					table.insert(clusters, pack)
+					pack = {}
+				end
+
+				for _, n in ipairs(_neighborsFor(p.x, p.z, diag)) do
+					local nk = _cellKey(n[1], n[2])
+					local nextCell = remain[nk]
+					if nextCell then
+						remain[nk] = nil
+						table.insert(queue, nextCell)
+					end
+				end
+			end
+
+			if #pack > 0 then
+				table.insert(clusters, pack)
+			end
+		end
+	end
+
+	-- Optional: order clusters by their min (x,z) for locality-friendly scheduling
+	table.sort(clusters, function(A,B)
+		local ax, az = math.huge, math.huge
+		for i = 1, #A do local a = A[i]; if a.x < ax or (a.x == ax and a.z < az) then ax, az = a.x, a.z end end
+		local bx, bz = math.huge, math.huge
+		for i = 1, #B do local b = B[i]; if b.x < bx or (b.x == bx and b.z < bz) then bx, bz = b.x, b.z end end
+		return (ax < bx) or (ax == bx and az < bz)
+	end)
+
+	return clusters
 end
 
 local function _pendingAddCells(player: Player, zoneId: string, wealth: string, cells: { { x: number, z: number } }?)
@@ -1220,7 +1308,7 @@ function CityInteractions._flushPendingWealthForZone(player: Player, zoneId: str
 		mode = z and z.mode or "Residential"
 	end
 
-	-- Materialize queued intents
+	-- Materialize queued intents (deduped already as a map)
 	local list = {}
 	for key, wealth in pairs(zoneMap) do
 		local sep = string.find(key, "|", 1, true)
@@ -1229,31 +1317,51 @@ function CityInteractions._flushPendingWealthForZone(player: Player, zoneId: str
 		table.insert(list, { x = x, z = z, wealth = wealth })
 	end
 
-	-- Clear queue for this zone
+	-- Clear queue for this zone before we mutate the world
 	_pendingWealth[player][zoneId] = nil
 	if not next(_pendingWealth[player]) then _pendingWealth[player] = nil end
 
-	-- Compute XP for upward moves at apply-time
+	-- Compute XP for upward moves (mirrors calculateGridUXP batching)
 	local batchXP = 0
-	local statConf = (Balance and Balance.StatConfig and Balance.StatConfig[mode]) or nil
-	if statConf then
-		local TIER = { Poor = 0, Medium = 1, Wealthy = 2 }
-		for _, ch in ipairs(list) do
-			local oldState = ZoneTracker.getGridWealth(player, zoneId, ch.x, ch.z) or "Poor"
-			local delta = (TIER[ch.wealth] or 0) - (TIER[oldState] or 0)
-			if delta > 0 then
-				local cfg = statConf[ch.wealth]
-				local exp = (cfg and cfg.exp) or 0
-				if type(exp) == "number" and exp > 0 then batchXP += exp end
+	do
+		local statConf = (Balance and Balance.StatConfig and Balance.StatConfig[mode]) or nil
+		if statConf then
+			local TIER = { Poor = 0, Medium = 1, Wealthy = 2 }
+			for _, ch in ipairs(list) do
+				local oldState = ZoneTracker.getGridWealth(player, zoneId, ch.x, ch.z) or "Poor"
+				local delta = (TIER[ch.wealth] or 0) - (TIER[oldState] or 0)
+				if delta > 0 then
+					local cfg = statConf[ch.wealth]
+					local exp = (cfg and cfg.exp) or 0
+					if type(exp) == "number" and exp > 0 then batchXP += exp end
+				end
 			end
 		end
 	end
 
-	-- Apply once; gap-fill once
-	CityInteractions._applyWealthBatch(player, zoneId, mode, list)
+	-- If many tiles changed, do an atomic, local bulk rebuild instead of piecemeal applies.
+	if #list >= BULK_REBUILD_THRESHOLD then
+		-- Bulk path recomputes the intent, removes all touching instances in one sweep,
+		-- sets tracker truth, and refills strictly by seeded cells per wealth bucket.
+		CityInteractions.bulkWealthRebuild(player, zoneId)
+		if batchXP > 0 then
+			XPManager.addXP(player, batchXP, zoneId)
+		end
+		_unlock()
+		return
+	end
 
-	if batchXP > 0 then
-		XPManager.addXP(player, batchXP, zoneId)
+	-- Small change set: keep precise per-tile apply pipeline
+	local ok, err = pcall(function()
+		CityInteractions._applyWealthBatch(player, zoneId, mode, list)
+	end)
+	if not ok then
+		warn(("[GridUXP] _applyWealthBatch failed for %s (%d changes): %s")
+			:format(zoneId, #list, tostring(err)))
+	else
+		if batchXP > 0 then
+			XPManager.addXP(player, batchXP, zoneId)
+		end
 	end
 
 	_unlock()
@@ -1370,7 +1478,7 @@ local function computeAggregatePollution(target: ZoneData, neighbors: { ZoneData
 				end
 			end
 		elseif DEBUG_SYNERGY and other.zoneId ~= target.zoneId then
-				print(("[PollutionAgg]   src=%s allowed=%s ignored=%s"):format(other.mode,tostring(_pollutionAllowed(target.mode, other.mode)),tostring(IGNORE_ZONE_TYPES[other.mode] == true)))
+			print(("[PollutionAgg]   src=%s allowed=%s ignored=%s"):format(other.mode,tostring(_pollutionAllowed(target.mode, other.mode)),tostring(IGNORE_ZONE_TYPES[other.mode] == true)))
 		end
 	end
 
@@ -1639,12 +1747,66 @@ function CityInteractions._ensureTileWealthAt(
 	if inst then
 		-- Let the generator do the heavy lifting (origin/coverage math, occupancy, backfill-on-shrink)
 		BuildingGeneratorModule.upgradeGrid(player, zoneId, gx, gz, targetWealth, mode, "Default")
-		return true
+		-- ===========================================================
+		-- FIX 2: re-verify coverage/wealth after upgradeGrid
+		-- (if still wrong/empty, treat as a gap so we will backfill)
+		-- ===========================================================
+		local inst2, wealth2 = CityInteractions._getTileInstanceWealth(player, zoneId, gx, gz)
+		if inst2 and (wealth2 or "Poor") == targetWealth then
+			return true
+		else
+			return false
+		end
 	end
 
 	-- Nothing covers the tile: tell caller this is a gap.
 	return false
 end
+
+-- === NEW (FIX 3): local neighborhood gap sweep ===========================================
+-- Catches newly orphaned tiles created by multi-cell model footprint changes in the small-batch path.
+local LOCAL_GAP_SWEEP_RADIUS_CELLS = 3
+local function _sweepLocalGapsAround(player: Player, zoneId: string, mode: string, changed: { { x: number, z: number, wealth: string } })
+	if not changed or #changed == 0 then return end
+	local z = _getZoneDataFromCache(player, zoneId)
+	if not z then
+		CityInteractions.rebuildCacheFromTracker(player)
+		z = _getZoneDataFromCache(player, zoneId)
+		if not z then return end
+	end
+
+	-- Build fast membership set for this zone’s tiles
+	local zoneSet: { [string]: boolean } = {}
+	for _, t in ipairs(z.gridList) do zoneSet[_tkey(t.x, t.z)] = true end
+
+	local visited: { [string]: boolean } = {}
+	local toFillByWealth: { [string]: { { x: number, z: number } } } = {}
+
+	for _, ch in ipairs(changed) do
+		for x = ch.x - LOCAL_GAP_SWEEP_RADIUS_CELLS, ch.x + LOCAL_GAP_SWEEP_RADIUS_CELLS do
+			for zz = ch.z - LOCAL_GAP_SWEEP_RADIUS_CELLS, ch.z + LOCAL_GAP_SWEEP_RADIUS_CELLS do
+				local key = _tkey(x, zz)
+				if zoneSet[key] and not visited[key] then
+					visited[key] = true
+					local inst, _w = CityInteractions._getTileInstanceWealth(player, zoneId, x, zz)
+					if not inst then
+						-- Use the tracker’s current truth for the wealth we want to refill with.
+						local intended = ZoneTracker.getGridWealth(player, zoneId, x, zz) or "Poor"
+						toFillByWealth[intended] = toFillByWealth[intended] or {}
+						table.insert(toFillByWealth[intended], { x = x, z = zz })
+					end
+				end
+			end
+		end
+	end
+
+	for w, cells in pairs(toFillByWealth) do
+		if cells and #cells > 0 then
+			CityInteractions._fillZoneGapsAtWealth(player, zoneId, mode, w, cells)
+		end
+	end
+end
+-- ===========================================================================================
 
 -- Back-fill any empty tiles in the zone using the requested wealth (uses your exported helper).
 -- SERIALIZED per-(player, zone): queues gap cells and flushes them in-order to ensure only one
@@ -1661,24 +1823,33 @@ function CityInteractions._fillZoneGapsAtWealth(
 		return
 	end
 
-	-- If a refill is already in-flight for this (player, zone), just return; the flusher will pick up the new cells.
+	-- ======================================================
+	-- FIX 4: safe lock init + single in-flight guard
+	-- ======================================================
 	_refillLock[player] = _refillLock[player] or {}
-	if _refillLock[player][zoneId] then return end
-
-	-- Acquire lock and flush queued buckets serially (by wealth).
+	if _refillLock[player][zoneId] then
+		-- already flushing; the pending seeds we just added will be picked up
+		return
+	end
 	_refillLock[player][zoneId] = true
+
 	while _pendingHasAny(player, zoneId) do
 		local wealthToRun, cellsToRun = _pendingPopOne(player, zoneId)
 		if not wealthToRun or not cellsToRun or #cellsToRun == 0 then break end
 
-		-- Forward the seeded cells to the generator (serialized at our level).
-		if type((BuildingGeneratorModule :: any)._refillZoneGaps) == "function" then
-			(BuildingGeneratorModule :: any)._refillZoneGaps(
-				player, zoneId, mode, wealthToRun,
-				nil, "Default",
-				nil,         -- refillSourceZoneId (none from UXP path)
-				cellsToRun   -- ← seeded cells only
-			)
+		-- NEW: cluster & cap batch size
+		local clusters = SEED_CLUSTERING.enabled and _clusterSeedCells(cellsToRun, SEED_CLUSTERING) or { cellsToRun }
+		for _, cluster in ipairs(clusters) do
+			if type((BuildingGeneratorModule :: any)._refillZoneGaps) == "function" then
+				(BuildingGeneratorModule :: any)._refillZoneGaps(
+					player, zoneId, mode, wealthToRun,
+					nil, "Default",
+					nil,         -- refillSourceZoneId (none for UXP path)
+					cluster      -- ← seed whitelist (cluster)
+				)
+			end
+			-- polite yield to keep the server responsive
+			task.wait(SEED_CLUSTERING.yield_between or 0.02)
 		end
 	end
 	_unlockRefill(player, zoneId)
@@ -1714,6 +1885,12 @@ function CityInteractions._applyWealthBatch(
 			CityInteractions._fillZoneGapsAtWealth(player, zoneId, mode, w, cells)
 		end
 	end
+
+	-- =========================================================
+	-- FIX 3: micro-sweep around changed tiles to catch *newly*
+	-- orphaned cells created by multi-cell footprint changes.
+	-- =========================================================
+	_sweepLocalGapsAround(player, zoneId, mode, changes)
 end
 
 -- ===== UXP (with delta-triggered pulse) =====
@@ -1944,6 +2121,25 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 	-- ===== SINGLE COMMIT (atomic apply) =====
 	-- Apply tile intentions by aligning models to intended wealth and filling any gaps at the correct wealth.
 	if #batchChanges > 0 then
+		-- ==========================================================
+		-- FIX 1: consistent bulk cutover (>= threshold, not >)
+		-- ==========================================================
+		if #batchChanges >= BULK_REBUILD_THRESHOLD then
+			dprintUXP(("   [bulk] %d changes meet/exceed threshold (%d) — running bulkWealthRebuild")
+				:format(#batchChanges, BULK_REBUILD_THRESHOLD))
+
+			-- If zone is still populating, queue normal batch and exit; bulk will be run later.
+			if _shouldDeferWealthChanges(player, zoneData.zoneId) then
+				dprintUXP(("   [bulk] zone is populating; deferring %d change(s)"):format(#batchChanges))
+				_queueWealthChanges(player, zoneData.zoneId, batchChanges)
+			else
+				-- Atomic: compute intents, remove all instances touching changed tiles, refill by wealth buckets.
+				CityInteractions.bulkWealthRebuild(player, zoneData.zoneId)
+			end
+			return
+		end
+
+		-- Small change set: keep existing precise per-tile apply pipeline
 		if _shouldDeferWealthChanges(player, zoneData.zoneId) then
 			dprintUXP(("   [defer] zone '%s' is populating; queueing %d change(s) for post-populate")
 				:format(zoneData.zoneId, #batchChanges))
@@ -2061,7 +2257,7 @@ function CityInteractions.onZoneRecreated(player: Player, zoneId: string, mode: 
 	-- Update cache entry for this zone (replace its grid & bbox)
 	local cache = zoneCacheByPlayer[player]
 	if not cache then zoneCacheByPlayer[player] = {} cache = zoneCacheByPlayer[player] end
-		_pollTickCursor[player] = _pollTickCursor[player] or {}
+	_pollTickCursor[player] = _pollTickCursor[player] or {}
 	_pollTickCursor[player][zoneId] = 1
 	local bb = computeBoundingBox(gridList)
 	local found = false
@@ -2165,7 +2361,7 @@ end
 
 -- ===== BindableEvents wiring =====
 do
-	
+
 
 	local zonePopulatedEvent = BindableEvents:WaitForChild("ZonePopulated")
 	zonePopulatedEvent.Event:Connect(function(player: Player, zoneId: string, _placed: any)
@@ -2186,14 +2382,14 @@ do
 			_endPass()
 		end
 	end)
-	
+
 	local zoneCreatedEvent = BindableEvents:WaitForChild("ZoneCreated", 5)
 	if zoneCreatedEvent then
 		(zoneCreatedEvent :: any).Event:Connect(function(player: Player, zoneId: string, mode: string, gridList: { GridTile })
 			CityInteractions.onZoneCreated(player, zoneId, mode, gridList)
 		end)
 	end
-	
+
 
 	local zoneRemovedEvent = BindableEvents:WaitForChild("ZoneRemoved", 5)
 	if zoneRemovedEvent then
@@ -2251,5 +2447,128 @@ Players.PlayerRemoving:Connect(function(plr: Player)
 	_incomePollutionTiles[plr] = nil
 	_pollTickCursor[plr]   = nil
 end)
+
+-- === INTENT-ONLY PASS: compute intended wealth for every tile (no side effects) ===
+function CityInteractions.computeIntendedWealthMap(player: Player, zoneId: string): { [string]: string }
+	local z = (function()
+		local cache = zoneCacheByPlayer[player]
+		if not cache then CityInteractions.rebuildCacheFromTracker(player) cache = zoneCacheByPlayer[player] end
+		if not cache then return nil end
+		for _, item in ipairs(cache) do if item.zoneId == zoneId then return item end end
+		return nil
+	end)()
+	if not z then return {} end
+
+	local wt = getWealthThresholdsForMode(z.mode)
+	local M, W = wt.Medium, wt.Wealthy
+
+	-- prepare neighbor cache once
+	local allZones = zoneCacheByPlayer[player]
+	if not allZones or #allZones == 0 then
+		CityInteractions.rebuildCacheFromTracker(player)
+		allZones = zoneCacheByPlayer[player]
+	end
+
+	local intents = {} -- ["x|z"] = "Poor"|"Medium"|"Wealthy"
+
+	for _, t in ipairs(z.gridList) do
+		-- compute UXP exactly like calculateGridUXP does (best-per-category sum)
+		local bestTierScore: { [string]: number } = {}
+		local bestBuilding:  { [string]: string } = {}
+		for categoryName, _ in pairs(CATEGORY :: any) do bestTierScore[categoryName] = 0 end
+
+		for _, other in ipairs(allZones) do
+			if other.zoneId ~= z.zoneId and (UXP_VALUES :: any)[other.mode] and not UXP_IGNORE_ZONE_TYPES[other.mode] then
+				local w = getInfluenceWidth(other.mode)
+				local bb = other.boundingBox
+				if t.x >= bb.minX - w and t.x <= bb.maxX + w and t.z >= bb.minZ - w and t.z <= bb.maxZ + w then
+					for _, ot in ipairs(other.gridList) do
+						if isNearby(t, ot, w) then
+							for categoryName, set in pairs(CATEGORY :: any) do
+								if set[other.mode] then
+									local tier = (BUILDING_TIERS :: any)[other.mode] or 0
+									if tier > (bestTierScore[categoryName] or 0) then
+										bestTierScore[categoryName] = tier
+										bestBuilding[categoryName]  = other.mode
+									end
+								end
+							end
+							break
+						end
+					end
+				end
+			end
+		end
+
+		local uxpTotal = 0
+		for _, btype in pairs(bestBuilding) do
+			local val = (UXP_VALUES :: any)[btype]
+			if type(val) == "number" then uxpTotal += val end
+		end
+
+		local intended = "Poor"
+		if uxpTotal >= (W + (HYSTERESIS.WealthUp or 0)) then
+			intended = "Wealthy"
+		elseif uxpTotal >= (M + (HYSTERESIS.MediumUp or 0)) then
+			intended = "Medium"
+		end
+		intents[tostring(t.x).."|"..tostring(t.z)] = intended
+	end
+
+	return intents
+end
+
+-- === ATOMIC, ZONE-LOCAL REBUILD ===
+-- Computes intents, finds changes, removes touching instances, refills by wealth, and syncs tracker.
+function CityInteractions.bulkWealthRebuild(player: Player, zoneId: string)
+	-- Resolve mode + grid
+	local z = _getZoneDataFromCache(player, zoneId)
+	if not z then
+		CityInteractions.rebuildCacheFromTracker(player)
+		z = _getZoneDataFromCache(player, zoneId)
+	end
+	if not z then warn("[bulkWealthRebuild] no zone data for "..zoneId) return end
+
+	-- Defer if the zone is currently populating
+	if _shouldDeferWealthChanges(player, zoneId) then
+		warn("[bulkWealthRebuild] zone is populating; try again after ZonePopulated")
+		return
+	end
+
+	-- 1) intents
+	local intents = CityInteractions.computeIntendedWealthMap(player, zoneId)
+
+	-- 2) diff vs tracker to get CHANGED tiles only
+	local changedSet = {}   -- ["x|z"]=true
+	local buckets    = { Poor = {}, Medium = {}, Wealthy = {} }
+	for _, t in ipairs(z.gridList) do
+		local key = _tkey(t.x, t.z)
+		local intended = intents[key]
+		if intended then
+			local curr = ZoneTracker.getGridWealth(player, zoneId, t.x, t.z) or "Poor"
+			if curr ~= intended then
+				changedSet[key] = true
+				table.insert(buckets[intended], { x = t.x, z = t.z })
+			end
+		end
+	end
+	if not next(changedSet) then
+		return -- nothing to do
+	end
+
+	-- 3) collect and remove all instances touching any changed tile
+	local touching = BuildingGeneratorModule.collectInstancesTouchingTiles(player, zoneId, changedSet)
+	BuildingGeneratorModule.bulkRemoveInstances(player, zoneId, touching)
+
+	-- 4) tracker mirror (so later systems see the intended truth immediately)
+	for _, wealth in ipairs({ "Poor", "Medium", "Wealthy" }) do
+		for _, cell in ipairs(buckets[wealth]) do
+			ZoneTracker.setGridWealth(player, zoneId, cell.x, cell.z, wealth)
+		end
+	end
+
+	-- 5) refill per wealth bucket (strict wealth override)
+	BuildingGeneratorModule.seededRefillByWealth(player, zoneId, z.mode, buckets)
+end
 
 return CityInteractions

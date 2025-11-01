@@ -19,8 +19,8 @@ local InputController = require(ReplicatedStorage.Scripts.Controllers.InputContr
 local PlayerDataController = require(ReplicatedStorage.Scripts.Controllers.PlayerDataController)
 
 -- Constants
-local TAB_SELECTED = Color3.fromRGB(255, 170, 0)
-local TAB_UNSELECTED = Color3.fromRGB(255, 255, 255)
+local TAB_SELECTED = Color3.fromRGB(255, 255, 255)
+local TAB_UNSELECTED = Color3.fromRGB(170, 170, 170)
 
 -- Defines
 local LocalPlayer: Player = Players.LocalPlayer
@@ -116,10 +116,16 @@ local function SetTabGamepass()
 	-- Fix Tab Colors
 	UI_TabBtnMoneyCategory.Container.Icon.ImageColor3 = TAB_UNSELECTED
 	UI_TabBtnMoneyCategory.Container.TextLabel.TextColor3 = TAB_UNSELECTED		
-
+	TweenService:Create(UI_TabBtnMoneyCategory.Underline, TweenInfo.new(0.5), {
+		Size = UDim2.new(0, 0, 0, 2)
+	}):Play()
+	
 	UI_TabBtnGamepassCategory.Container.Icon.ImageColor3 = TAB_SELECTED
 	UI_TabBtnGamepassCategory.Container.TextLabel.TextColor3 = TAB_SELECTED
-
+	TweenService:Create(UI_TabBtnGamepassCategory.Underline, TweenInfo.new(0.5), {
+		Size = UDim2.new(1, 0, 0, 2)
+	}):Play()
+	
 	-- Visible Update
 	UI_TabMoneyCategory.Visible = false
 	UI_TabGamepassCategory.Visible = true
@@ -140,10 +146,16 @@ local function SetTabMoney()
 	-- Fix Tab Colors
 	UI_TabBtnMoneyCategory.Container.Icon.ImageColor3 = TAB_SELECTED
 	UI_TabBtnMoneyCategory.Container.TextLabel.TextColor3 = TAB_SELECTED		
-
+	TweenService:Create(UI_TabBtnMoneyCategory.Underline, TweenInfo.new(0.5), {
+		Size = UDim2.new(1, 0, 0, 2)
+	}):Play()
+	
 	UI_TabBtnGamepassCategory.Container.Icon.ImageColor3 = TAB_UNSELECTED
 	UI_TabBtnGamepassCategory.Container.TextLabel.TextColor3 = TAB_UNSELECTED
-
+	TweenService:Create(UI_TabBtnGamepassCategory.Underline, TweenInfo.new(0.5), {
+		Size = UDim2.new(0, 0, 0, 2)
+	}):Play()
+	
 	-- Visible Update
 	UI_TabMoneyCategory.Visible = true
 	UI_TabGamepassCategory.Visible = false
@@ -338,27 +350,29 @@ function PremiumShopGui.Init()
 	end)
 
 	-- Tabs
-	UI_TabBtnMoneyCategory.MouseEnter:Connect(function()
-		TweenService:Create(UI_TabBtnMoneyCategory.Underline, TweenInfo.new(0.15), {
-			Size = UDim2.new(1, 0, 0, 2)
-		}):Play()
-	end)
-	UI_TabBtnMoneyCategory.MouseLeave:Connect(function()
-		TweenService:Create(UI_TabBtnMoneyCategory.Underline, TweenInfo.new(0.15), {
-			Size = UDim2.new(0, 0, 0, 2)
-		}):Play()
+	UI_TabBtnMoneyCategory:GetPropertyChangedSignal("GuiState"):Connect(function()
+		if UI_TabBtnMoneyCategory.GuiState == Enum.GuiState.Hover then
+			TweenService:Create(UI_TabBtnMoneyCategory.Container, TweenInfo.new(0.15), {
+				Position = UDim2.fromScale(0, -0.1)
+			}):Play()
+		else
+			TweenService:Create(UI_TabBtnMoneyCategory.Container, TweenInfo.new(0.15), {
+				Position = UDim2.fromScale(0, 0)
+			}):Play()
+		end
 	end)
 	UI_TabBtnMoneyCategory.MouseButton1Down:Connect(SetTabMoney)
 
-	UI_TabBtnGamepassCategory.MouseEnter:Connect(function()
-		TweenService:Create(UI_TabBtnGamepassCategory.Underline, TweenInfo.new(0.15), {
-			Size = UDim2.new(1, 0, 0, 2)
-		}):Play()
-	end)
-	UI_TabBtnGamepassCategory.MouseLeave:Connect(function()
-		TweenService:Create(UI_TabBtnGamepassCategory.Underline, TweenInfo.new(0.15), {
-			Size = UDim2.new(0, 0, 0, 2)
-		}):Play()
+	UI_TabBtnGamepassCategory:GetPropertyChangedSignal("GuiState"):Connect(function()
+		if UI_TabBtnGamepassCategory.GuiState == Enum.GuiState.Hover then
+			TweenService:Create(UI_TabBtnGamepassCategory.Container, TweenInfo.new(0.15), {
+				Position = UDim2.fromScale(0, -0.1)
+			}):Play()
+		else
+			TweenService:Create(UI_TabBtnGamepassCategory.Container, TweenInfo.new(0.15), {
+				Position = UDim2.fromScale(0, 0)
+			}):Play()
+		end
 	end)
 	UI_TabBtnGamepassCategory.MouseButton1Down:Connect(SetTabGamepass)
 

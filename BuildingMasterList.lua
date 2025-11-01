@@ -2532,6 +2532,48 @@ local buildings = {
 					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
 					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
 				},
+				{
+					name = "HComP19",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComP20",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComP21",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComP22",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComP23",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComP24",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
 			},
 			Medium = {
 				{
@@ -2993,6 +3035,48 @@ local buildings = {
 				},
 				{
 					name = "HComW36",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW37",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW38",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW39",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW40",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW41",
+					tier = 3,
+					cost = { money = 3000, metal = 50 },
+					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
+					requirements = { power = 15, water = 25, happiness = 0, jobs = 0, population = 5 },
+				},
+				{
+					name = "HComW42",
 					tier = 3,
 					cost = { money = 3000, metal = 50 },
 					stats = { wealthGeneration = 25, happinessIncrease = 15, wealthCost = 5 },
@@ -4279,6 +4363,50 @@ function BuildingMasterList.getRoadsByStyle(style)
 	return populatedList
 end
 
+function BuildingMasterList._autoscanIndividual(style: string, subfolder: string)
+	local individualRoot = BuildingFolder:FindFirstChild("Individual")
+	if not individualRoot then
+		warn("BuildingMasterList: 'Individual' folder missing under Buildings.")
+		return {}
+	end
+
+	local styleFolder = individualRoot:FindFirstChild(style)
+	if not styleFolder then
+		warn(string.format("BuildingMasterList: Style '%s' not found under 'Individual'.", style))
+		return {}
+	end
+
+	local container = styleFolder:FindFirstChild(subfolder)
+	if not container then
+		warn(string.format("BuildingMasterList: Subfolder '%s' not found under 'Individual' > '%s'.", subfolder, style))
+		return {}
+	end
+
+	local out = {}
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Model") or child:IsA("Folder") then
+			local name = child.Name
+			-- Reuse your Stage loader; it already knows how to find Stage3 for Individual.
+			local stages = BuildingMasterList.loadBuildingStages("Individual", style, name)
+			if stages and stages.Stage3 then
+				-- Create a lightweight def; you can enrich from Attributes if you want.
+				local def = {
+					name = name,
+					tier = 1,
+					stats = {},          -- optionally: pull from child:GetAttributes()
+					requirements = {},   -- optionally: pull from child:GetAttributes()
+					stages = stages,
+				}
+				table.insert(out, def)
+			else
+				warn(string.format("BuildingMasterList: Auto-scan found '%s' but Stage3 missing.", name))
+			end
+		end
+	end
+
+	return out
+end
+
 --Individual Buildings
 function BuildingMasterList.getIndividualBuildingsByType(individualType, style)
 	local individual = buildings.Individual
@@ -4334,11 +4462,15 @@ function BuildingMasterList.getIndividualBuildingByName(individualType, style, b
 
 	local buildingList = styleFolder[individualType]
 	if not buildingList then
-		warn(string.format(
-			"BuildingMasterList: Individual type '%s' does not exist under style '%s' in 'Individual'.",
-			individualType, style
-			))
-		return {}
+		-- Fallback to auto-scan the folder on disk (e.g., 'Flags', 'Landmark', etc.)
+		buildingList = BuildingMasterList._autoscanIndividual(style, individualType)
+		if #buildingList == 0 then
+			warn(string.format(
+				"BuildingMasterList: No table entries and no models found for Individual type '%s' under style '%s'.",
+				individualType, style
+				))
+			return {}
+		end
 	end
 
 	for _, building in ipairs(buildingList) do

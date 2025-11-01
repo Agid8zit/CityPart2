@@ -6,7 +6,6 @@ NetworkManager.__index = NetworkManager
 ----------------------------------------------------------------------
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local RunService         = game:GetService("RunService")
 local ZoneTrackerModule  = require(script.Parent.Parent.Zones.ZoneManager.ZoneTracker)
 
 ----------------------------------------------------------------------
@@ -25,46 +24,14 @@ local USE_DIAGONAL_ADJ  = true           -- keep 8-way; set false for 4-way stri
 local POST_TICK_RESCAN  = true           -- one-shot deferred rescan after add
 local USE_ZONE_TRACKER_FALLBACK = false  -- keep false to avoid “any zone” ambiguity
 
--- Final rebuild wheel (3 phases → 120° apart)
-local REBUILD_WHEEL_DIV = 3
-
 -- Road source coordinate – any road zone that contains this grid
 -- acts as the single "source" for the Road network.
 local ROAD_SOURCE_COORD = { x = 0, z = 0 }
 
 ----------------------------------------------------------------------
---  Reload gating from SaveManager (if present)
-----------------------------------------------------------------------
-local WorldReloadActiveByUid = {}
-
-do
-	local WorldReloadBeginBE = BE:FindFirstChild("WorldReloadBegin")
-	local WorldReloadEndBE   = BE:FindFirstChild("WorldReloadEnd")
-
-	if WorldReloadBeginBE and WorldReloadBeginBE:IsA("BindableEvent") then
-		WorldReloadBeginBE.Event:Connect(function(player)
-			if player and player.UserId then WorldReloadActiveByUid[player.UserId] = true end
-		end)
-	end
-	if WorldReloadEndBE and WorldReloadEndBE:IsA("BindableEvent") then
-		WorldReloadEndBE.Event:Connect(function(player)
-			if player and player.UserId then
-				WorldReloadActiveByUid[player.UserId] = nil
-				-- Schedule a phased rebuild offset by 120° per phase
-				NetworkManager.schedulePhasedRebuildForPlayer(player)
-			end
-		end)
-	end
-end
-
-local function isReloading(player)
-	return player and WorldReloadActiveByUid[player.UserId] == true
-end
-
-----------------------------------------------------------------------
 --  Private helpers
 ----------------------------------------------------------------------
-local warnOnce = {}  -- [msg] = true  (cleared after delay)
+local warnOnce     = {}            -- [msg] = true  (cleared after delay)
 
 local function dPrint(...)
 	if DEBUG_LOGS then
@@ -81,7 +48,9 @@ local function wPrint(msg)
 end
 
 -- compact grid key
-local function keyXZ(x, z) return tostring(x).."|"..tostring(z) end
+local function keyXZ(x, z)
+	return tostring(x) .. "|" .. tostring(z)
+end
 
 -- Safe extractor for coord {x=?, z=?}
 local function getXZ(coord)
@@ -98,7 +67,9 @@ local function zoneContainsCoord(zoneData, gx, gz)
 	if typeof(gl) ~= "table" then return false end
 	for _, c in ipairs(gl) do
 		local x, z = getXZ(c)
-		if x and z and x == gx and z == gz then return true end
+		if x and z and x == gx and z == gz then
+			return true
+		end
 	end
 	return false
 end
@@ -155,7 +126,9 @@ local function uf_union(uf, x, y)
 end
 
 ----------------------------------------------------------------------
---  Zone‑type lookup tables
+--  Zone‑type lookup tables (names used verbatim)
+--  (Buildings are members so they can belong to a component;
+--   infra is a subset used for cell-level connectivity)
 ----------------------------------------------------------------------
 local waterNetworkModes = {
 	WaterTower=true, WaterPipe=true, WaterPlant=true,
@@ -172,6 +145,7 @@ local powerNetworkModes = {
 	ResDense=true,   CommDense=true,  IndusDense=true,
 }
 
+-- Infra predicates for cell-level DSU
 local function isWaterInfra(mode)
 	return mode == "WaterTower" or mode == "WaterPipe" or mode == "WaterPlant"
 		or mode == "PurificationWaterPlant" or mode == "MolecularWaterPlant"
@@ -266,61 +240,6 @@ local function deindexZoneCells(net, zoneId, gridList)
 end
 
 ----------------------------------------------------------------------
---  Reset / bulk rebuild helpers (used by phased rebuild)
-----------------------------------------------------------------------
-local function _resetNetworkFor(player, networkType)
-	local net = ensurePlayerNetwork(player, networkType)
-	net.zones     = {}
-	net.adjacency = {}
-	net.unionFind = { parent = {}, rank = {} }
-	net.cells     = {}
-	net.ufCells   = nil
-	return net
-end
-
--- Bulk rebuild a single type from ZoneTracker (no isReloading gate, no per-add churn)
-local function _bulkRebuildTypeFromScratch(player, networkType)
-	local net = _resetNetworkFor(player, networkType)
-	local all = ZoneTrackerModule.getAllZones(player)
-
-	-- 1) Index zones and cells
-	for zid, z in pairs(all) do
-		if NetworkManager.isZonePartOfNetwork(z, networkType) then
-			net.zones[zid]     = z
-			net.adjacency[zid] = {}
-			indexZoneCells(net, zid, z.gridList)
-		end
-	end
-
-	-- 2) Build adjacency + union at zone-level
-	for zid, z in pairs(net.zones) do
-		NetworkManager.updateZoneConnections(player, zid, z, networkType) -- unions as it goes
-	end
-
-	-- 3) Finalize DSUs
-	NetworkManager.rebuildUnionFind(player, networkType)      -- zone-level
-	NetworkManager.rebuildCellUnionFind(player, networkType)  -- cell-level
-
-	return net
-end
-
--- Immediate (non-wheel) phased rebuild: Road -> Water -> Power
-function NetworkManager.rebuildAllForPlayerPhased(player)
-	if not (player and player:IsA("Player")) then return end
-	local pid = player.UserId
-	NetworkManager.networks[pid] = NetworkManager.networks[pid] or {}
-
-	local road  = _bulkRebuildTypeFromScratch(player, "Road")
-	for zid, zdata in pairs(road.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-
-	local water = _bulkRebuildTypeFromScratch(player, "Water")
-	for zid, zdata in pairs(water.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-
-	local power = _bulkRebuildTypeFromScratch(player, "Power")
-	for zid, zdata in pairs(power.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-end
-
-----------------------------------------------------------------------
 --  Cell-level connectivity (per-network cell DSU)
 ----------------------------------------------------------------------
 function NetworkManager.rebuildCellUnionFind(player, networkType)
@@ -348,19 +267,23 @@ function NetworkManager.rebuildCellUnionFind(player, networkType)
 		end
 	end
 
-	-- 2) connect neighbour infra cells
+	-- 2) connect neighbour infra cells (4‑ or 8‑way depending on USE_DIAGONAL_ADJ)
 	for k, _ in pairs(present) do
 		local xs, zs = k:match("([^|]+)|([^|]+)")
 		local x, z = tonumber(xs), tonumber(zs)
 		for _, off in ipairs(adjacentOffsets) do
 			local nk = keyXZ(x + off[1], z + off[2])
-			if present[nk] then uf_union(uf, k, nk) end
+			if present[nk] then
+				uf_union(uf, k, nk)
+			end
 		end
 	end
 
 	-- 3) compute source roots
 	local roots = {}
-	for _, k in ipairs(sourceCells) do roots[uf_find(uf, k)] = true end
+	for _, k in ipairs(sourceCells) do
+		roots[uf_find(uf, k)] = true
+	end
 
 	-- store
 	net.ufCells = { parent = uf.parent, rank = uf.rank, present = present, sourceRoots = roots }
@@ -385,7 +308,6 @@ end
 --  Public: add / remove
 ----------------------------------------------------------------------
 function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
-	if isReloading(player) then return end  -- stay quiet during reload
 	local net = ensurePlayerNetwork(player, networkType)
 
 	-- Register zone
@@ -411,6 +333,8 @@ function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
 				and NetworkManager.networks[player.UserId][networkType].zones[zoneId]
 			if stillHere then
 				NetworkManager.updateZoneConnections(player, zoneId, zoneData, networkType)
+				-- Cell DSU is topology based; adding connections does not change present cells,
+				-- but rebuild anyway to be explicit & future-safe.
 				NetworkManager.rebuildCellUnionFind(player, networkType)
 			end
 		end)
@@ -425,9 +349,6 @@ function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
 end
 
 function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
-	-- If reloading, skip heavy work; a full reset follows
-	if isReloading(player) then return end
-
 	local pnets = NetworkManager.networks[player.UserId]
 	local net = pnets and pnets[networkType]
 	if not (net and net.zones[zoneId]) then return end
@@ -441,7 +362,9 @@ function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
 		if list then
 			for i = 1, #list do
 				local nid = list[i]
-				if nid and nid ~= zoneId then neighbours[#neighbours+1] = nid end
+				if nid and nid ~= zoneId then
+					neighbours[#neighbours+1] = nid
+				end
 			end
 		end
 	end
@@ -469,7 +392,9 @@ function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
 	-- notify surviving neighbours so downstream systems rescan
 	for _, nid in ipairs(neighbours) do
 		local nz = net.zones[nid]
-		if nz then NetworkReadyEvent:Fire(player, nid, nz) end
+		if nz then
+			NetworkReadyEvent:Fire(player, nid, nz)
+		end
 	end
 end
 
@@ -560,6 +485,7 @@ function NetworkManager.isSourceZone(zoneData, networkType)
 			or m == "GeothermalPowerPlant"
 			or m == "NuclearPowerPlant"
 	elseif networkType == "Road" then
+		-- treat whichever road zone contains ROAD_SOURCE_COORD as the source
 		if m == "DirtRoad" or m == "Pavement" or m == "Highway" then
 			return zoneContainsCoord(zoneData, ROAD_SOURCE_COORD.x, ROAD_SOURCE_COORD.z)
 		end
@@ -650,8 +576,11 @@ local function onZoneAdded(player, zoneId, zoneData)
 		relevant = true
 	end
 
-	-- Only notify in live play, not during reload
-	if relevant and not isReloading(player) then
+	if DEBUG_LOGS and not relevant and zoneData and zoneData.mode then
+		dPrint(("Unrecognized mode on add: %s"):format(tostring(zoneData.mode)))
+	end
+
+	if relevant then
 		NetworkReadyEvent:Fire(player, zoneId, zoneData)
 	end
 end
@@ -662,7 +591,6 @@ local function onZoneCreated(player, zoneId, mode, gridList)
 end
 
 local function onZoneRemoved(player, zoneId, mode, gridList)
-	if isReloading(player) then return end -- skip heavy churn during reload; full reset follows
 	local dummy = { zoneId = zoneId, mode = mode }
 	if NetworkManager.isZonePartOfNetwork(dummy, "Water") then
 		NetworkManager.removeZoneFromNetwork(player, zoneId, "Water")
@@ -685,9 +613,6 @@ do
 	end
 end
 
-----------------------------------------------------------------------
---  Legacy non-phased rebuild (kept for tooling)
-----------------------------------------------------------------------
 function NetworkManager.rebuildAllForPlayer(player)
 	local pid = player.UserId
 
@@ -714,7 +639,7 @@ function NetworkManager.rebuildAllForPlayer(player)
 	NetworkManager.rebuildUnionFind(player, "Power")
 	NetworkManager.rebuildUnionFind(player, "Road")
 
-	-- Pass 3: notify downstream
+	-- Pass 3: notify downstream (ZoneRequirementsChecker listens to NetworkReady)
 	for networkType, net in pairs(NetworkManager.networks[pid]) do
 		for zid, zdata in pairs(net.zones) do
 			NetworkReadyEvent:Fire(player, zid, zdata)
@@ -727,7 +652,6 @@ end
 ----------------------------------------------------------------------
 Players.PlayerRemoving:Connect(function(plr)
 	local pid = plr.UserId
-	NetworkManager._phasedJobs[pid] = nil
 	NetworkManager.networks[pid] = nil
 end)
 
@@ -774,79 +698,5 @@ function NetworkManager.getZoneData(player, zoneId, networkType)
 	if not net then return nil end
 	return net.zones[zoneId]
 end
-
-----------------------------------------------------------------------
---  120°-offset phased scheduler (Road → Water → Power)
-----------------------------------------------------------------------
-NetworkManager._phasedJobs = {}  -- [pid] = { tasks = { {phase,bucket}, ... } }
-
-local _wheelIndex = 0
-local function _baseBucketForPlayer(player)
-	-- stable, deterministic split into 3 buckets
-	return ((player.UserId % REBUILD_WHEEL_DIV) + 1)
-end
-local function _bucketOffset(b, off)
-	-- wrap into 1..REBUILD_WHEEL_DIV
-	return (((b - 1 + (off % REBUILD_WHEEL_DIV)) % REBUILD_WHEEL_DIV) + 1)
-end
-
--- Public: schedule a 3‑phase rebuild staggered by 120°
-function NetworkManager.schedulePhasedRebuildForPlayer(player)
-	if not (player and player:IsA("Player")) then return end
-	local pid = player.UserId
-	local base = _baseBucketForPlayer(player)
-
-	NetworkManager._phasedJobs[pid] = {
-		player = player,
-		tasks = {
-			{ phase = "Road",  bucket = base },
-			{ phase = "Water", bucket = _bucketOffset(base, 1) },
-			{ phase = "Power", bucket = _bucketOffset(base, 2) },
-		}
-	}
-	if DEBUG_LOGS then
-		dPrint(("Scheduled phased rebuild for %s @ buckets [%d, %d, %d]")
-			:format(player.Name,
-				base, _bucketOffset(base,1), _bucketOffset(base,2)))
-	end
-end
-
--- Wheel: advance 1 → 2 → 3 → 1 ...
-RunService.Heartbeat:Connect(function()
-	_wheelIndex = (_wheelIndex % REBUILD_WHEEL_DIV) + 1
-
-	for pid, job in pairs(NetworkManager._phasedJobs) do
-		local player = job.player or Players:GetPlayerByUserId(pid)
-		if not player then
-			NetworkManager._phasedJobs[pid] = nil
-		else
-			local tasks = job.tasks
-			local i = 1
-			while i <= #tasks do
-				local t = tasks[i]
-				if t.bucket == _wheelIndex then
-					if t.phase == "Road" then
-						local net = _bulkRebuildTypeFromScratch(player, "Road")
-						for zid, zdata in pairs(net.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-					elseif t.phase == "Water" then
-						local net = _bulkRebuildTypeFromScratch(player, "Water")
-						for zid, zdata in pairs(net.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-					elseif t.phase == "Power" then
-						local net = _bulkRebuildTypeFromScratch(player, "Power")
-						for zid, zdata in pairs(net.zones) do NetworkReadyEvent:Fire(player, zid, zdata) end
-					end
-					table.remove(tasks, i)
-					-- Only one task per player can match a given bucket (by design)
-				else
-					i += 1
-				end
-			end
-			if #tasks == 0 then
-				NetworkManager._phasedJobs[pid] = nil
-				if DEBUG_LOGS then dPrint(("Phased rebuild complete for %s"):format(player.Name)) end
-			end
-		end
-	end
-end)
 
 return NetworkManager

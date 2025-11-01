@@ -11,12 +11,110 @@ local CC = S3.Build.Zones.CoreConcepts.PowerGen
 local PowerLinePath = require(CC.PowerLinePath)
 local PowerGeneratorModule = require(CC.PowerGenerator)
 
--- Commands (for standard “Zone_<uid>_<n>” creation path)  -- ADD
-local CmdRoot                = S3.Build.Zones.Commands      -- ADD
-local PlayerCommandManager   = require(CmdRoot.PlayerCommandManager) -- ADD
-local BuildZoneCommand       = require(CmdRoot.BuildZoneCommand)     -- ADD
+-- Commands (for standard “Zone_<uid>_<n>” creation path)
+local CmdRoot                = S3.Build.Zones.Commands
+local PlayerCommandManager   = require(CmdRoot.PlayerCommandManager)
+local BuildZoneCommand       = require(CmdRoot.BuildZoneCommand)
 
 local Players = game:GetService("Players")
+
+-- Grid helpers (we need world positions for power-line cells)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GridScripts  = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Grid")
+local GridUtils    = require(GridScripts:WaitForChild("GridUtil"))
+local GridConfig   = require(GridScripts:WaitForChild("GridConfig"))
+
+local function _getGlobalBoundsForPlot(plot)
+	local terrains = {}
+	local unlocks  = plot:FindFirstChild("Unlocks")
+	if unlocks then
+		for _, zone in ipairs(unlocks:GetChildren()) do
+			for _, seg in ipairs(zone:GetChildren()) do
+				if seg:IsA("BasePart") and seg.Name:match("^Segment%d+$") then
+					table.insert(terrains, seg)
+				end
+			end
+		end
+	end
+	local testTerrain = plot:FindFirstChild("TestTerrain")
+	if #terrains == 0 and testTerrain then
+		table.insert(terrains, testTerrain)
+	end
+	return GridConfig.calculateGlobalBounds(terrains), terrains
+end
+
+-- Power path helpers
+local function _powerSegmentsFor(zoneId)
+	local net = PowerLinePath.getLineNetworks()[zoneId] or PowerLinePath.getLineData(zoneId) or {}
+	return net.segments or net.pathCoords or {}
+end
+
+local function _allPowerZoneIdsOnPlot(player)
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+	if not plot then return {} end
+	local pf = plot:FindFirstChild("PowerLines"); if not pf then return {} end
+	local out = {}
+	for _, zf in ipairs(pf:GetChildren()) do
+		if zf:IsA("Folder") then table.insert(out, zf.Name) end
+	end
+	return out
+end
+
+-- Return nearest power-line cell (grid + world) to the given grid (gx,gz) across ONE power zone
+local function _nearestCellForPowerZone(player, powerZoneId, gx, gz)
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return nil end
+	local gb, terrains = _getGlobalBoundsForPlot(plot)
+
+	local best, bestCell = math.huge, nil
+	for _, s in ipairs(_powerSegmentsFor(powerZoneId)) do
+		local x = (s.coord and s.coord.x) or s.x
+		local z = (s.coord and s.coord.z) or s.z
+		if x and z then
+			local d = math.abs(x - gx) + math.abs(z - gz) -- grid Manhattan
+			if d < best then best, bestCell = d, {x = x, z = z} end
+		end
+	end
+	if not bestCell then return nil end
+	local wx, wy, wz = GridUtils.globalGridToWorldPosition(bestCell.x, bestCell.z, gb, terrains)
+	return bestCell, Vector3.new(wx, wy, wz), best
+end
+
+-- From all power zones, pick the single (powerZoneId, nearestCellWorld) best for a given building origin grid
+local function _nearestPowerLineForBuilding(player, gx, gz)
+	local ids = _allPowerZoneIdsOnPlot(player); if #ids == 0 then return nil end
+	local best = { dist = math.huge }
+	for _, pzid in ipairs(ids) do
+		local cell, world, d = _nearestCellForPowerZone(player, pzid, gx, gz)
+		if cell and d < best.dist then
+			best = { powerZoneId = pzid, world = world, cell = cell, dist = d }
+		end
+	end
+	return (best.powerZoneId and best) or nil
+end
+
+-- Choose the single best building inside a building zone for a given power zone
+local function _chooseBestBuildingForPowerZone(player, zoneId, powerZoneId)
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return nil end
+	local populated = plot:FindFirstChild("Buildings") and plot.Buildings:FindFirstChild("Populated"); if not populated then return nil end
+	local zoneFolder = populated:FindFirstChild(zoneId); if not zoneFolder then return nil end
+
+	local best = { dist = math.huge }
+	for _, bld in ipairs(zoneFolder:GetChildren()) do
+		if (bld:IsA("Model") or bld:IsA("BasePart"))
+			and bld:GetAttribute("ZoneId") == zoneId
+			and bld:FindFirstChild("ConcretePad")
+		then
+			local gx, gz = bld:GetAttribute("GridX"), bld:GetAttribute("GridZ")
+			if gx and gz then
+				local cell, world, d = _nearestCellForPowerZone(player, powerZoneId, gx, gz)
+				if cell and d < best.dist then
+					best = { building = bld, targetWorld = world, dist = d }
+				end
+			end
+		end
+	end
+	return (best.building and best) or nil
+end
 
 -- List of Building Zones (to avoid crossover with roads, utilities, etc.)
 local buildingZoneTypes = {
@@ -99,6 +197,12 @@ local buildingZoneTypes = {
 	WindTurbine = true,
 }
 
+-- Helper: treat listed modes AND dynamic "Flag:<Name>" as building modes
+local function isBuildingMode(mode : string)
+	if buildingZoneTypes[mode] then return true end
+	return type(mode)=="string" and string.sub(mode,1,5)=="Flag:"
+end
+
 local zoneCreatedEvent   = BindableEvents:WaitForChild("ZoneCreated")
 local zoneRemovedEvent   = BindableEvents:WaitForChild("ZoneRemoved")
 local zoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
@@ -144,6 +248,35 @@ local function _nextMetroEntranceZoneId(player)
 	return ZoneTrackerModule.getNextZoneId(player, prefix)
 end
 
+-- Helper: pick the nearest power line zone to a given building origin grid.
+local function _nearestPowerZoneIdToGrid(player, gx, gz)
+	if not (player and gx and gz) then return nil end
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+	if not plot then return nil end
+
+	local pf = plot:FindFirstChild("PowerLines")
+	if not pf then return nil end
+
+	local bestId, bestDist
+	for _, zf in ipairs(pf:GetChildren()) do
+		if zf:IsA("Folder") then
+			local net  = PowerLinePath.getLineNetworks()[zf.Name] or PowerLinePath.getLineData(zf.Name) or {}
+			local segs = net.segments or net.pathCoords or {}
+			for _, s in ipairs(segs) do
+				local x = (s.coord and s.coord.x) or s.x
+				local z = (s.coord and s.coord.z) or s.z
+				if x and z then
+					local d = math.abs(x - gx) + math.abs(z - gz) -- Manhattan distance in grid-space
+					if not bestDist or d < bestDist then
+						bestDist, bestId = d, zf.Name
+					end
+				end
+			end
+		end
+	end
+	return bestId
+end
+
 -- Does this building zone overlap ANY power line path?
 local function _zoneTouchesAnyPowerLine(player, zoneGridList)
 	local set = _gridSet(zoneGridList)
@@ -172,31 +305,48 @@ zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
 	-- Look up the zone to know its mode and gridList
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
 	if not z then return end
-	if not buildingZoneTypes[z.mode] then return end
+	if not isBuildingMode(z.mode) then return end
 
 	-- Only bother if this zone actually overlaps at least one power line path
 	if not _zoneTouchesAnyPowerLine(player, z.gridList or {}) then return end
 
-	-- Walk that zone’s populated folder and spawn pad poles on eligible buildings
 	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
 	local populated = plot:FindFirstChild("Buildings") and plot.Buildings:FindFirstChild("Populated"); if not populated then return end
 	local zoneFolder = populated:FindFirstChild(zoneId); if not zoneFolder then return end
 
+	-- Choose the single best building + power line pair (closest grid → closest path cell)
+	local bestChoice = nil
 	for _, bld in ipairs(zoneFolder:GetChildren()) do
 		if (bld:IsA("Model") or bld:IsA("BasePart"))
 			and bld:GetAttribute("ZoneId") == zoneId
 			and bld:FindFirstChild("ConcretePad")
-			and not bld:FindFirstChild("PadPole")            -- idempotent
 		then
-			-- nil prefab => module uses its default
-			BuildingGeneratorModule.spawnPadPowerPoles(bld, nil, {
-				ZoneId = zoneId,
-				GridX  = bld:GetAttribute("GridX"),
-				GridZ  = bld:GetAttribute("GridZ"),
-			})
-			-- NOTE: PowerGeneratorModule already listens to PadPoleSpawned and will auto-bridge
+			local gx, gz = bld:GetAttribute("GridX"), bld:GetAttribute("GridZ")
+			if gx and gz then
+				local pick = _nearestPowerLineForBuilding(player, gx, gz)
+				if pick and (not bestChoice or pick.dist < bestChoice.dist) then
+					bestChoice = {
+						building     = bld,
+						powerZoneId  = pick.powerZoneId,
+						targetWorld  = pick.world,
+						dist         = pick.dist
+					}
+				end
+			end
 		end
 	end
+
+	if not bestChoice then return end
+
+	-- Force a guaranteed, directed spawn on that building
+	BuildingGeneratorModule.spawnPadPowerPoles(bestChoice.building, nil, {
+		ZoneId          = zoneId,
+		GridX           = bestChoice.building:GetAttribute("GridX"),
+		GridZ           = bestChoice.building:GetAttribute("GridZ"),
+		PowerLineZoneId = bestChoice.powerZoneId, -- ownership
+		ForceSpawn      = true,                   -- << guarantee 100%
+		TargetWorldPos  = bestChoice.targetWorld, -- << choose corner nearest to the line
+	})
 end)
 
 local function _hasZoneOfModeAt(player, coord, wantMode)
@@ -229,7 +379,7 @@ zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predefin
 		return  -- tunnel isn’t a building zone
 	end
 
-	if buildingZoneTypes[mode] then
+	if isBuildingMode(mode) then
 		PowerGeneratorModule.suppressPolesOnGridList(player, zoneId, gridList)
 		local zoneData = ZoneTrackerModule.getZoneById(player, zoneId)
 		if not zoneData then
@@ -276,42 +426,32 @@ linesPlacedEvent.Event:Connect(function(player, powerZoneId)
 			local otherId = ZoneTrackerModule.getOtherZoneIdAtGrid(player, ox, oz, powerZoneId)
 			if otherId and otherId ~= powerZoneId then
 				local z = ZoneTrackerModule.getZoneById(player, otherId)
-				if z and buildingZoneTypes[z.mode] then
+				if z and isBuildingMode(z.mode) then
 					touchedBldZoneIds[otherId] = true
 				end
 			end
 		end
 	end
 
-	-- 2) For each building zone touched by this power line, spawn pad-poles on its buildings
+	-- 2) For each building zone touched by this power line, spawn exactly one pad‑pole on its nearest building
 	for bldZoneId, _ in pairs(touchedBldZoneIds) do
-		local folder = populated:FindFirstChild(bldZoneId)
-		if folder then
-			for _, bld in ipairs(folder:GetChildren()) do
-				if (bld:IsA("Model") or bld:IsA("BasePart"))
-					and bld:GetAttribute("ZoneId") == bldZoneId
-					and bld:FindFirstChild("ConcretePad")
-					and not bld:FindFirstChild("PadPole")    -- idempotent
-				then
-					-- nil polePrefab is fine; the module defaults to its prefab
-					BuildingGeneratorModule.spawnPadPowerPoles(bld, nil, {
-						ZoneId = bldZoneId,
-						GridX  = bld:GetAttribute("GridX"),
-						GridZ  = bld:GetAttribute("GridZ"),
-					})
-				end
-			end
+		local pick = _chooseBestBuildingForPowerZone(player, bldZoneId, powerZoneId)
+		if pick and pick.building then
+			BuildingGeneratorModule.spawnPadPowerPoles(pick.building, nil, {
+				ZoneId          = bldZoneId,
+				GridX           = pick.building:GetAttribute("GridX"),
+				GridZ           = pick.building:GetAttribute("GridZ"),
+				PowerLineZoneId = powerZoneId,     -- ownership
+				ForceSpawn      = true,            -- << guarantee 100%
+				TargetWorldPos  = pick.targetWorld -- << choose corner nearest to this power line
+			})
 		end
 	end
-
-	-- (Optional) if you also want utility buildings to get padpoles, uncomment:
-	-- local utilities = populated:FindFirstChild("Utilities")
-	-- if utilities then ... same loop as above ...
 end)
 
 -- When a zone is removed, only remove buildings if it's truly a building zone.
 zoneRemovedEvent.Event:Connect(function(player, zoneId, mode, gridList)
-	if buildingZoneTypes[mode] then
+	if isBuildingMode(mode) then
 		-- Use the snapshot provided by ZoneTracker (this is the ONLY reliable mask)
 		local removedGrid = gridList or {}
 

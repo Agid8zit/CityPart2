@@ -45,7 +45,7 @@ DefaultData.SaveFile = {
 	},
 
 	-- Basic info
-	cityName   = "My City",
+	cityName   = "",
 	lastPlayed = 0, -- set at creation in newSaveFile()
 	xp         = 0,
 	cityLevel  = 0,
@@ -55,7 +55,7 @@ DefaultData.SaveFile = {
 
 	-- Economy
 	economy = {
-		money        = 0,
+		money        = 30000,
 		bustickets   = 0,
 		planetickets = 0,
 	},
@@ -125,7 +125,7 @@ function DefaultData.newSaveFile(): table
 	sf.UniqueBuildings = {}
 
 	sf.economy = {
-		money        = 0,
+		money        = 3000000,
 		bustickets   = 0,
 		planetickets = 0,
 	}
@@ -135,7 +135,9 @@ function DefaultData.newSaveFile(): table
 		busDepot = makeTransitNode(),
 		airport  = makeTransitNode(),
 	}
-
+	
+	sf.cityName = ""
+	
 	sf.exclusiveLocations = {
 		FirePrecinct        = 0,
 		PolicePrecinct      = 0,

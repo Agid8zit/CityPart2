@@ -140,10 +140,10 @@ do
 	-- Compatibility: “does myType block otherType?”
 	-- Goal: buildings and water co-exist; water blocks only water.
 	local _BLOCKS = {
-		building = { building = true }, -- building vs building blocks
+		building = { building = true, road = true }, -- ⬅ block buildings when roads pre‑reserve tiles
 		water    = { water    = true }, -- water vs water blocks (avoid duplicates)
 		power    = { power    = true }, -- future: power vs power blocks; power vs building allowed
-		road     = { road     = true }, -- keep roads self-consistent; overlay with others is up to callers
+		road     = { road     = true, building = false }, -- roads may co‑reserve where a building is in-flight
 	}
 
 	-- per-player store: _R[uid][key] = { reservation, ... }

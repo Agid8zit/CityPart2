@@ -2,7 +2,6 @@
 
 local DataSizes = {
 
-	
 	--  PER-ZONE INFORMATION  (one Zone record per zone the player owns)
 	Zone = {
 		order = { "id", "mode", "coords", "flags", "wealth", "tileFlags", "buildings"},
@@ -45,10 +44,18 @@ local DataSizes = {
 			decode    = "DecodeTileFlagsList",
 		},
 
-		buildings = { type="string", size="dynamic", countType="u16" }, -- JSON blob of predefined buildings
+		-- IMPORTANT:
+		--   • New saves write a u32 length prefix.
+		--   • We still *read* legacy u16 safely to avoid silent corruption.
+		--   • If you truly don't want legacy, you can drop legacyCountType later,
+		--     but leaving it in does not harm new saves.
+		buildings = {
+			type            = "string",
+			size            = "dynamic",
+			countType       = "u32",   -- current format
+		},
 	},
 
-	
 	--  EXACT ROAD SNAPSHOT (per road-zone)
 	RoadSnapshot = {
 		order = { "zoneId", "snapshot" },
@@ -56,7 +63,6 @@ local DataSizes = {
 		snapshot = { size = "dynamic", type = "string", countType = "u32" }, -- JSON snapshot of segments/decos
 	},
 
-	
 	--  PLAYER-LEVEL CURRENCIES (single row per player)
 	--  No Economy module required; this is the canonical save.
 	PlayerEconomy = {
@@ -68,14 +74,12 @@ local DataSizes = {
 		busTickets   = { size = 4, type = "u32" },
 	},
 
-	
 	--  UNLOCK KEYS (tiny rows)
 	Unlock = {
 		order = { "name" },
 		name = { size = 24, type = "string" },
 	},
 
-	
 	--  FILE HEADER / FOOTER
 	Metadata = {
 		order = { "version", "timestamp" },

@@ -260,6 +260,11 @@ local ZoneTypes = {
 		displayName = "Police Station",
 		gridType = "PoliceStation",
 	},
+	-- Flags (category)
+	Flags = {
+		displayName = "Flags",
+		gridType = "Flags",
+	},
 	--Sports
 	ArcheryRange = {
 		displayName = "Archery Range",
@@ -361,6 +366,19 @@ function ZoneManager.onSelectZoneType(player, zoneType)
 	debugPrint("Player", player.Name, "selected zone type:", zoneType)
 
 	local selectedZone = ZoneTypes[zoneType]
+	
+	local isDynamicFlag = (type(zoneType)=="string" and zoneType:sub(1,5)=="Flag:")
+	if isDynamicFlag then
+		playerModes[player.UserId] = zoneType
+		local gridType = "Flags"
+		if displayGridEvent then
+			displayGridEvent:FireClient(player, gridType)
+			debugPrint("'DisplayGrid' event fired to player:", player.Name, "GridType:", gridType)
+		else
+			warn("DisplayGrid RemoteEvent not found")
+		end
+		return
+	end
 
 	if selectedZone then
 		playerModes[player.UserId] = zoneType

@@ -58,6 +58,47 @@ local TEMP_ALARM_BUDGET_MS         = 4      -- soft time budget per update call
 local TEMP_ALARM_YIELD_EVERY_OPS   = 200    -- yield cadence for large batches
 local LOAD_AWARE_SKIP_TEMP_ALARMS  = true   -- skip temp alarms during world reload
 
+-- >>> ADDED: definitive requirement name mapping for defensive checks
+local REQ_NAME_FOR_ALARM = {
+	AlarmRoad  = "Road",
+	AlarmWater = "Water",
+	AlarmPower = "Power",
+}
+
+-- >>> ADDED: last-writer-wins sequencing to eliminate stale re-adds
+local AlarmSeq     = {} -- [uid][zoneId][alarmType] = seq
+local TempAlarmSeq = {} -- [uid][zoneId][alarmType] = seq
+local function _getSeq(tbl, player, zoneId, alarmType)
+	local uid = player and player.UserId
+	if not uid then return 0 end
+	local a = tbl[uid]; if not a then return 0 end
+	local b = a[zoneId]; if not b then return 0 end
+	return b[alarmType] or 0
+end
+local function _bumpSeq(tbl, player, zoneId, alarmType)
+	local uid = player and player.UserId
+	if not uid then return 0 end
+	tbl[uid] = tbl[uid] or {}
+	tbl[uid][zoneId] = tbl[uid][zoneId] or {}
+	local nextSeq = (tbl[uid][zoneId][alarmType] or 0) + 1
+	tbl[uid][zoneId][alarmType] = nextSeq
+	return nextSeq
+end
+local function _setSeq(tbl, player, zoneId, alarmType, seq)
+	local uid = player and player.UserId
+	if not uid then return end
+	tbl[uid] = tbl[uid] or {}
+	tbl[uid][zoneId] = tbl[uid][zoneId] or {}
+	tbl[uid][zoneId][alarmType] = seq
+end
+local function _clearSeqsForZone(player, zoneId)
+	local uid = player and player.UserId
+	if not uid then return end
+	if AlarmSeq[uid]     then AlarmSeq[uid][zoneId]     = nil end
+	if TempAlarmSeq[uid] then TempAlarmSeq[uid][zoneId] = nil end
+end
+-- ========================================================================
+
 -- Track world-reload windows fired by SaveManager (if present)
 local WorldReloadActiveByUid = {}
 
@@ -67,22 +108,69 @@ do
 
 	if WorldReloadBeginBE and WorldReloadBeginBE:IsA("BindableEvent") then
 		WorldReloadBeginBE.Event:Connect(function(player)
-			if player and player.UserId then WorldReloadActiveByUid[player.UserId] = true end
+			if player and player.UserId then
+				WorldReloadActiveByUid[player.UserId] = true
+				-- >>> ADDED: on reload begin, also clear alarm sequences for safety
+				_clearSeqsForZone(player, "ALL_ZONES_SEQ_SENTINEL") -- noop pattern; just keeping symmetry
+			end
 		end)
 	end
 	if WorldReloadEndBE and WorldReloadEndBE:IsA("BindableEvent") then
 		WorldReloadEndBE.Event:Connect(function(player)
-			if player and player.UserId then WorldReloadActiveByUid[player.UserId] = nil end
+			if player and player.UserId then
+				WorldReloadActiveByUid[player.UserId] = nil
+				-- >>> ADDED: sequences not strictly needed to clear here since zone-wise clears happen elsewhere
+			end
 		end)
 	end
 end
 
-local function isReloading(player)
-	return player and WorldReloadActiveByUid [player.UserId] == true
+local AGGREGATE_CACHE_TTL = 0.25
+local aggregateTotalsCache = {}
+local aggregateProductionCache = {}
+
+local function copyAggregate(src)
+	local dest = { water = 0, power = 0 }
+	if src then
+		dest.water = tonumber(src.water) or 0
+		dest.power = tonumber(src.power) or 0
+	end
+	return dest
 end
+
+local function getAggregateCache(cache, player)
+	if not (player and player.UserId) then return nil end
+	local entry = cache[player.UserId]
+	if not entry then return nil end
+
+	local now = os.clock()
+	if entry.expiry and entry.expiry > now then
+		return copyAggregate(entry.value)
+	end
+
+	cache[player.UserId] = nil
+	return nil
+end
+
+local function setAggregateCache(cache, player, totals)
+	if not (player and player.UserId) then return end
+	cache[player.UserId] = {
+		value = copyAggregate(totals),
+		expiry = os.clock() + AGGREGATE_CACHE_TTL,
+	}
+end
+
+local function invalidateAggregateCaches(player)
+	if not (player and player.UserId) then return end
+	aggregateTotalsCache[player.UserId] = nil
+	aggregateProductionCache[player.UserId] = nil
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	invalidateAggregateCaches(player)
+end)
+
 -- ========================================================================
-
-
 
 local function getGlobalBoundsForPlot(plot)
 	local cached = boundsCache[plot]
@@ -165,7 +253,6 @@ end
 local getProductionSynergyWidth
 local computeProductionMultiplierForProducer
 
-
 -- Component-aware production/requirement for a seed zone's network.
 -- Uses DSU from NetworkManager + ProductionConfig for sources + DSM stats for demand.
 local function getComponentBudget(player, seedZoneId, networkType, opts)
@@ -231,7 +318,6 @@ local function getComponentBudget(player, seedZoneId, networkType, opts)
 
 	return produced, required
 end
-
 
 -- === Deferred production gate for recreates ===
 local function getProductionSnapshot(player)
@@ -322,7 +408,6 @@ function ZoneRequirementsChecker.isBuildingZone(mode)
 	return buildingZoneTypes[mode] == true
 end
 
-
 local powerInfrastructureModes = {
 	PowerLines           = true,
 	SolarPanels          = true,
@@ -393,7 +478,6 @@ end
 local function detachSharedBobbing(part)
 	ActiveAlarms[part] = nil
 end
-
 
 local function borrowAlarm(templateFolder, alarmType)
 	AlarmPool[alarmType] = AlarmPool[alarmType] or {}
@@ -504,9 +588,10 @@ local function invalidateZoneCache(player, zoneId)
 	if zoneRequirementCache[userId] and zoneRequirementCache[userId][zoneId] then
 		zoneRequirementCache[userId][zoneId] = nil
 	end
+	invalidateAggregateCaches(player)
+	-- >>> ADDED: clear sequencing for this zone to avoid cross-talk
+	_clearSeqsForZone(player, zoneId)
 end
-
-
 
 local function _postPopulationRecheck(player, zoneId)
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
@@ -627,9 +712,13 @@ function ZoneRequirementsChecker.flushPendingAlarms(player, zoneId)
 	end
 
 	debugPrint("Flushing pending alarms for zone", zoneId, "in priority order Road→Water→Power")
-	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmRoad" , toList(roadSet))
-	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmWater", toList(waterSet))
-	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmPower", toList(powerSet))
+	-- >>> ADDED: pass last-writer-wins sequence
+	local seqR = _bumpSeq(AlarmSeq, player, zoneId, "AlarmRoad")
+	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmRoad" , toList(roadSet), seqR)
+	local seqW = _bumpSeq(AlarmSeq, player, zoneId, "AlarmWater")
+	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmWater", toList(waterSet), seqW)
+	local seqP = _bumpSeq(AlarmSeq, player, zoneId, "AlarmPower")
+	ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmPower", toList(powerSet), seqP)
 
 	pendingAlarms[userId][zoneId] = nil
 end
@@ -934,15 +1023,28 @@ end
 ----------------------------------------------------------------------
 -- Normal alarm update (only when populated)
 ----------------------------------------------------------------------
-function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, unsatisfiedCoords)
+function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, unsatisfiedCoords, seq)
+	-- >>> ADDED: last-writer-wins gate
+	local current = _getSeq(AlarmSeq, player, zoneId, alarmType)
+	if seq and seq < current then
+		if DEBUG then
+			print(("[ZoneReq] Ignoring stale %s update for %s (seq %d < %d)"):format(alarmType, zoneId, seq, current))
+		end
+		return
+	end
+	if seq and seq > current then
+		_setSeq(AlarmSeq, player, zoneId, alarmType, seq)
+	end
+
 	-- If zone is NOT populated, store in pending and bail out
 	if not isZonePopulated(player, zoneId) then
 		debugPrint("Zone NOT populated, storing alarm coords for later:", alarmType, zoneId)
 		storePendingAlarms(player, zoneId, alarmType, unsatisfiedCoords)
 
 		if SHOW_POPULATING_ALARMS and SHOW_TEMP_FROM_INFRA_EVENTS then
+			local tseq = _bumpSeq(TempAlarmSeq, player, zoneId, alarmType) -- >>> ADDED
 			ZoneRequirementsChecker.updateTempTileAlarms(
-				player, zoneId, alarmType, unsatisfiedCoords, unsatisfiedCoords
+				player, zoneId, alarmType, unsatisfiedCoords, unsatisfiedCoords, tseq
 			)
 		end
 		return
@@ -983,9 +1085,16 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 		return false
 	end
 
+	-- >>> ADDED: build 'needed' from unsatisfiedCoords, but confirm with ZoneTracker (defensive truth check)
 	local needed = {}
-	for _, c in ipairs(unsatisfiedCoords) do
-		if not hasHigherAlarm(c.x, c.z) then
+	local reqName = REQ_NAME_FOR_ALARM[alarmType]
+	for _, c in ipairs(unsatisfiedCoords or {}) do
+		local missing = true
+		if reqName then
+			local v = ZoneTrackerModule.getTileRequirement(player, zoneId, c.x, c.z, reqName)
+			missing = (v == false)
+		end
+		if missing and not hasHigherAlarm(c.x, c.z) then
 			needed[string.format("%d_%d", c.x, c.z)] = true
 		end
 	end
@@ -994,6 +1103,7 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], needed)
 	end
 
+	-- Remove any existing parts of this type that are no longer needed
 	for _, child in ipairs(zoneModel:GetChildren()) do
 		if child:IsA("BasePart") and child.Name:sub(1, #alarmType) == alarmType then
 			local gx, gz = child.Name:match("^"..alarmType.."_([%-0-9]+)_([%-0-9]+)$")
@@ -1006,19 +1116,19 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 		end
 	end
 
-	for _, c in ipairs(unsatisfiedCoords) do
-		local key  = c.x.."_"..c.z
-		if needed[key] then
-			local name = string.format("%s_%d_%d", alarmType, c.x, c.z)
-			if not zoneModel:FindFirstChild(name) then
-				local basePos = gridToWorld(playerPlot, c.x, c.z) + Vector3.new(0,6,0)
-				local alarm   = borrowAlarm(templateFolder, alarmType)
-				if alarm then
-					alarm.Name     = name
-					alarm.Parent   = zoneModel
-					alarm.Position = basePos
-					startBobbing(alarm, basePos)
-				end
+	-- Place required alarms
+	for k, _ in pairs(needed) do
+		local x, z = k:match("^([%-0-9]+)_([%-0-9]+)$")
+		x, z = tonumber(x), tonumber(z)
+		local name = string.format("%s_%d_%d", alarmType, x, z)
+		if not zoneModel:FindFirstChild(name) then
+			local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0,6,0)
+			local alarm   = borrowAlarm(templateFolder, alarmType)
+			if alarm then
+				alarm.Name     = name
+				alarm.Parent   = zoneModel
+				alarm.Position = basePos
+				startBobbing(alarm, basePos)
 			end
 		end
 	end
@@ -1046,14 +1156,28 @@ local function indexTempAlarmFolder(tempFolder)
 end
 
 -- TEMP alarm updater (pre-population only) (REPLACED)
-function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType, unsatisfiedCoords, scopeCoords)
+function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType, unsatisfiedCoords, scopeCoords, seq)
 	if not SHOW_POPULATING_ALARMS then return end
 	if not player or not zoneId or not alarmType then return end
+
+	-- >>> ADDED: last-writer-wins for temp alarms
+	local current = _getSeq(TempAlarmSeq, player, zoneId, alarmType)
+	if seq and seq < current then
+		if DEBUG then
+			print(("[ZoneReq] Ignoring stale TEMP %s update for %s (seq %d < %d)"):format(alarmType, zoneId, seq, current))
+		end
+		return
+	end
+	if seq and seq > current then
+		_setSeq(TempAlarmSeq, player, zoneId, alarmType, seq)
+	end
 
 	-- Skip temp alarms entirely while SaveManager is doing a progressive world reload
 	if LOAD_AWARE_SKIP_TEMP_ALARMS and WorldReloadActiveByUid[player.UserId] then
 		return
 	end
+
+	if isZonePopulated(player, zoneId) then return end
 
 	local zoneModel, playerPlot = getZoneModelFor(player, zoneId)
 	if not (zoneModel and playerPlot) then return end
@@ -1172,7 +1296,6 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 		maybeYield()
 	end
 end
-
 
 ----------------------------------------------------------------------
 -- 5) CREATE THE GLOBAL SPATIAL GRIDS
@@ -1330,7 +1453,7 @@ computeProductionMultiplierForProducer = function(player: Player, producerZoneId
 	elseif seen.Commercial  then delta += (deltas.Commercial  or 0) end
 
 	if seen.IndusDense  then delta += (deltas.IndusDense  or 0)
-	elseif seen.Industrial then delta += (deltas.Industrial or 0) end
+	elseif seen.Industrial  then delta += (deltas.Industrial or 0) end
 
 	-- Clamp total delta
 	local minMul = 1.0 - maxPenalty
@@ -1343,6 +1466,10 @@ end
 
 function ZoneRequirementsChecker.getEffectiveProduction(player: Player)
 	-- Sum all producer zones for this player using production multipliers.
+
+	local cached = getAggregateCache(aggregateProductionCache, player)
+	if cached then return cached end
+
 	local totals = { water = 0, power = 0 }
 	if not (player and player:IsA("Player")) then return totals end
 
@@ -1353,11 +1480,16 @@ function ZoneRequirementsChecker.getEffectiveProduction(player: Player)
 			totals[pcfg.type] = (totals[pcfg.type] or 0) + ((pcfg.amount or 0) * mul)
 		end
 	end
-	return totals
+
+	setAggregateCache(aggregateProductionCache, player, totals)
+	return copyAggregate(totals)
 end
 
 -- Uses CityInteractions.getTileDemandMultiplier so Res<->Comm proximity bumps demand.
 function ZoneRequirementsChecker.getEffectiveTotals(player)
+	local cached = getAggregateCache(aggregateTotalsCache, player)
+	if cached then return cached end
+
 	local totals = { water = 0, power = 0 }
 	if not (player and player:IsA("Player")) then return totals end
 
@@ -1381,10 +1513,7 @@ function ZoneRequirementsChecker.getEffectiveTotals(player)
 							mulW = CityInteractions.getTileDemandMultiplier(player, z.zoneId, c.x, c.z, z.mode, "Water") or 1.0
 							mulP = CityInteractions.getTileDemandMultiplier(player, z.zoneId, c.x, c.z, z.mode, "Power") or 1.0
 						end
-						
-						if baseP > 0 then
-							--print(("[DemandMix POWER] %s (%d,%d) base=%s mul=%s eff=%s"):format(z.mode, c.x, c.z, tostring(baseP), tostring(mulP), tostring(math.floor(baseP*mulP+0.5))))
-						end
+
 						totals.water += math.floor(baseW * mulW + 0.5)
 						totals.power += math.floor(baseP * mulP + 0.5)
 					end
@@ -1393,7 +1522,8 @@ function ZoneRequirementsChecker.getEffectiveTotals(player)
 		end
 	end
 
-	return totals
+	setAggregateCache(aggregateTotalsCache, player, totals)
+	return copyAggregate(totals)
 end
 
 local function allocateTilesForZone(player, zoneId, networkType, gridList, produced, required, radius)
@@ -1646,6 +1776,7 @@ function ZoneRequirementsChecker.onZoneRemoved(player, zoneId, mode, gridList)
 	if debounce(("remove:%s:%s"):format(player.UserId, zoneId)) then return end
 	invalidateZoneCache(player, zoneId)
 	ZoneRequirementsChecker.clearTempAlarms(player, zoneId)
+	_clearSeqsForZone(player, zoneId) -- >>> ADDED: drop any pending sequences for this zone
 
 	local entry = { zoneId = zoneId, mode = mode, gridList = gridList,
 		center = computeZoneCenter(gridList) }
@@ -1723,9 +1854,13 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 				ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' needs power. Build plant/lines within %d blocks."):format(zoneId, SEARCH_RADIUS))
 			end
 
-			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmRoad",  missR)
-			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmWater", missW)
-			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmPower", missP)
+			-- >>> ADDED: sequence bump per alarmType
+			local seqR = _bumpSeq(AlarmSeq, player, zoneId, "AlarmRoad")
+			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmRoad",  missR, seqR)
+			local seqW = _bumpSeq(AlarmSeq, player, zoneId, "AlarmWater")
+			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmWater", missW, seqW)
+			local seqP = _bumpSeq(AlarmSeq, player, zoneId, "AlarmPower")
+			ZoneRequirementsChecker.updateTileAlarms(player, zoneId, "AlarmPower", missP, seqP)
 
 			setCachedRequirements(player, zoneId, allRoad, allWater, allPower)
 
@@ -1821,7 +1956,7 @@ end
 -- 10) Infrastructure checks after creation (Water/Power) or removal
 ----------------------------------------------------------------------
 function ZoneRequirementsChecker.checkPendingRoadRequirements(player, zoneId, mode, gridList)
-	if isReloading(player) then return end 
+	--if isReloading(player) then return end 
 	local touched = collectDistinctNearbyBuildingZones(gridList, SEARCH_RADIUS)
 
 	for _, bZone in pairs(touched) do
@@ -1831,7 +1966,8 @@ function ZoneRequirementsChecker.checkPendingRoadRequirements(player, zoneId, mo
 		local wasOK = data.requirements and data.requirements["Road"] == true
 		local allRoad, missR = ZoneRequirementsChecker.evaluateRoadsForZone(
 			player, bZone.zoneId, data.mode, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmRoad", missR)
+		local seqR = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmRoad") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmRoad", missR, seqR)
 
 		if allRoad and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", true)
@@ -1844,18 +1980,20 @@ function ZoneRequirementsChecker.checkPendingRoadRequirements(player, zoneId, mo
 
 		local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
 		ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", allWater)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW)
+		local seqW = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmWater") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW, seqW)
 
 		local allPower, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, bZone.zoneId, data.gridList)
 		ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", allPower)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP)
+		local seqP = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmPower") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP, seqP)
 
 		setCachedRequirements(player, bZone.zoneId, allRoad, allWater, allPower)
 	end
 end
 
 function ZoneRequirementsChecker.checkPendingWaterRequirements(player, zoneId, mode, gridList)
-	if isReloading(player) then return end
+	--if isReloading(player) then return end
 	local touched = collectDistinctNearbyBuildingZones(gridList, SEARCH_RADIUS)
 
 	for _, bZone in pairs(touched) do
@@ -1864,7 +2002,8 @@ function ZoneRequirementsChecker.checkPendingWaterRequirements(player, zoneId, m
 
 		local wasOK = data.requirements and data.requirements["Water"] == true
 		local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW)
+		local seqW = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmWater") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW, seqW)
 
 		if allWater and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", true)
@@ -1878,13 +2017,14 @@ function ZoneRequirementsChecker.checkPendingWaterRequirements(player, zoneId, m
 		task.defer(function()
 			local allPower, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, bZone.zoneId, data.gridList)
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", allPower)
-			ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP)
+			local seqP = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmPower") -- >>> ADDED
+			ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP, seqP)
 		end)
 	end
 end
 
 function ZoneRequirementsChecker.checkPendingPowerRequirements(player, zoneId, mode, gridList)
-	if isReloading(player) then return end
+	--if isReloading(player) then return end
 	local touched = collectDistinctNearbyBuildingZones(gridList, SEARCH_RADIUS)
 
 	for _, bZone in pairs(touched) do
@@ -1893,7 +2033,8 @@ function ZoneRequirementsChecker.checkPendingPowerRequirements(player, zoneId, m
 
 		local wasOK = data.requirements and data.requirements["Power"] == true
 		local allPower, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP)
+		local seqP = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmPower") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP, seqP)
 
 		if allPower and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", true)
@@ -1904,7 +2045,7 @@ function ZoneRequirementsChecker.checkPendingPowerRequirements(player, zoneId, m
 		end
 	end
 end
-	
+
 ----------------------------------------------------------------------
 -- 11) CHECKING AFTER INFRASTRUCTURE REMOVAL
 ----------------------------------------------------------------------
@@ -1917,7 +2058,8 @@ function ZoneRequirementsChecker.checkDependentZonesAfterRoadRemoval(player, rem
 
 		local wasOK = data.requirements and data.requirements["Road"] == true
 		local allRoad, missR = ZoneRequirementsChecker.evaluateRoadsForZone(player, bZone.zoneId, data.mode, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmRoad", missR)
+		local seqR = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmRoad") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmRoad", missR, seqR)
 
 		if allRoad and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", true)
@@ -1929,11 +2071,13 @@ function ZoneRequirementsChecker.checkDependentZonesAfterRoadRemoval(player, rem
 		end
 
 		local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW)
+		local seqW = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmWater") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", missW, seqW)
 		ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", allWater)
 
 		local allPower, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP)
+		local seqP = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmPower") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", missP, seqP)
 		ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", allPower)
 	end
 end
@@ -1946,7 +2090,8 @@ function ZoneRequirementsChecker.checkDependentZonesAfterWaterRemoval(player, re
 		if not data then continue end
 
 		local allOK, miss = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", miss)
+		local seqW = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmWater") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmWater", miss, seqW)
 
 		if not allOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", false)
@@ -1963,7 +2108,8 @@ function ZoneRequirementsChecker.checkDependentZonesAfterPowerRemoval(player, re
 		if not data then continue end
 
 		local allOK, miss = ZoneRequirementsChecker.evaluatePowerForZone(player, bZone.zoneId, data.gridList)
-		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", miss)
+		local seqP = _bumpSeq(AlarmSeq, player, bZone.zoneId, "AlarmPower") -- >>> ADDED
+		ZoneRequirementsChecker.updateTileAlarms(player, bZone.zoneId, "AlarmPower", miss, seqP)
 
 		if not allOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", false)
@@ -2014,19 +2160,22 @@ local function recheckBuildingsAroundCoords(player, coordList, which)
 			if which == "Water" then
 				local allW, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bId, data.gridList)
 				ZoneTrackerModule.markZoneRequirement(player, bId, "Water", allW)
-				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmWater", missW)
+				local seqW = _bumpSeq(AlarmSeq, player, bId, "AlarmWater") -- >>> ADDED
+				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmWater", missW, seqW)
 				if allW then ZoneRequirementsChecker.attemptActivatePendingZone(player, bId) end
 
 			elseif which == "Road" then
 				local allR, missR = ZoneRequirementsChecker.evaluateRoadsForZone(player, bId, data.mode, data.gridList)
 				ZoneTrackerModule.markZoneRequirement(player, bId, "Road", allR)
-				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmRoad", missR)
+				local seqR = _bumpSeq(AlarmSeq, player, bId, "AlarmRoad") -- >>> ADDED
+				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmRoad", missR, seqR)
 				if allR then ZoneRequirementsChecker.attemptActivatePendingZone(player, bId) end
 
 			else -- Power
 				local allP, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, bId, data.gridList)
 				ZoneTrackerModule.markZoneRequirement(player, bId, "Power", allP)
-				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmPower", missP)
+				local seqP = _bumpSeq(AlarmSeq, player, bId, "AlarmPower") -- >>> ADDED
+				ZoneRequirementsChecker.updateTileAlarms(player, bId, "AlarmPower", missP, seqP)
 			end
 		end
 	end
@@ -2113,7 +2262,7 @@ WigiPlacedEvent.Event:Connect(function(player, zoneId, payload)
 	if not SHOW_POPULATING_ALARMS then return end
 	if not player or not zoneId or not payload then return end
 	if isZonePopulated(player, zoneId) then return end
-	
+
 	if LOAD_AWARE_SKIP_TEMP_ALARMS and WorldReloadActiveByUid[player.UserId] then
 		return
 	end
@@ -2145,13 +2294,16 @@ WigiPlacedEvent.Event:Connect(function(player, zoneId, payload)
 	-- Temp-only “dirty” evaluation: NO writes to ZoneTracker, NO normal alarms, NO notifications.
 	-- Order matters for priority visuals: Road → Water → Power
 	local missR = dirtyEvaluateRoadsForTiles(player, zoneId, zMode, scope)
-	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmRoad",  missR, scope)
+	local seqR  = _bumpSeq(TempAlarmSeq, player, zoneId, "AlarmRoad") -- >>> ADDED
+	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmRoad",  missR, scope, seqR)
 
 	local missW = dirtyEvaluateWaterForTiles(player, zoneId, zMode, scope)
-	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmWater", missW, scope)
+	local seqW  = _bumpSeq(TempAlarmSeq, player, zoneId, "AlarmWater") -- >>> ADDED
+	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmWater", missW, scope, seqW)
 
 	local missP = dirtyEvaluatePowerForTiles(player, zoneId, zMode, scope)
-	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmPower", missP, scope)
+	local seqP  = _bumpSeq(TempAlarmSeq, player, zoneId, "AlarmPower") -- >>> ADDED
+	ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, "AlarmPower", missP, scope, seqP)
 end)
 
 function ZoneRequirementsChecker.recomputeAndPublishHappiness(player)
@@ -2276,11 +2428,12 @@ function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
 	end
 end
 
-
 function ZoneRequirementsChecker.clearPlayerData(player)
 	zoneRequirementCache[player.UserId] = nil
 	pendingAlarms[player.UserId]        = nil
 	zonePopulated[player.UserId]        = nil
+	AlarmSeq[player.UserId]             = nil -- >>> ADDED
+	TempAlarmSeq[player.UserId]         = nil -- >>> ADDED
 
 	-- flush any alarm parts sitting in the pool
 	for _, pool in pairs(AlarmPool) do

@@ -104,7 +104,7 @@ return {
 	[Enum.KeyCode.ButtonB] = 'rbxassetid://8981032988'; -- Alternate 360 (rbxassetid://8981058499)
 	[Enum.KeyCode.ButtonX] = 'rbxassetid://8981031512'; -- Alternate 360 (rbxassetid://8981058296)
 	[Enum.KeyCode.ButtonY] = 'rbxassetid://8981031340'; -- Alternate 360 (rbxassetid://8981058067)
-	
+
 	[Enum.KeyCode.DPadDown] = 'rbxassetid://8981032801'; -- Alternate 360 (rbxassetid://8981065752)
 	[Enum.KeyCode.DPadLeft] = 'rbxassetid://8981032709'; -- Alternate 360 (rbxassetid://8981065623)
 	[Enum.KeyCode.DPadRight] = 'rbxassetid://8981032630'; -- Alternate 360 (rbxassetid://8981065509)
@@ -122,7 +122,7 @@ return {
 
 	[Enum.KeyCode.ButtonStart] = 'rbxassetid://8981032070';
 	[Enum.KeyCode.ButtonSelect] = 'rbxassetid://8981031615';
-	
+
 	PlayStation = {
 		[Enum.KeyCode.ButtonA] = 'rbxassetid://15030912568';
 		[Enum.KeyCode.ButtonB] = 'rbxassetid://15030911057';
@@ -133,14 +133,14 @@ return {
 		[Enum.KeyCode.DPadLeft] = 'rbxassetid://15030920602';
 		[Enum.KeyCode.DPadRight] = 'rbxassetid://15030921122';
 		[Enum.KeyCode.DPadUp] = 'rbxassetid://15030919257';
-		
+
 		[Enum.KeyCode.ButtonL1] = 'rbxassetid://15030926703'; -- Shoulder
 		[Enum.KeyCode.ButtonL2] = 'rbxassetid://15030927456'; -- Trigger
 		[Enum.KeyCode.ButtonL3] = 'rbxassetid://8981032229'; -- Analog Click
 		[Enum.KeyCode.ButtonR1] = 'rbxassetid://15030928539'; -- Shoulder
 		[Enum.KeyCode.ButtonR2] = 'rbxassetid://15030930133'; -- Trigger
 		[Enum.KeyCode.ButtonR3] = 'rbxassetid://8981031803'; -- Analog Click
-		
+
 		[Enum.KeyCode.Thumbstick1] = 'rbxassetid://8981032344';
 		[Enum.KeyCode.Thumbstick2] = 'rbxassetid://8981031890';
 

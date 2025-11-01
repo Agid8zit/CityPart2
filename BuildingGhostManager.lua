@@ -244,7 +244,13 @@
 			zone = "Leisure",
 			style = "Default",
 			name = "Hindu Temple"
-		},
+	},
+	Flags = {
+		type = "category",
+		zone = "Flags",
+		style = "Default",
+		name = nil
+	},
 	--Police
 		Courthouse = {
 			type = "named",
@@ -385,21 +391,70 @@
 	function BuildingGhostManager.getGhostModel(mode)
 		if IGNORED_MODES[mode] then
 			return nil
+	end
+	
+	if type(mode) == "string" and string.sub(mode, 1, 5) == "Flag:" then
+		local flagName = string.sub(mode, 6)
+		local bd = BuildingMasterList.getIndividualBuildingByName("Flags", "Default", flagName)[1]
+		if not (bd and bd.stages and bd.stages.Stage3) then
+			warn("[GhostManager] Missing Stage3 for dynamic flag:", flagName)
+			return nil
 		end
+
+		local ghost = bd.stages.Stage3:Clone()
+		ghost.Name = mode .. "Ghost"
+
+		-- Ensure PrimaryPart
+		if not ghost.PrimaryPart then
+			local root = ghost:FindFirstChildWhichIsA("BasePart")
+			ghost.PrimaryPart = root
+		end
+
+		-- Make ghost transparent and uncollidable
+		for _, part in ipairs(ghost:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Transparency = 0.5
+				part.CanCollide = false
+				part.CanQuery = false
+			end
+		end
+
+		-- Shared radius for all flags
+		local radius = Balance.UxpConfig and Balance.UxpConfig.Radius and (
+			Balance.UxpConfig.Radius["Flags"] or Balance.UxpConfig.Radius["Flag"]
+		)
+		if radius and ghost.PrimaryPart then
+			local rv = RangeVisualTemplate:Clone()
+			rv.Name         = mode .. "RangeVisual"
+			rv.Size         = Vector3.new(radius * GridConfig.GRID_SIZE, 1, radius * GridConfig.GRID_SIZE)
+			rv.CFrame       = ghost.PrimaryPart.CFrame
+			rv.Anchored     = true
+			rv.CanCollide   = false
+			rv.CanQuery     = false
+			rv.Transparency = 1
+			rv.Parent       = ghost
+		end
+
+		return ghost
+	end
+	
 		local config = buildingConfigs[mode]
 		if not config then
 			warn("[GhostManager] No config found for mode:", mode)
 			return nil
 		end
 
-		local buildingData
-		if config.type == "utility" then
-			buildingData = BuildingMasterList.getUtilityBuilding(config.zone, config.style, config.name)[1]
-		elseif config.type == "individual" then
-			buildingData = BuildingMasterList.getIndividualBuildingsByType(config.zone, config.style)[1]
-		elseif config.type == "named" then
-			buildingData = BuildingMasterList.getIndividualBuildingByName(config.zone, config.style, config.name)[1]
-		end
+	local buildingData
+	if config.type == "utility" then
+		buildingData = BuildingMasterList.getUtilityBuilding(config.zone, config.style, config.name)[1]
+	elseif config.type == "individual" then
+		buildingData = BuildingMasterList.getIndividualBuildingsByType(config.zone, config.style)[1]
+	elseif config.type == "named" then
+		buildingData = BuildingMasterList.getIndividualBuildingByName(config.zone, config.style, config.name)[1]
+	elseif config.type == "category" then
+		local list = BuildingMasterList.getIndividualBuildingsByType(config.zone, config.style)
+		buildingData = list and list[1]
+	end
 
 		if not (buildingData and buildingData.stages and buildingData.stages.Stage3) then
 			warn("[GhostManager] Missing Stage3 for mode:", mode)
@@ -424,23 +479,23 @@
 			end
 		end
 		
-		local radius = Balance.UxpConfig and Balance.UxpConfig.Radius[mode]
-		if radius then
-			config.range = Vector3.new((radius*GridConfig.GRID_SIZE), 1, (radius*GridConfig.GRID_SIZE))
-		end
+	local radius = Balance.UxpConfig and Balance.UxpConfig.Radius and (
+		Balance.UxpConfig.Radius[mode]
+			or Balance.UxpConfig.Radius["Flags"]
+			or Balance.UxpConfig.Radius["Flag"]
+	)
 
-		-- Spawn RangeVisual
-		if config.range and ghost.PrimaryPart then
-			local rv = RangeVisualTemplate:Clone()
-			rv.Name        = mode .. "RangeVisual"
-			rv.Size        = config.range
-			rv.CFrame      = ghost.PrimaryPart.CFrame
-			rv.Anchored    = true
-			rv.CanCollide  = false
-			rv.CanQuery    = false
-			rv.Transparency = 1
-			rv.Parent      = ghost
-		end
+	if radius and ghost.PrimaryPart then
+		local rv = RangeVisualTemplate:Clone()
+		rv.Name         = mode .. "RangeVisual"
+		rv.Size         = Vector3.new(radius * GridConfig.GRID_SIZE, 1, radius * GridConfig.GRID_SIZE)
+		rv.CFrame       = ghost.PrimaryPart.CFrame
+		rv.Anchored     = true
+		rv.CanCollide   = false
+		rv.CanQuery     = false
+		rv.Transparency = 1
+		rv.Parent       = ghost
+	end
 
 		return ghost
 	end
@@ -463,8 +518,9 @@
 	end
 
 	-- Returns true if the mode is supported by BuildingGhostManager
-	function BuildingGhostManager.isGhostable(mode)
-		return buildingConfigs[mode] ~= nil
-	end
+function BuildingGhostManager.isGhostable(mode)
+	return buildingConfigs[mode] ~= nil
+		or (type(mode) == "string" and (mode == "Flags" or string.sub(mode, 1, 5) == "Flag:"))
+end
 
 	return BuildingGhostManager

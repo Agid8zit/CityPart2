@@ -1,4 +1,4 @@
-local CityName = {}
+﻿local CityName = {}
 
 -- Services
 local Players           = game:GetService("Players")
@@ -12,6 +12,9 @@ local UtilityGUIOk, UtilityGUI: any = pcall(function()
 end)
 local SoundControllerOk, SoundController: any = pcall(function()
 	return require(ReplicatedStorage.Scripts.Controllers.SoundController)
+end)
+local PlayerDataControllerOk, PlayerDataController: any = pcall(function()
+	return require(ReplicatedStorage.Scripts.Controllers.PlayerDataController)
 end)
 
 -- UI
@@ -50,6 +53,15 @@ local RF_SwitchToSlot: RemoteFunction?    = findRF("SwitchToSlot")
 local storedFilteredText: string = ""
 local lastFilterToken = 0
 
+local function normalizeName(value: any): string
+	if typeof(value) ~= "string" then return "" end
+	return value:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function setStoredName(value: any)
+	storedFilteredText = normalizeName(value)
+end
+
 -- Helpers ------------------------------------------------------------------
 local function playClick()
 	if SoundControllerOk and SoundController and typeof(SoundController.PlaySoundOnce) == "function" then
@@ -83,13 +95,19 @@ local function isBadName(filtered: string): boolean
 	return (n < MIN_LEN) or (n > MAX_LEN)
 end
 
+local function needsPromptName(current: any): boolean
+	local trimmed = normalizeName(current)
+	if trimmed == "" then return true end
+	return (#trimmed < MIN_LEN)
+end
+
 local function debounceFilterApply()
 	lastFilterToken += 1
 	local token = lastFilterToken
 	task.delay(0.25, function()
 		if token ~= lastFilterToken then return end
 		UI_SearchBox.Text = filterTextServer(UI_SearchBox.Text or "")
-		storedFilteredText = UI_SearchBox.Text
+		setStoredName(UI_SearchBox.Text)
 	end)
 end
 
@@ -119,6 +137,7 @@ function CityName.OnShow(): ()
 	if UI_Header:GetAttribute("LangKey") ~= "City Name" then
 		UI_Header:SetAttribute("LangKey", "City Name")
 	end
+	UI_SearchBox.PlaceholderText = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
 	UI_SearchBox.Text = storedFilteredText
 	pcall(function() UI_SearchBox.ClearTextOnFocus = false end)
 	focusForController()
@@ -165,11 +184,11 @@ function CityName.Init(): ()
 		-- 1) filter + validate
 		local filtered = filterTextServer(UI_SearchBox.Text or "")
 		UI_SearchBox.Text = filtered
-		storedFilteredText = filtered
+		setStoredName(filtered)
 
 		if isBadName(filtered) then
 			UI_SearchBox.Text = ""
-			UI_SearchBox.PlaceholderText = ("Name must be %d–%d chars."):format(MIN_LEN, MAX_LEN)
+			UI_SearchBox.PlaceholderText = ("Name must be %d-%d chars."):format(MIN_LEN, MAX_LEN)
 			return
 		end
 
@@ -216,7 +235,7 @@ function CityName.Init(): ()
 		if not resTbl.ok then
 			if resTbl.reason == "BAD_NAME" then
 				UI_SearchBox.Text = ""
-				UI_SearchBox.PlaceholderText = ("Name must be %d–%d chars."):format(MIN_LEN, MAX_LEN)
+				UI_SearchBox.PlaceholderText = ("Name must be %d-%d chars."):format(MIN_LEN, MAX_LEN)
 			else
 				UI_SearchBox.PlaceholderText = "Save failed. Try again."
 			end
@@ -236,10 +255,45 @@ function CityName.Init(): ()
 	UI_SearchBox.FocusLost:Connect(function()
 		local filtered = filterTextServer(UI_SearchBox.Text or "")
 		UI_SearchBox.Text = filtered
-		storedFilteredText = filtered
+		setStoredName(filtered)
 	end)
+
+	if PlayerDataControllerOk and PlayerDataController then
+		local function handlePlayerData(pd)
+			if typeof(pd) ~= "table" then return end
+			local currentSlot = pd.currentSaveFile
+			if typeof(currentSlot) ~= "string" then return end
+			local savefiles = pd.savefiles
+			if typeof(savefiles) ~= "table" then return end
+			local sf = savefiles[currentSlot]
+			if typeof(sf) ~= "table" then return end
+
+			if needsPromptName(sf.cityName) then
+				if not UI.Enabled then
+					setStoredName("")
+					UI_SearchBox.Text = ""
+					UI_SearchBox.PlaceholderText = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
+					CityName.OnShow()
+				end
+			else
+				setStoredName(sf.cityName)
+			end
+		end
+
+		if typeof(PlayerDataController.ListenForAnyDataChange) == "function" then
+			PlayerDataController.ListenForAnyDataChange(handlePlayerData)
+		end
+
+		if typeof(PlayerDataController.GetData) == "function" then
+			local current = PlayerDataController.GetData()
+			if current then
+				handlePlayerData(current)
+			end
+		end
+	end
 
 	UI.Enabled = false
 end
 
 return CityName
+

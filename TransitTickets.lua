@@ -384,7 +384,8 @@ RunService.Heartbeat:Connect(function()
 			local ut = unlockedTiers(rec.unlock)
 			for ti = 1, ut do
 				local lvl = clamp(rec.tiers[ti] or 0, 0, MAX_TIER_LEVEL)
-				local earned = AirportUpgrades.GetEarnedTicketSec(lvl)
+				-- CHANGED: pass tierIndex
+				local earned = AirportUpgrades.GetEarnedTicketSec(lvl, ti)
 				if typeof(earned) == "number" then total += earned end
 			end
 		end
@@ -398,7 +399,8 @@ RunService.Heartbeat:Connect(function()
 			local ut = unlockedTiers(rec.unlock)
 			for ti = 1, ut do
 				local lvl = clamp(rec.tiers[ti] or 0, 0, MAX_TIER_LEVEL)
-				local earned = BusDepotUpgrades.GetEarnedTicketSec(lvl)
+				-- CHANGED: pass tierIndex
+				local earned = BusDepotUpgrades.GetEarnedTicketSec(lvl, ti)
 				if typeof(earned) == "number" then total += earned end
 			end
 		end

@@ -1,4 +1,3 @@
---THIS IS THE PRIMARY USER INPUT LOCAL SCRIPT THEY CLICK A BUTTON, IT PROBABLY OPENS THIS, THIS FIRES TO EVERYTHING ELSE LIKELY
 -- Services THIS HAS GHOSTING
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -28,6 +27,16 @@ local PlotAssignedAck = RemoteEventsFolder:WaitForChild("PlotAssignedAck")
 local GridScripts = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Grid")
 local GridConfig = require(GridScripts:WaitForChild("GridConfig"))
 local GridUtil = require(GridScripts:WaitForChild("GridUtil"))
+
+-- Onboarding bindables & alarm model
+local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
+local BE_GridGuard  = BE:WaitForChild("OBGridGuard")        -- step specs: start/advance/stop
+local BE_GuardFB    = BE:WaitForChild("OBGuardFeedback")    -- feedback: done/canceled
+local BE_ToggleOB   = BE:WaitForChild("OnboardingToggle")   -- true/false
+
+local FuncRS        = ReplicatedStorage:WaitForChild("FuncTestGroundRS")
+local AlarmsFolder  = FuncRS:WaitForChild("Alarms")
+local OnboardAlarmTemplate = AlarmsFolder:WaitForChild("OnboardAlarm")
 
 -- For spawning the Water Tower ghost
 local BuildingGhostManager = require(ReplicatedStorage.Scripts.BuildingManager.BuildingGhostManager)
@@ -60,7 +69,7 @@ local GRID_TRANSPARENCY = 0.5
 
 -- Tables for grid parts
 local gridParts = {}
-local gridLookup = {}  
+local gridLookup = {}
 local cardinalGridParts = {}
 local metroEntranceCells = {}
 local metroTunnelCells = {}
@@ -77,14 +86,11 @@ end
 
 local function _key(x, z) return string.format("%d,%d", x, z) end
 
-
-
 -- Map a world position to the nearest currently-rendered GridSquare (uses gridParts)
 local function _nearestGridKeyFromWorld(pos)
 	local bestKey, bestDist = nil, math.huge
 	local px, pz = pos.X, pos.Z
 	for _, part in ipairs(gridParts) do
-		-- gridParts only has GridSquare/CardinalGridSquare we created
 		if part.Name == "GridSquare" then
 			local gx = part:GetAttribute("GridX")
 			local gz = part:GetAttribute("GridZ")
@@ -140,7 +146,6 @@ local function findMetroTunnels()
 	end
 
 	for _, zoneFolder in ipairs(tunnelsFolder:GetChildren()) do
-		-- MetroTunnelZone_<uid>_<n>
 		if zoneFolder:IsA("Folder") and zoneFolder.Name:match("^MetroTunnelZone_") then
 			for _, inst in ipairs(zoneFolder:GetDescendants()) do
 				if inst:IsA("BasePart") then
@@ -150,7 +155,7 @@ local function findMetroTunnels()
 					if gx and gz then
 						key = _key(gx, gz)
 					else
-						key = _nearestGridKeyFromWorld(inst.Position) -- snap to nearest visible grid
+						key = _nearestGridKeyFromWorld(inst.Position)
 					end
 					if key then
 						metroTunnelCells[key] = true
@@ -179,13 +184,11 @@ local function findMetroEntrances()
 	end
 
 	for _, zoneFolder in ipairs(populated:GetChildren()) do
-		-- Zone folders are named "Zone_<uid>_<n>"
 		if zoneFolder:IsA("Folder") and zoneFolder.Name:match("^Zone_") then
 			for _, inst in ipairs(zoneFolder:GetChildren()) do
 				if inst:IsA("Model") and string.lower(inst.Name) == "metro entrance" then
 					local pp = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
 					if pp then
-						-- Prefer attributes if present; otherwise snap to nearest rendered grid cell
 						local gx = pp:GetAttribute("GridX")
 						local gz = pp:GetAttribute("GridZ")
 						local key
@@ -215,6 +218,135 @@ local currentMode = nil
 local selectedCoord = nil
 local selectedCoords = {}
 
+
+-- === Guided step (reusable: line / rect / point) ============================
+local guard = { active=false, spec=nil, stage=nil }
+local guardMarks = {}  -- [BasePart] = true
+local alarmModel = nil
+local YELLOW = Color3.new(1,1,0)
+
+local function _gridPartAt(coord)
+	if not coord then return nil end
+	return gridLookup[tostring(coord.x)..","..tostring(coord.z)]
+end
+
+local function _mark(part)
+	if not part then return end
+	if part:GetAttribute("_GuardOrigR") == nil then
+		local c = part.Color
+		part:SetAttribute("_GuardOrigR", c.R)
+		part:SetAttribute("_GuardOrigG", c.G)
+		part:SetAttribute("_GuardOrigB", c.B)
+		part:SetAttribute("_GuardOrigT", part.Transparency)
+	end
+	part.Color = YELLOW
+	part.Transparency = 0.3
+	guardMarks[part] = true
+end
+
+local function _unmarkAll()
+	for p,_ in pairs(guardMarks) do
+		local r = p:GetAttribute("_GuardOrigR")
+		local g = p:GetAttribute("_GuardOrigG")
+		local b = p:GetAttribute("_GuardOrigB")
+		local t = p:GetAttribute("_GuardOrigT")
+		if r and g and b then p.Color = Color3.new(r,g,b) end
+		if t ~= nil then p.Transparency = t end
+	end
+	table.clear(guardMarks)
+end
+
+-- === visuals that extend to the next target =======================
+local function _markLineInclusive(a, b)
+	if not a or not b then return end
+	if a.x == b.x then
+		local step = (b.z >= a.z) and 1 or -1
+		for z = a.z, b.z, step do
+			_mark(_gridPartAt({ x = a.x, z = z }))
+		end
+	elseif a.z == b.z then
+		local step = (b.x >= a.x) and 1 or -1
+		for x = a.x, b.x, step do
+			_mark(_gridPartAt({ x = x, z = a.z }))
+		end
+	end
+end
+
+local function _markRectInclusive(a, b)
+	if not a or not b then return end
+	local minx, maxx = math.min(a.x, b.x), math.max(a.x, b.x)
+	local minz, maxz = math.min(a.z, b.z), math.max(a.z, b.z)
+	for x = minx, maxx do
+		for z = minz, maxz do
+			_mark(_gridPartAt({ x = x, z = z }))
+		end
+	end
+end
+
+local function _destroyAlarm()
+	if alarmModel then alarmModel:Destroy(); alarmModel = nil end
+end
+
+local function _spawnOrMoveAlarmAtCoord(coord)
+	if not coord or not globalBounds then return end
+	local x,y,z = GridUtil.globalGridToWorldPosition(coord.x, coord.z, globalBounds, terrains)
+	if not alarmModel then
+		local ok, m = pcall(function() return OnboardAlarmTemplate:Clone() end)
+		if not ok or not m then return end
+		alarmModel = m
+		alarmModel.Parent = Workspace
+	end
+	alarmModel:PivotTo(CFrame.new(x, y + 0.5, z))
+end
+
+local function _clearGuardUI()
+	_unmarkAll()
+	_destroyAlarm()
+end
+
+local function _activateGuard(spec)
+	guard.active = true
+	guard.spec   = spec
+	guard.stage  = (spec.kind == "line" and "await_first")
+		or (spec.kind == "rect" and "await_first")
+		or "await_point"
+
+	-- If the correct grid is already visible, prime highlight + alarm now.
+	if currentMode == spec.mode and next(gridLookup) ~= nil then
+		local first = spec.from or spec.point or spec.one
+		local p = _gridPartAt(first)
+		if p then _mark(p) end
+		_spawnOrMoveAlarmAtCoord(first)
+	end
+end
+
+local function _finishGuard(done)
+	local payload = guard.spec and { item = guard.spec.item or guard.spec.mode, mode = guard.spec.mode } or nil
+	_clearGuardUI()
+	guard.active=false; guard.spec=nil; guard.stage=nil
+	if done then
+		pcall(function() BE_GuardFB:Fire("done", payload) end)
+	else
+		pcall(function() BE_GuardFB:Fire("canceled", payload) end)
+	end
+end
+
+-- Listen for guard steps (generic; NOT road-only)
+BE_GridGuard.Event:Connect(function(action, spec)
+	if action == "start" or action == "advance" then
+		_clearGuardUI()
+		_activateGuard(spec)
+	elseif action == "stop" then
+		-- Break the stop<->canceled echo loop with OnboardingController.
+		_clearGuardUI()
+		guard.active = false
+		guard.spec   = nil
+		guard.stage  = nil
+		-- NOTE: do NOT call _finishGuard(false) here (which fires BE_GuardFB).
+	end
+end)
+-- ============================================================================
+
 -- Debounce
 local debounce = false
 local DEBOUNCE_TIME = 0.5 -- seconds
@@ -224,7 +356,7 @@ local ghostModel = nil
 local moveConnection = nil
 
 -- Track rotation for the ghost model
-local buildingRotation = 0 
+local buildingRotation = 0
 
 -- Table for currently highlighted squares (for footprints, etc.)
 local highlightSquares = {}
@@ -282,7 +414,7 @@ local function openPremiumShop()
 			return require(premiumShopGui.Logic)
 		end)
 		if ok and mod and type(mod.OnShow) == "function" then
-			mod.OnShow() -- keep signature same as your building path
+			mod.OnShow()
 			return true
 		end
 	end
@@ -305,6 +437,59 @@ local function openPremiumShop()
 	return false
 end
 
+-- [ADDED] ======== Line/Path cost helpers for Roads/Pipes/PowerLines =========
+local function lineCellCount(startCoord, endCoord)
+	-- Cardinal lines only; includes both endpoints
+	if not startCoord or not endCoord then return 0 end
+	local dx = math.abs((endCoord.x or 0) - (startCoord.x or 0))
+	local dz = math.abs((endCoord.z or 0) - (startCoord.z or 0))
+	return dx + dz + 1
+end
+
+local function costPerGridFor(mode)
+	return asNumber(COST_PER_GRID[mode]) or 0
+end
+
+local function canAffordLine(startCoord, endCoord, mode)
+	local cells = lineCellCount(startCoord, endCoord)
+	local cpg   = costPerGridFor(mode)
+	local total = cells * cpg
+	return (playerBalance >= total), total, cells, cpg
+end
+
+-- [ADDED] Truncate a desired end to the maximum affordable length in the same cardinal direction.
+local function truncateEndToBudget(startCoord, desiredEnd, mode)
+	local cpg = costPerGridFor(mode)
+	if cpg <= 0 then
+		local cells = lineCellCount(startCoord, desiredEnd)
+		return desiredEnd, cells, 0, false, false  -- end, cells, cost, cannotAffordAny, truncated
+	end
+	local affordableCells = math.floor(playerBalance / cpg)
+	if affordableCells <= 0 then
+		return nil, 0, 0, true, false
+	end
+
+	local desiredCells = lineCellCount(startCoord, desiredEnd)
+	local cellsToBuild = math.min(desiredCells, affordableCells)
+
+	if cellsToBuild == desiredCells then
+		return desiredEnd, cellsToBuild, cellsToBuild * cpg, false, false
+	else
+		local dx, dz = 0, 0
+		if desiredEnd.x ~= startCoord.x then
+			dx = (desiredEnd.x > startCoord.x) and 1 or -1
+		elseif desiredEnd.z ~= startCoord.z then
+			dz = (desiredEnd.z > startCoord.z) and 1 or -1
+		end
+		local truncated = {
+			x = startCoord.x + dx * (cellsToBuild - 1),
+			z = startCoord.z + dz * (cellsToBuild - 1)
+		}
+		return truncated, cellsToBuild, cellsToBuild * cpg, false, true
+	end
+end
+-- ============================================================================
+
 local zoneHighlights = {}
 
 local function clearZoneHighlights()
@@ -322,8 +507,8 @@ local function highlightZoneRange(startCoord)
 		return
 	end
 
-	-- Changed: normalize cost to number (supports "50k" style configs too)
-	local cost = asNumber(Balance.costPerGrid[currentMode])
+	local costKey = (type(currentMode)=="string" and currentMode:sub(1,5)=="Flag:") and "Flags" or currentMode
+	local cost = asNumber(Balance.costPerGrid[costKey])
 	if cost <= 0 then return end
 
 	local maxCells = math.floor(playerBalance / cost)
@@ -332,9 +517,8 @@ local function highlightZoneRange(startCoord)
 	for _, part in ipairs(gridParts) do
 		local gx, gz = part:GetAttribute("GridX"), part:GetAttribute("GridZ")
 
-		-- **skip the first-click cell** so it stays red
 		if gx == startCoord.x and gz == startCoord.z then
-			-- do nothing
+			-- leave start red
 		else
 			local w = math.abs(gx - startCoord.x) + 1
 			local d = math.abs(gz - startCoord.z) + 1
@@ -347,28 +531,21 @@ local function highlightZoneRange(startCoord)
 	end
 end
 
-
 -- ROTATION HELPER
-
 local function rotateGhost()
 	buildingRotation = (buildingRotation + 90) % 360
 end
 
-
 -- CLEAR FOOTPRINT HIGHLIGHTS
-
 local function clearFootprintHighlights()
 	for _, part in ipairs(highlightSquares) do
-		-- Optionally restore color/transparency
 		part.Color = part:GetAttribute("BaseColor") or part.Color
 		part.Transparency = GRID_TRANSPARENCY
 	end
 	highlightSquares = {}
 end
 
-
 -- HIGHLIGHT FOOTPRINT
-
 local function highlightFootprint(gx, gz, width, depth)
 	clearFootprintHighlights()
 
@@ -377,7 +554,6 @@ local function highlightFootprint(gx, gz, width, depth)
 			local key = x .. "," .. z
 			local part = gridLookup[key]
 			if part then
-				-- Color these squares differently, e.g. yellow
 				part.Color = Color3.new(1, 1, 0)
 				part.Transparency = 0.3
 				table.insert(highlightSquares, part)
@@ -385,7 +561,6 @@ local function highlightFootprint(gx, gz, width, depth)
 		end
 	end
 end
-
 
 local function rebuildTerrainsFromUnlocks(unlockData)
 	if not playerPlot then return end
@@ -418,8 +593,6 @@ local function rebuildTerrainsFromUnlocks(unlockData)
 end
 
 -- GET BUILDING FOOTPRINT (WITH ROTATION)
---  If rotation is 90° or 270°, we swap X and Z to account for bounding box
-
 local function getBuildingFootprint(model, rotationDegrees)
 	if not model or not model.PrimaryPart then
 		return 1, 1
@@ -428,7 +601,6 @@ local function getBuildingFootprint(model, rotationDegrees)
 	local sizeX = model.PrimaryPart.Size.X
 	local sizeZ = model.PrimaryPart.Size.Z
 
-	-- For 90 or 270, swap
 	local modRotation = rotationDegrees % 180
 	local w, d
 	if modRotation == 90 then
@@ -442,11 +614,7 @@ local function getBuildingFootprint(model, rotationDegrees)
 	return w, d
 end
 
-
-
-
 -- MOVE GHOST MODEL (APPLYING ROTATION)
-
 local function startGhostMovement()
 	if moveConnection then
 		moveConnection:Disconnect()
@@ -462,24 +630,16 @@ local function startGhostMovement()
 				if gx and gz and globalBounds and terrains then
 
 					local w, d = getBuildingFootprint(ghostModel, buildingRotation)
-					-- Position the ghost's model
 					local x, y, z = GridUtil.globalGridToWorldPosition(gx, gz, globalBounds, terrains)
 					local offX = (w - 1) * GRID_SIZE * 0.5
 					local offZ = (d - 1) * GRID_SIZE * 0.5
 					local pivotOffset = CFrame.new(offX, 0, offZ)
-
-
-					-- offset pivot from center back to the corner
-					local half      = GRID_SIZE/2
-					local cornerOff = CFrame.new(-half, 0, -half)
 
 					ghostModel:SetPrimaryPartCFrame(
 						CFrame.new(x, y, z)
 							* pivotOffset
 							* CFrame.Angles(0, math.rad(buildingRotation), 0)
 					)
-					-- Highlight squares (multi-cell footprint with rotation)
-
 					highlightFootprint(gx, gz, w, d)
 				else
 					clearFootprintHighlights()
@@ -491,9 +651,7 @@ local function startGhostMovement()
 	end)
 end
 
-
 -- STOP GHOST MOVEMENT AND REMOVE GHOST
-
 local function removeGhost()
 	if ghostModel then
 		ghostModel:Destroy()
@@ -506,9 +664,7 @@ local function removeGhost()
 	clearFootprintHighlights()
 end
 
-
 -- CLEAR FUNCTIONS
-
 local function clearCardinalGrids()
 	for _, part in ipairs(cardinalGridParts) do
 		part:Destroy()
@@ -517,7 +673,6 @@ local function clearCardinalGrids()
 end
 
 local function clearGrid()
-
 	if playerBuildings then
 		playerBuildings.Parent = playerBuildingsOrigParent
 	end
@@ -544,58 +699,31 @@ BE_DisableBuildMode.Event:Connect(function()
 end)
 
 notifyLockedEvent.OnClientEvent:Connect(function(zoneType, requiredLevel)
-	-- wipe anything that might already be on the screen
 	removeGhost()
 	clearAll()
+	local _ = zoneType
 	currentMode = nil
-
-	-- show feedback – replace this with your own UI if you like
 	warn(("%s is locked. Reach city level %d to unlock it."):format(zoneType, requiredLevel))
-	-- you could also flash the button, open a popup, etc.
 end)
 
-
 -- CREATE GRID
-
 local function createGrid(mode)
 	if not terrains or #terrains == 0 then
 		warn("GridVisualizer: No terrains are defined.")
 		return
 	end
 
-	-- Calculate global bounds
 	globalBounds = GridConfig.calculateGlobalBounds(terrains)
 
 	print("=== globalBounds ===")
 	printTable(globalBounds)
 	print("====================")
 
-	-- Clear existing grid parts
 	for _, part in ipairs(gridParts) do
 		part:Destroy()
 	end
 	gridParts = {}
 
-	-- hide buildings
-	--if mode == "WaterPipe" or mode == "PowerLines" then
-	--	if not playerBuildings then
-	--		local PlayerPlots = workspace:FindFirstChild("PlayerPlots")
-	--		if PlayerPlots then
-	--			local PlayerPlot = PlayerPlots:FindFirstChild("Plot_"..player.UserId)
-	--			if PlayerPlot then
-	--				playerBuildings = PlayerPlot:FindFirstChild("Buildings")
-	--				if playerBuildings then
-	--					playerBuildingsOrigParent = playerBuildings.Parent
-	--				end
-	--			end
-	--		end
-	--	end
-	--	if playerBuildings then
-	--		playerBuildings.Parent = ReplicatedStorage
-	--	end
-	--end
-
-	-- Decide color
 	local GRID_COLOUR = Color3.new(0, 1, 0)
 	if mode == "DirtRoad" or mode == "Pavement" or mode == "Highway" or mode == "PowerLines" or mode == "MetroTunnel" then
 		GRID_COLOUR = Color3.new(0, 1, 0)
@@ -618,10 +746,8 @@ local function createGrid(mode)
 	local displayGridSizeX = math.ceil(totalWidthX / step)
 	local displayGridSizeZ = math.ceil(totalWidthZ / step)
 
-	-- Create/find a folder
 	local gridFolder = workspace.PlayerPlots.GridParts
 
-	-- Generate squares
 	for i = 0, displayGridSizeX - 1 do
 		for j = 0, displayGridSizeZ - 1 do
 			local worldX = absMinX + (i + 0.5) * step
@@ -651,11 +777,11 @@ local function createGrid(mode)
 			gridLookup[gridX .. "," .. gridZ] = gridPart
 		end
 	end
+
 	if mode == "MetroTunnel" then
 		findMetroEntrances()
 		findMetroTunnels()
 
-		-- highlight entrances (yellow)
 		for key, _ in pairs(metroEntranceCells) do
 			local part = gridLookup[key]
 			if part then
@@ -664,7 +790,6 @@ local function createGrid(mode)
 			end
 		end
 
-		-- highlight allowed starts adjacent to tunnels (orange); don't overwrite entrance tint
 		for key, _ in pairs(metroTunnelCells) do
 			local gx, gz = key:match("^(-?%d+),(-?%d+)$")
 			gx, gz = tonumber(gx), tonumber(gz)
@@ -684,9 +809,7 @@ local function createGrid(mode)
 	end
 end
 
-
 -- SHOW CARDINAL GRIDS
-
 local function showCardinalGrids(startCoord)
 	if not terrains or #terrains == 0 then
 		warn("GridVisualizer: No terrains are defined.")
@@ -708,6 +831,18 @@ local function showCardinalGrids(startCoord)
 		{0, -1},  -- North
 	}
 
+	-- [ADDED] Budget cap for line modes (roads/pipes/power)
+	local budgetSteps -- nil means unlimited (no cap)
+	if currentMode == "DirtRoad" or currentMode == "Pavement" or currentMode == "Highway"
+		or currentMode == "WaterPipe" or currentMode == "PowerLines" then
+		local cpg = costPerGridFor(currentMode)
+		if cpg > 0 then
+			local affordableCells = math.floor(playerBalance / cpg)
+			-- steps from the start in one direction; start cell is already counted
+			budgetSteps = math.max(0, affordableCells - 1)
+		end
+	end
+
 	local cardinalFolder = playerPlot and playerPlot.Parent:FindFirstChild("CardinalGridParts")
 	if not cardinalFolder then
 		cardinalFolder = Instance.new("Folder")
@@ -722,10 +857,18 @@ local function showCardinalGrids(startCoord)
 	for _, dir in ipairs(directions) do
 		local dx, dz = dir[1], dir[2]
 		local x, z = startCoord.x, startCoord.z
+		local steps = 0
 
 		while true do
 			x = x + dx
 			z = z + dz
+			steps += 1
+
+			-- [ADDED] stop showing beyond the affordable steps (if capped)
+			if budgetSteps and steps > budgetSteps then
+				break
+			end
+
 			if x < minGridX or x > maxGridX or z < minGridZ or z > maxGridZ then
 				break
 			end
@@ -751,7 +894,6 @@ local function showCardinalGrids(startCoord)
 	end
 end
 
-
 -- INPUT HANDLER
 RunService.Heartbeat:Connect(function()
 	local target = mouse.Target
@@ -774,6 +916,74 @@ local function click(target)
 		end
 
 		print("Clicked grid coords: x =", x_grid, "z =", z_grid)
+		
+		-- === Guided lock (generic) ==========================================
+		if guard.active and guard.spec and currentMode == guard.spec.mode then
+			local gx, gz = x_grid, z_grid
+			local spec = guard.spec
+
+			if spec.kind == "line" then
+				-- first click must be EXACT start
+				if guard.stage == "await_first" then
+					if gx ~= spec.from.x or gz ~= spec.from.z then return end
+					_unmarkAll()
+					_markLineInclusive(spec.from, spec.to)   -- show full path now
+					_spawnOrMoveAlarmAtCoord(spec.to)        -- alarm moves to the end
+					guard.stage = "await_second"
+					return -- swallow base logic
+				else
+					-- second click: exact end (unless explicitly relaxed)
+					local exact = (spec.requireExactEnd ~= false)
+					local ok = (gx == spec.to.x and gz == spec.to.z)
+					if not ok and not exact then
+						if (gx == spec.from.x) ~= (gz == spec.from.z) then
+							ok = true
+							spec.to = { x = gx, z = gz }
+						end
+					end
+					if not ok then return end
+
+					if spec.mode == "WaterPipe" then
+						buildPipeEvent:FireServer(spec.from, spec.to, "WaterPipe")
+					elseif spec.mode == "PowerLines" then
+						ExecuteCommandEvent:FireServer("BuildPowerLine", spec.from, spec.to, "PowerLines")
+					elseif spec.mode == "MetroTunnel" then
+						ExecuteCommandEvent:FireServer("BuildMetroTunnel", spec.from, spec.to, "MetroTunnel")
+					else
+						ExecuteCommandEvent:FireServer("BuildRoad", spec.from, spec.to, spec.mode)
+					end
+					_finishGuard(true)
+					clearAll()
+					return
+				end
+
+			elseif spec.kind == "rect" then
+				if guard.stage == "await_first" then
+					if gx ~= spec.from.x or gz ~= spec.from.z then return end
+					_unmarkAll()
+					_markRectInclusive(spec.from, spec.to)   -- show whole rectangle now
+					_spawnOrMoveAlarmAtCoord(spec.to)
+					guard.stage = "await_second"
+					return
+				else
+					if gx ~= spec.to.x or gz ~= spec.to.z then return end
+					ExecuteCommandEvent:FireServer("BuildZone", spec.from, spec.to, spec.mode)
+					_finishGuard(true)
+					clearAll()
+					return
+				end
+
+			else
+				-- point (e.g., WaterTower). We lock the one cell, but let your normal
+				-- ghost-aware placement code run on click.
+				local p = spec.point or spec.from
+				if not p or gx ~= p.x or gz ~= p.z then return end
+				_clearGuardUI()
+				guard.active=false; guard.spec=nil; guard.stage=nil
+				-- fall through to base logic for actual placement
+			end
+		end
+		-- === end Guided lock ================================================
 
 		if currentMode == "DirtRoad" or currentMode == "Pavement" or currentMode == "Highway" then
 			if not selectedCoord then
@@ -782,13 +992,34 @@ local function click(target)
 				target.Color = Color3.new(1, 0, 0)
 				showCardinalGrids(selectedCoord)
 			else
-				if (target.Name == "CardinalGridSquare" or target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
-					local endCoord = {x = x_grid, z = z_grid}
-					print("Road end:", endCoord.x, endCoord.z)
-					ExecuteCommandEvent:FireServer("BuildRoad", selectedCoord, endCoord, currentMode)
+				if (target.Name == "CardinalGridSquare")
+					or (target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
+
+					local desiredEnd = {x = x_grid, z = z_grid}
+					-- [ADDED] truncate to budget
+					local newEnd, cells, cost, cannot, truncated =
+						truncateEndToBudget(selectedCoord, desiredEnd, currentMode)
+
+					if cannot then
+						openPremiumShop()
+						clearAll()
+						currentMode = nil
+						return
+					end
+
+					if truncated then
+						pcall(function()
+							StarterGui:SetCore("SendNotification", {
+								Title = "Road length limited",
+								Text  = ("Built %d tile(s) within budget."):format(cells),
+								Duration = 3
+							})
+						end)
+					end
+
+					print("Road end:", newEnd.x, newEnd.z, "cells=", cells, "cost=", cost)
+					ExecuteCommandEvent:FireServer("BuildRoad", selectedCoord, newEnd, currentMode)
 					clearAll()
-					--buildModeToggleEvent:Fire(false)
-					--BuildMenuUI.OnHide()
 				else
 					print("Please select a cardinal grid.")
 				end
@@ -796,18 +1027,39 @@ local function click(target)
 
 		elseif currentMode == "WaterPipe" then
 			if not selectedCoord then
-				selectedCoord = {x = x_grid, z = z_grid}
+				selectedCoord = { x = x_grid, z = z_grid }
 				print("WaterPipe start:", selectedCoord.x, selectedCoord.z)
 				target.Color = Color3.new(1, 0, 0)
 				showCardinalGrids(selectedCoord)
 			else
-				if (target.Name == "CardinalGridSquare" or target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
-					local endCoord = {x = x_grid, z = z_grid}
-					print("WaterPipe end:", endCoord.x, endCoord.z)
-					buildPipeEvent:FireServer(selectedCoord, endCoord, currentMode)
+				if (target.Name == "CardinalGridSquare")
+					or (target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
+
+					local desiredEnd = { x = x_grid, z = z_grid }
+					-- [ADDED] truncate to budget
+					local newEnd, cells, cost, cannot, truncated =
+						truncateEndToBudget(selectedCoord, desiredEnd, currentMode)
+
+					if cannot then
+						openPremiumShop()
+						clearAll()
+						currentMode = nil
+						return
+					end
+
+					if truncated then
+						pcall(function()
+							StarterGui:SetCore("SendNotification", {
+								Title = "Pipe length limited",
+								Text  = ("Built %d tile(s) within budget."):format(cells),
+								Duration = 3
+							})
+						end)
+					end
+
+					print("WaterPipe end:", newEnd.x, newEnd.z, "cells=", cells, "cost=", cost)
+					buildPipeEvent:FireServer(selectedCoord, newEnd, currentMode)
 					clearAll()
-					--buildModeToggleEvent:Fire(false)
-					--BuildMenuUI.OnHide()
 				else
 					print("Please select a cardinal grid.")
 				end
@@ -820,20 +1072,41 @@ local function click(target)
 				target.Color = Color3.new(1, 0, 0)
 				showCardinalGrids(selectedCoord)
 			else
-				if (target.Name == "CardinalGridSquare" or target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
-					local endCoord = {x = x_grid, z = z_grid}
-					print("PowerLines end:", endCoord.x, endCoord.z)
-					ExecuteCommandEvent:FireServer("BuildPowerLine", selectedCoord, endCoord, currentMode)
+				if (target.Name == "CardinalGridSquare")
+					or (target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
+
+					local desiredEnd = {x = x_grid, z = z_grid}
+					-- [ADDED] truncate to budget
+					local newEnd, cells, cost, cannot, truncated =
+						truncateEndToBudget(selectedCoord, desiredEnd, currentMode)
+
+					if cannot then
+						openPremiumShop()
+						clearAll()
+						currentMode = nil
+						return
+					end
+
+					if truncated then
+						pcall(function()
+							StarterGui:SetCore("SendNotification", {
+								Title = "Power line limited",
+								Text  = ("Built %d tile(s) within budget."):format(cells),
+								Duration = 3
+							})
+						end)
+					end
+
+					print("PowerLines end:", newEnd.x, newEnd.z, "cells=", cells, "cost=", cost)
+					ExecuteCommandEvent:FireServer("BuildPowerLine", selectedCoord, newEnd, currentMode)
 					clearAll()
-					--buildModeToggleEvent:Fire(false)
-					--BuildMenuUI.OnHide()
 				else
 					print("Please select a cardinal grid.")
 				end
 			end
+
 		elseif currentMode == "MetroTunnel" then
 			if not selectedCoord then
-				-- refresh scans
 				findMetroEntrances()
 				findMetroTunnels()
 
@@ -842,10 +1115,6 @@ local function click(target)
 				local onEntrance   = _isEntranceCell(x_grid, z_grid)
 				local nearTunnel   = _isAdjacentToTunnel(x_grid, z_grid)
 
-				-- Rules:
-				-- - If tunnels exist: allow start on an entrance OR adjacent to any tunnel (N/E/S/W).
-				-- - If no tunnels but entrances exist: must start on an entrance.
-				-- - If neither exists: unrestricted.
 				if hasTunnels then
 					if not (onEntrance or nearTunnel) then
 						warn("Metro: start on an Entrance or next to an existing tunnel.")
@@ -877,16 +1146,17 @@ local function click(target)
 				target.Color = Color3.new(1, 0, 0)
 				showCardinalGrids(selectedCoord)
 			else
-				if (target.Name == "CardinalGridSquare" or target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
+				if (target.Name == "CardinalGridSquare")
+					or (target.Name == "GridSquare" and selectedCoord.x == x_grid and selectedCoord.z == z_grid) then
 					local startCoord = selectedCoord
 					local endCoord   = {x = x_grid, z = z_grid}
 
-					-- guarantee the *first* param we send is a valid metro start
 					if not _isValidMetroStart(startCoord.x, startCoord.z) and _isValidMetroStart(endCoord.x, endCoord.z) then
 						startCoord, endCoord = endCoord, startCoord
 					end
 
 					print("MetroTunnel end:", endCoord.x, endCoord.z)
+					-- NOTE: if you also want budget-truncation for MetroTunnel, I can mirror it here.
 					ExecuteCommandEvent:FireServer("BuildMetroTunnel", startCoord, endCoord, currentMode)
 					clearAll()
 				else
@@ -899,10 +1169,9 @@ local function click(target)
 			local w, d = BuildingGhostManager.getFootprint(ghostModel, buildingRotation)
 			local endCoord = {x = coord.x + w - 1, z = coord.z + d - 1}
 
-			-- compute total cost (normalized)
-			local totalCost = asNumber(Balance.costPerGrid[currentMode])
+			local costKey  = (type(currentMode)=="string" and currentMode:sub(1,5)=="Flag:") and "Flags" or currentMode
+			local totalCost = asNumber(Balance.costPerGrid[costKey])
 
-			-- if they can't afford it, open PremiumShop and bail
 			if playerBalance < totalCost then
 				openPremiumShop()
 				removeGhost()
@@ -911,14 +1180,12 @@ local function click(target)
 				return
 			end
 
-			-- otherwise proceed with placement
 			print("Placing", currentMode, "from:", coord.x, coord.z, "to", endCoord.x, endCoord.z)
 			ExecuteCommandEvent:FireServer("BuildZone", coord, endCoord, currentMode, buildingRotation)
 			target.Color = Color3.new(0, 0, 1)
 			removeGhost()
 			clearAll()
 			currentMode = nil
-			--buildModeToggleEvent:Fire(false)
 			BuildMenuUI.OnHide()
 		else
 			-- Generic "BuildZone" path (e.g., Residential/Commercial/etc.)
@@ -929,19 +1196,14 @@ local function click(target)
 			highlightZoneRange(selectedCoords[1])
 
 			if #selectedCoords == 2 then
-				-- 1) compute rectangle size in cells
 				local width  = math.abs(selectedCoords[2].x - selectedCoords[1].x) + 1
 				local depth  = math.abs(selectedCoords[2].z - selectedCoords[1].z) + 1
 
-				-- 2) compute total cost (normalized)
 				local costPerCell = asNumber(Balance.costPerGrid[currentMode])
 				local totalCost   = width * depth * costPerCell
 
-				-- 3) if they can’t afford it, open PremiumShop instead
 				if playerBalance < totalCost then
 					openPremiumShop()
-
-					-- reset selection
 					selectedCoords = {}
 					clearZoneHighlights()
 					clearGrid()
@@ -949,12 +1211,10 @@ local function click(target)
 					return
 				end
 
-				-- 4) otherwise proceed with the build
 				ExecuteCommandEvent:FireServer("BuildZone", selectedCoords[1], selectedCoords[2], currentMode)
 				selectedCoords = {}
 				clearZoneHighlights()
 				clearGrid()
-				--buildModeToggleEvent:Fire(false)
 				BuildMenuUI.OnHide()
 			end
 		end
@@ -964,7 +1224,6 @@ end
 ReplicatedStorage.Events.BindableEvents.MobileClick.Event:Connect(function()
 	click(targetMobile)
 end)
-
 
 local function onInputBegan(input, gameProcessed)
 	if gameProcessed and input.KeyCode ~= Enum.KeyCode.ButtonA then return end
@@ -977,26 +1236,19 @@ local function onInputBegan(input, gameProcessed)
 
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.ButtonA then
 		click(mouse.Target)
-
 	elseif input.UserInputType == Enum.UserInputType.Touch then
 		targetMobile = mouse.Target
 	end
 end
 
-
 -- CANCEL & ROTATE SHORTCUTS
-
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
-
-	-- If R is pressed, rotate the ghost
 	if input.KeyCode == Enum.KeyCode.R then
 		if ghostModel then
 			rotateGhost()
 		end
 	end
-
-	-- If X is pressed, cancel
 	if input.KeyCode == Enum.KeyCode.X then
 		print("Cancel selection, clearing grid.")
 		removeGhost()
@@ -1005,16 +1257,11 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	end
 end)
 
-
 -- CONNECT MAIN INPUT
-
 UserInputService.InputBegan:Connect(onInputBegan)
 
-
 -- DISPLAY GRID EVENT
-
 displayGridEvent.OnClientEvent:Connect(function(mode)
-
 	removeGhost()
 	clearAll()
 
@@ -1028,13 +1275,18 @@ displayGridEvent.OnClientEvent:Connect(function(mode)
 		ghostModel.Parent = Workspace
 		startGhostMovement()
 	end
-
+	
+	--Onboarding
+	if guard.active and guard.spec and guard.spec.mode == currentMode then
+		local first = guard.spec.from or guard.spec.point or guard.spec.one
+		local p = _gridPartAt(first)
+		if p then _mark(p) end
+		_spawnOrMoveAlarmAtCoord(first)
+	end
+	
 end)
 
-
-
 -- PLOT ASSIGNED EVENT
-
 plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
 	PlotAssignedAck:FireServer()
 	print("GridVisualizer: Received plot name", plotName, unlockData)
@@ -1055,7 +1307,7 @@ plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
 	if roadStart then
 		GridConfig.setStableAnchorFromPart(roadStart)
 	else
-		warn(("GridVisualizer: RoadStart missing on plot %s – falling back to first‑terrain logic.")
+		warn(("GridVisualizer: RoadStart missing on plot %s – falling back to first-terrain logic.")
 			:format(plotName))
 	end
 
@@ -1076,10 +1328,7 @@ plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
 end)
 
 unlocksUpdatedEvent.OnClientEvent:Connect(function(newUnlockTable)
-	-- Update terrains immediately when unlocks change in-session
 	rebuildTerrainsFromUnlocks(newUnlockTable)
-
-	-- If a grid is currently shown (currentMode set), re-render it so the player sees the new area
 	if currentMode then
 		createGrid(currentMode)
 	end

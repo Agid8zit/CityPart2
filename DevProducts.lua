@@ -16,12 +16,12 @@ type DevProductContent = {
 -- Constants
 local DEVPRODUCTS_RAW = {
 	-- Name = DevProductID
-	["Coin Option1"] = {ID = 3280553599, EarnedCoins = 100, LayoutOrder = 1};
-	["Coin Option2"] = {ID = 3280553720, EarnedCoins = 500, LayoutOrder = 2};
-	["Coin Option3"] = {ID = 3280554426, EarnedCoins = 1500, LayoutOrder = 3};
-	["Coin Option4"] = {ID = 3280554937, EarnedCoins = 4500, LayoutOrder = 4};
-	["Coin Option5"] = {ID = 3280555256, EarnedCoins = 10000, LayoutOrder = 5};
-	["Coin Option6"] = {ID = 3280555633, EarnedCoins = 20000, LayoutOrder = 6};
+	["Coin Option1"] = {ID = 3280553599, EarnedCoins = 10000, LayoutOrder = 1};
+	["Coin Option2"] = {ID = 3280553720, EarnedCoins = 50000, LayoutOrder = 2};
+	["Coin Option3"] = {ID = 3280554426, EarnedCoins = 150000, LayoutOrder = 3};
+	["Coin Option4"] = {ID = 3280554937, EarnedCoins = 500000, LayoutOrder = 4};
+	["Coin Option5"] = {ID = 3280555256, EarnedCoins = 1000000, LayoutOrder = 5};
+	["Coin Option6"] = {ID = 3280555633, EarnedCoins = 2000000, LayoutOrder = 6};
 	
 	["FirePrecinct"] = {ID = 3296251177};
 	["PolicePrecinct"] = {ID = 3296251266};

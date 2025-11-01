@@ -30,6 +30,24 @@ ForceCivTest.Name  = "ForceCivTest"
 
 local CiviliansFolder   = ReplicatedStorage:WaitForChild("FuncTestGroundRS"):WaitForChild("Civilians")
 
+local zoneCellsCache   = {}
+local zoneCellsVersion = {}
+
+local civTemplates = {}
+local function refreshCivTemplates()
+	table.clear(civTemplates)
+	for _, child in ipairs(CiviliansFolder:GetChildren()) do
+		civTemplates[#civTemplates+1] = child
+	end
+end
+refreshCivTemplates()
+CiviliansFolder.ChildAdded:Connect(function()
+	task.defer(refreshCivTemplates)
+end)
+CiviliansFolder.ChildRemoved:Connect(function()
+	task.defer(refreshCivTemplates)
+end)
+
 local CFG = {
 	-- populations
 	MaxAlivePerZone      = 1,
@@ -190,20 +208,46 @@ local function buildCellSet(list)
 end
 
 -- Map every non-origin zone cell -> { id=zoneId, mode=zoneMode }
-local function buildAllZonesCellMapExcept(player, exceptZoneId)
-	local zones = ZoneTrackerModule.getAllZones(player)
-	local map = {}
-	if zones then
-		for zId, z in pairs(zones) do
-			if zId ~= exceptZoneId and z and z.gridList then
-				for _, c in ipairs(z.gridList) do
-					map[cellKey(c.x, c.z)] = { id = zId, mode = z.mode }
+local function bumpZoneCellsVersion(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then return end
+	local uid = player.UserId
+	zoneCellsVersion[uid] = (zoneCellsVersion[uid] or 0) + 1
+end
+
+local function buildAllZonesCellMapExcept(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return {}
+	end
+	local uid = player.UserId
+	local currentVersion = zoneCellsVersion[uid] or 0
+	local cached = zoneCellsCache[uid]
+	if not cached or cached.version ~= currentVersion then
+		local cells = cached and cached.cells or {}
+		if cached then
+			table.clear(cells)
+		else
+			cells = {}
+			cached = { cells = cells }
+		end
+
+		local zones = ZoneTrackerModule.getAllZones(player)
+		if zones then
+			for zId, z in pairs(zones) do
+				if z and z.gridList then
+					local mode = z.mode
+					for _, c in ipairs(z.gridList) do
+						cells[cellKey(c.x, c.z)] = { id = zId, mode = mode }
+					end
 				end
 			end
 		end
+
+		cached.version = currentVersion
+		zoneCellsCache[uid] = cached
 	end
-	return map
+	return cached.cells
 end
+
 
 local neighbors4 = { {1,0}, {-1,0}, {0,1}, {0,-1} }
 
@@ -245,9 +289,9 @@ local function collectOutsideEdgeCandidates(plot, zone)
 	return candidates
 end
 
-local function isCellAllowedSpawn(x, z, zonesMap, allowedModes)
+local function isCellAllowedSpawn(x, z, zonesMap, allowedModes, exceptZoneId)
 	local ent = zonesMap[cellKey(x, z)]
-	if not ent then return true end                     -- empty cell => allowed
+	if not ent or (exceptZoneId and ent.id == exceptZoneId) then return true end -- empty/own cell => allowed
 	if allowedModes and allowedModes[ent.mode] then
 		return true                                     -- whitelisted zone => allowed
 	end
@@ -256,13 +300,13 @@ end
 
 -- Push outward from a starting neighbor cell until we hit an allowed cell (empty or whitelisted zone),
 -- or until we exhaust the step budget.
-local function pushOutwardToAllowedOrEmpty(startX, startZ, dx, dz, zonesMap, allowedModes, maxSteps)
+local function pushOutwardToAllowedOrEmpty(startX, startZ, dx, dz, zonesMap, allowedModes, maxSteps, exceptZoneId)
 	local x, z   = startX, startZ
 	local steps  = 0
-	while (not isCellAllowedSpawn(x, z, zonesMap, allowedModes)) and steps < maxSteps do
+	while (not isCellAllowedSpawn(x, z, zonesMap, allowedModes, exceptZoneId)) and steps < maxSteps do
 		x += dx; z += dz; steps += 1
 	end
-	if isCellAllowedSpawn(x, z, zonesMap, allowedModes) then
+	if isCellAllowedSpawn(x, z, zonesMap, allowedModes, exceptZoneId) then
 		return { x = x, z = z }, steps
 	end
 	return nil, steps
@@ -270,7 +314,7 @@ end
 
 -- Origin-side pick: spawn at furthest-most edge outside the origin zone (existing behavior)
 local function pickEdgeSpawnOutside(plot, player, zone, zoneId, wpath)
-	local zonesMap = buildAllZonesCellMapExcept(player, zoneId)
+	local zonesMap = buildAllZonesCellMapExcept(player)
 	local cands    = collectOutsideEdgeCandidates(plot, zone)
 	if #cands == 0 then return nil end
 
@@ -285,7 +329,7 @@ local function pickEdgeSpawnOutside(plot, player, zone, zoneId, wpath)
 		local endCell, steps = pushOutwardToAllowedOrEmpty(
 			c.start.x, c.start.z,
 			c.dirGrid.dx, c.dirGrid.dz,
-			zonesMap, CFG.EdgeAllowedZoneModes, CFG.EdgePushMaxSteps
+			zonesMap, CFG.EdgeAllowedZoneModes, CFG.EdgePushMaxSteps, zoneId
 		)
 		if endCell then
 			local w = gridToWorld(endCell, plot)
@@ -305,7 +349,7 @@ end
 -- We choose the candidate best aligned with the final approach vector; if that outside neighbor is inside a
 -- disallowed zone, we push outward until empty/whitelisted.
 local function pickEdgeDespawnOutside(plot, player, destZone, destZoneId, wpath)
-	local zonesMap = buildAllZonesCellMapExcept(player, destZoneId)
+	local zonesMap = buildAllZonesCellMapExcept(player)
 	local cands    = collectOutsideEdgeCandidates(plot, destZone)
 	if #cands == 0 then return nil end
 	if not (wpath and #wpath >= 2) then return nil end
@@ -322,7 +366,7 @@ local function pickEdgeDespawnOutside(plot, player, destZone, destZoneId, wpath)
 		local endCell, _ = pushOutwardToAllowedOrEmpty(
 			c.start.x, c.start.z,
 			c.dirGrid.dx, c.dirGrid.dz,
-			zonesMap, CFG.EdgeAllowedZoneModes, CFG.EdgePushMaxSteps
+			zonesMap, CFG.EdgeAllowedZoneModes, CFG.EdgePushMaxSteps, destZoneId
 		)
 		if endCell then
 			local w = gridToWorld(endCell, plot)
@@ -533,8 +577,8 @@ end
 -- =========================================================
 local function pickCivilian()
 	local kids = CiviliansFolder:GetChildren()
-	if #kids == 0 then return nil end
-	return kids[math.random(1, #kids)]
+	if #civTemplates == 0 then return nil end
+	return civTemplates[math.random(1, #civTemplates)]
 end
 
 spawnOneCivilianFlexible = function(player, zoneId)
@@ -684,6 +728,7 @@ end
 local function onZoneCreateOrRecreate(player, zoneId)
 	-- Do NOT gate this on isZoneReady(); attach watchers and activate immediately.
 	zoneOwner[zoneId] = player
+	bumpZoneCellsVersion(player)
 
 	local plot = getPlayerPlot(player)
 	if plot then
@@ -745,6 +790,7 @@ end
 
 -- When *any* zone is removed, stop moves, prevent respawn, and hard-clean.
 ZoneRemovedEvent.Event:Connect(function(player, removedZoneId, _mode, _gridList)
+	bumpZoneCellsVersion(player)
 	CivilianMovement.stopMovesForKey(removedZoneId)
 	setActive(removedZoneId, false)
 	readyAwaiters[removedZoneId] = nil  -- cancel any waiters
@@ -788,6 +834,13 @@ ForceCivTest.Event:Connect(function(player, zoneId)
 	if not isZoneReady(player, zoneId) then
 		scheduleReadyTopUp(player, zoneId, { sleep = 0.25, maxTries = 240 })
 	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	local uid = player and player.UserId
+	if not uid then return end
+	zoneCellsCache[uid] = nil
+	zoneCellsVersion[uid] = nil
 end)
 
 print("CivilianSpawner: Iteration 3.0 online (origin-edge spawn + destination-edge despawn; furthest-edge outward push + zone-type exceptions; always-activate; ready-await topups; folder watchers; queued despawn; TTL jitter; 1 per zone; hybrid roads)")

@@ -98,7 +98,7 @@ local TEMPLATE_BY_CATEGORY = {
 	SportsAndRecreation = "RequestSport",
 }
 
--- Which categories we evaluate:
+-- Which categories we evaluate (targets get icons for these)
 local CATEGORIES = { "Police", "Fire", "Health", "Education", "Landmark", "SportsAndRecreation" }
 
 -- Which zones *receive* services (targets)
@@ -366,8 +366,8 @@ end
 -- Semantics preserved: treat config radius as Chebyshev (L∞) tile radius.
 ----------------------------------------------------------------
 local function hasCategoryCoverage(player: Player, targetZone, categoryName: string): boolean
-	local bag = CATEGORY[categoryName]; if not bag then return true end
-	local all = ZoneTracker.getAllZones(player); if not all then return true end
+	local bag = CATEGORY[categoryName]; if not bag then return false end
+	local all = ZoneTracker.getAllZones(player); if not all then return false end
 	local idx = ensureProviderIndex(player, categoryName)
 
 	-- Quickly compute target zone AABB once
@@ -376,18 +376,10 @@ local function hasCategoryCoverage(player: Player, targetZone, categoryName: str
 
 	-- If *none* of the provider modes have any tiles or intersect, early-out false
 	local anyCandidate = false
-	for mode, mm in pairs(idx.modes) do
-		-- If no tiles for this mode, skip
+	for _, mm in pairs(idx.modes) do
 		if mm and next(mm.tiles) ~= nil then
 			anyCandidate = true
-			-- Expanded extent check by radius
-			local r = mm.radius
-			if not ((tbb.maxX + r) < mm.minX or (tbb.minX - r) > mm.maxX or (tbb.maxZ + r) < mm.minZ or (tbb.minZ - r) > mm.maxZ) then
-				-- There could be coverage; proceed to per-tile checks below
-				anyCandidate = true
-			else
-				-- This mode's providers cannot reach the AABB; keep scanning other modes
-			end
+			break
 		end
 	end
 	if not anyCandidate then
@@ -396,10 +388,9 @@ local function hasCategoryCoverage(player: Player, targetZone, categoryName: str
 
 	-- For each target tile, probe nearby buckets within each mode's radius (O(|A| * sum r^2))
 	for _, a in ipairs(targetZone.gridList or {}) do
-		for mode, mm in pairs(idx.modes) do
+		for _, mm in pairs(idx.modes) do
 			if mm and next(mm.tiles) ~= nil then
 				local r = mm.radius
-				-- Fast check: if the single tile is outside expanded extents, skip mode
 				if not ((a.x + r) < mm.minX or (a.x - r) > mm.maxX or (a.z + r) < mm.minZ or (a.z - r) > mm.maxZ) then
 					for dz = -r, r do
 						for dx = -r, r do
@@ -415,18 +406,30 @@ local function hasCategoryCoverage(player: Player, targetZone, categoryName: str
 	return false
 end
 
--- NEW: unified check for whether a category is unlocked for this player.
+----------------------------------------------------------------
+-- CORRECT CATEGORY UNLOCK CHECK FOR YOUR DATA MODEL
+----------------------------------------------------------------
 local function isCategoryUnlocked(player: Player, categoryName: string): boolean
-	-- If no progression system present, be permissive (unchanged behavior).
+	-- No progression module? Keep legacy permissive behavior.
 	if not Progression then return true end
+
+	-- Category must exist in Balance.UxpConfig.Category and contain at least one provider feature.
 	local bag = CATEGORY[categoryName]
-	-- If the category has no providers configured, consider it unlocked to avoid blocking.
-	if not bag then return true end
-	-- If the player has at least one provider unlock for this category, it's unlocked.
-	for mode in pairs(bag) do
-		local ok, has = pcall(function() return Progression.playerHasUnlock(player, mode) end)
-		if ok and has then return true end
+	if type(bag) ~= "table" then
+		return false
 	end
+
+	-- A category is unlocked iff the player has unlocked **any** provider feature listed in that category.
+	for featureName, _ in pairs(bag) do
+		local ok, has = pcall(function()
+			return (Progression :: any).playerHasUnlock and (Progression :: any).playerHasUnlock(player, featureName)
+		end)
+		if ok and has == true then
+			return true
+		end
+	end
+
+	-- None of the providers are unlocked yet -> category is locked for this player.
 	return false
 end
 
@@ -605,6 +608,11 @@ local function buildMissingTiles(player: Player, categoryName: string): ({ [stri
 	local bag = CATEGORY[categoryName]
 	if not bag then dprint("CATEGORY absent for", categoryName); return {}, nil end
 
+	-- Don’t compute/emit for locked category
+	if not isCategoryUnlocked(player, categoryName) then
+		return {}, nil
+	end
+
 	for zid, z in pairs(allZones) do
 		if TARGET_BUILDING_MODES[z.mode] then
 			if not isZonePopulated(player, zid) then
@@ -627,6 +635,11 @@ local function buildMissingTiles(player: Player, categoryName: string): ({ [stri
 end
 
 local function placeCategoryClusters(player: Player, categoryName: string, tileSet: { [string]: boolean }): number
+	-- Don’t place icons for locked category
+	if not isCategoryUnlocked(player, categoryName) then
+		return 0
+	end
+
 	local template = TEMPLATE_BY_CATEGORY[categoryName]
 	if not template then dprint("No template mapping for", categoryName); return 0 end
 	local plot = getPlayerPlot(player); if not plot then dprint("No plot"); return 0 end
@@ -663,7 +676,7 @@ end
 -- DEV canary (single pulse) to prove rendering even if coverage logic yields none
 local function dev_canary(player: Player)
 	if not DEV_CANARY_ENABLE then return end
-	-- Respect player level: only canary a category that is unlocked (unless no Progression present).
+	-- Respect player level: only canary a category that is unlocked.
 	if not isCategoryUnlocked(player, DEV_CANARY_CATEGORY) then
 		dprint("DEV canary suppressed; category locked:", DEV_CANARY_CATEGORY)
 		return
@@ -690,8 +703,6 @@ end
 -----------------------------
 -- WEAKEST-AREA CLOCK
 -----------------------------
--- Pick the populated building zone with the FEWEST covered civic categories,
--- skipping zones on cool-down, and return it + the list of missing categories.
 local function findWeakestZoneAndMissing(player: Player): (any?, {string})
 	local zones = ZoneTracker.getAllZones(player)
 	if not zones then return nil, {} end
@@ -706,7 +717,6 @@ local function findWeakestZoneAndMissing(player: Player): (any?, {string})
 			if (now() - lastPing) >= LAST_PING_COOLDOWN_SEC then
 				local missing, coveredCount = {}, 0
 				for _, cat in ipairs(CATEGORIES) do
-					-- only evaluate categories that are unlocked for this player
 					if isCategoryUnlocked(player, cat) then
 						if hasCategoryCoverage(player, z, cat) then
 							coveredCount += 1
@@ -740,12 +750,9 @@ end
 
 -- Revalidate that focus is still valid & still missing
 local function focusStillNeeded(player: Player, f: table): boolean
-	-- zone exists?
 	local zones = ZoneTracker.getAllZones(player); if not zones then return false end
 	local z = zones[f.zoneId]; if not z then return false end
-	-- zone still populated and a target?
 	if not (TARGET_BUILDING_MODES[z.mode] and isZonePopulated(player, f.zoneId)) then return false end
-	-- category still unlocked and still missing?
 	if not isCategoryUnlocked(player, f.category) then return false end
 	return not hasCategoryCoverage(player, z, f.category)
 end
@@ -762,7 +769,7 @@ local function pickNewFocus(player: Player): table?
 	table.sort(clusters, function(a,b) return #a > #b end)
 	local ctr = centroid(clusters[1])
 
-	local cat = missing[1]  -- deterministic; your shuffle already varies choices over time
+	local cat = missing[1]
 	local nameKey = string.format("Focus_%s_%d_%d", cat, ctr.x, ctr.z)
 
 	local f = { zoneId = zone.zoneId or zone.id, category = cat, cx = ctr.x, cz = ctr.z, nameKey = nameKey }
@@ -829,7 +836,6 @@ local function startClockFor(player: Player)
 	_clockTasks[player] = true
 	task.spawn(function()
 		while _clockTasks[player] do
-			-- refresh the single focused icon (pick one if none)
 			ensureFocusIcon(player)
 			task.wait(CLOCK_PERIOD_SEC)
 		end
@@ -922,23 +928,22 @@ local function wire()
 			end)
 		end)
 	end
-	
+
 	local DemandUpdated = BindableEvents:FindFirstChild("DemandUpdated", 5)
 	if DemandUpdated then
 		(DemandUpdated :: any).Event:Connect(function(player: Player, demandTbl: any, snapshot: any)
-			-- snapshot.suggestAdvisor is pre-computed by the engine (high demand or high strain)
 			if snapshot and snapshot.suggestAdvisor then
 				CivicRequestsAdvisor.scanCity(player)
 			end
 		end)
 	end
-	
+
 	if ZoneRemoved then
 		(ZoneRemoved :: any).Event:Connect(function(p: Player, zid: string)
 			local uid = p.UserId
 			if _populated[uid] then _populated[uid][zid] = nil end
 
-			-- we don't know the removed zone mode here; conservatively mark all categories dirty
+			-- conservatively mark all categories dirty
 			markAllProviderIndexDirty(uid)
 
 			-- drop focus if it was pointing at the removed zone
@@ -961,7 +966,6 @@ end
 
 -- Player lifecycle: start/stop the advisor clock
 Players.PlayerAdded:Connect(function(plr)
-	-- Don’t force a scan on join; the clock will handle gentle nudges.
 	task.delay(1.0, function()
 		if plr.Parent then startClockFor(plr) end
 	end)

@@ -288,15 +288,16 @@ function Utility.SetNetworkOwnershipAuto_Safe(Part)
 	Part:SetNetworkOwnershipAuto()
 end
 
-function Utility.CloneTable(SrcTable)
-	local DestTable = {}
-	for Key, Value in SrcTable do
-		if typeof(Value) == "table" then
-			Value = Utility.CloneTable(Value)
-		end
-		DestTable[Key] = Value
+function Utility.CloneTable(Src)
+	if typeof(Src) ~= "table" then
+		return Src
 	end
-	return DestTable
+
+	local Dest = {}
+	for Key, Value in pairs(Src) do
+		Dest[Key] = Utility.CloneTable(Value)
+	end
+	return Dest
 end
 
 local Temp = Instance.new("Part")

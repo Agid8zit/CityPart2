@@ -38,6 +38,12 @@ local DefaultCarsFolder = CarsRoot:WaitForChild("RedTestCar")
 local UniqueCarsFolder  = CarsRoot:FindFirstChild("UniqueCars")
 local BusesFolder       = CarsRoot:FindFirstChild("Buses") or CarsRoot:FindFirstChild("Busses")
 
+local ServerScriptService = game:GetService("ServerScriptService")
+local Services = ServerScriptService:WaitForChild("Services")
+
+-- Bus tiers/levels read
+local PlayerDataInterfaceService = require(Services:WaitForChild("PlayerDataInterfaceService"))
+
 --======================================================================
 --  CONFIG (tune to taste)
 --======================================================================
@@ -53,6 +59,13 @@ local CAR_LIFETIME_SEC          = 300     -- hard cleanup fallback
 local FADE_OUT_TIME             = 1.5     -- despawn fade
 local RECOMPUTE_DEBOUNCE        = 0.1     -- recompute coalescing
 local RESCAN_PERIODIC_SEC       = 45      -- periodic safety net
+
+--======================================================================
+--  BUS BALANCING (tiers/levels → % traffic that are buses)
+--======================================================================
+local MAX_BUS_SHARE        = 0.30  -- hard cap when all 10 tiers are level 100
+local LOG_RESPONSE_A       = 0.50  -- >0 means stronger early returns, diminishing later
+local MAX_BUS_TIERS        = 10    -- schema says 10
 
 -- Two-way options (kept; ignored in zone-based modes below)
 local BUS_SPAWN_CHANCE          = 0.25
@@ -93,6 +106,20 @@ local templates = {
 	fire    = {},
 	bus     = {},
 }
+
+-- Keep a per-tier index for buses so tier unlock gates selection cleanly
+local busByTier = {}   -- [tierIndex] = {Model, ...}
+for i=1, MAX_BUS_TIERS do busByTier[i] = {} end
+
+local function busTierOf(model: Instance): number
+	-- Prefer explicit attribute if you add it later
+	local att = tonumber(model:GetAttribute("Tier"))
+	if att then return math.clamp(math.floor(att), 1, MAX_BUS_TIERS) end
+	-- Fallback: parse trailing digits in name (e.g., "Bus3" -> 3)
+	local n = tonumber(string.match(model.Name, "(%d+)$"))
+	if n then return math.clamp(n, 1, MAX_BUS_TIERS) end
+	return 1
+end
 
 --======================================================================
 --  ALL-WAY STOP CONFIG + HELPERS
@@ -246,7 +273,27 @@ local function refreshTemplateCache()
 		end
 	end
 	clear(templates.bus)
-	if BusesFolder then repackChildren(BusesFolder, templates.bus) end
+	for i=1, MAX_BUS_TIERS do clear(busByTier[i]) end
+
+	if BusesFolder then
+		-- Gather all bus models into templates.bus and per-tier bins
+		local function addBusModel(m)
+			if m:IsA("Model") then
+				table.insert(templates.bus, m)
+				local ti = busTierOf(m)
+				table.insert(busByTier[ti], m)
+			end
+		end
+		for _, ch in ipairs(BusesFolder:GetChildren()) do
+			if ch:IsA("Model") then
+				addBusModel(ch)
+			elseif ch:IsA("Folder") then
+				for _, m in ipairs(ch:GetChildren()) do
+					addBusModel(m)
+				end
+			end
+		end
+	end
 end
 refreshTemplateCache()
 local function watchFolder(folder)
@@ -256,18 +303,81 @@ local function watchFolder(folder)
 end
 watchFolder(DefaultCarsFolder); watchFolder(UniqueCarsFolder); watchFolder(BusesFolder)
 
+local function unlockedTiersFromUnlockValue(unlockNum: number): number
+	-- same math as your Interface: floor(unlock/10)+1 clamped to 1..10
+	local t = math.floor(math.max(0, tonumber(unlockNum) or 0) / 10) + 1
+	return math.clamp(t, 1, MAX_BUS_TIERS)
+end
+
+-- Log-shaped contribution: strong early gains; diminishing later
+local function levelContributionLog(level: number): number
+	local L = math.clamp(tonumber(level) or 0, 0, 100)
+	if LOG_RESPONSE_A <= 0 then
+		return L/100 -- linear fallback if A<=0
+	end
+	local num = math.log(1 + LOG_RESPONSE_A * L)
+	local den = math.log(1 + LOG_RESPONSE_A * 100)
+	return (den > 0) and (num / den) or (L/100)
+end
+
+-- Main bus share + highest eligible tier for this player
+local function computeBusShareAndMaxTier(player: Player): (number, number)
+	-- Interface helpers you added at the bottom of your file:
+	--   GetTransitUnlock(player, "busDepot")
+	--   GetTransitTierLevel(player, "busDepot", tierIndex)
+	local unlock = PlayerDataInterfaceService.GetTransitUnlock(player, "busDepot") or 0
+	local unlocked = unlockedTiersFromUnlockValue(unlock)
+
+	local sum = 0
+	local maxTierEligible = 0
+	for ti = 1, unlocked do
+		local lv = PlayerDataInterfaceService.GetTransitTierLevel(player, "busDepot", ti) or 0
+		if lv > 0 then
+			maxTierEligible = ti
+		end
+		sum += levelContributionLog(lv) -- 0..1 per tier
+	end
+
+	-- Cap at 30% when all 10 tiers are 100: sum==10 ⇒ 0.3
+	local share = MAX_BUS_SHARE * (sum / MAX_BUS_TIERS)
+	return share, maxTierEligible
+end
+
+
 local function pickTemplateForPlayer(player)
 	local uid = player.UserId
-	if busSupport[uid] and #templates.bus > 0 and math.random() < BUS_SPAWN_CHANCE then
-		return templates.bus[math.random(1, #templates.bus)], "Bus"
+
+	-- Compute per-player bus share + max eligible tier
+	local busShare, maxBusTier = 0, 0
+	if busSupport[uid] and #templates.bus > 0 then
+		busShare, maxBusTier = computeBusShareAndMaxTier(player)
 	end
-	if busSupport[uid] and #templates.bus == 0 and not _busWarnedMissing then
-		warn("[UnifiedTraffic] Bus support enabled but no bus models found under Cars.Buses/Busses; falling back to cars.")
-		_busWarnedMissing = true
+
+	-- Try to spawn a bus under the share constraint if supported & any tier is eligible
+	if busSupport[uid] and maxBusTier > 0 and math.random() < busShare then
+		-- Choose a bus from tiers 1..maxBusTier (weighted uniformly across available models)
+		-- If you want to bias toward higher tiers, we can weight later—this is simple & robust.
+		local candidatePool = {}
+		for ti = 1, maxBusTier do
+			-- e.g., weight = ti (linear) or ti^2 (quadratic). Start with linear:
+			local weight = ti
+			for _, m in ipairs(busByTier[ti]) do
+				for _ = 1, weight do
+					table.insert(candidatePool, m)
+				end
+			end
+		end
+		if #candidatePool > 0 then
+			return candidatePool[math.random(1, #candidatePool)], "Bus"
+		end
+		-- fallthrough to fire/default if something odd happened
 	end
+
+	-- Keep your fire/default logic unchanged
 	if fireSupport[uid] and #templates.fire > 0 and math.random() < FIRE_SPAWN_CHANCE then
 		return templates.fire[math.random(1, #templates.fire)], "Fire"
 	end
+
 	if #templates.default == 0 then
 		warn("[UnifiedTraffic] DefaultCarsFolder is empty; cannot spawn traffic.")
 		return nil, nil

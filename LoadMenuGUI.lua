@@ -1,11 +1,13 @@
-local LoadMenu = {}
+﻿local LoadMenu = {}
 
 -- Services
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
-local UserInputService  = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players             = game:GetService("Players")
+local RunService          = game:GetService("RunService")
+local TweenService        = game:GetService("TweenService")
+local UserInputService    = game:GetService("UserInputService")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local LocalizationService = game:GetService("LocalizationService")
+local CityLoader = require(ReplicatedStorage.Scripts.UI.CityLoader)
 
 -- Optional deps
 local ConstantsOk, ConstantsAny = pcall(function()
@@ -64,9 +66,30 @@ local function findRF(name: string): RemoteFunction?
 	return nil
 end
 
+local RemoteEvents: Folder = EventsFolder:WaitForChild("RemoteEvents")
+local WorldReloadRE: RemoteEvent = RemoteEvents:WaitForChild("WorldReload") :: RemoteEvent
 local RF_GetSaveSlots: RemoteFunction?   = findRF("GetSaveSlots")
 local RF_SwitchToSlot: RemoteFunction?   = findRF("SwitchToSlot")
 local RF_DeleteSaveFile: RemoteFunction? = findRF("DeleteSaveFile")
+
+local isReloading = false
+WorldReloadRE.OnClientEvent:Connect(function(kind: string, a: any, b: any)
+	if kind == "begin" then
+		isReloading = true
+		CityLoader.Show({ delay = 0, message = "Loading City" })
+
+	elseif kind == "progress" then
+		-- a = percent number, b = label string
+		local pct = tonumber(a) or 0
+		local label = (typeof(b) == "string" and b) or nil
+		-- Update bar + (optional) label
+		CityLoader.SetProgress(pct, label)
+
+	elseif kind == "end" then
+		isReloading = false
+		CityLoader.Hide()
+	end
+end)
 
 -- Spinner tween
 local SpinTween: Tween = TweenService:Create(
@@ -87,6 +110,71 @@ local DeleteMode = false
 local PendingDeleteSlotId: string? = nil
 
 -- Helpers ------------------------------------------------------------------
+
+-- Preferred locale with sensible defaults
+local function getPreferredLocale(): string
+	local loc = LocalizationService.RobloxLocaleId
+	if typeof(loc) ~= "string" or loc == "" then
+		-- some environments expose SystemLocaleId; use it if present
+		local ok, sys = pcall(function() return LocalizationService.SystemLocaleId end)
+		if ok and typeof(sys) == "string" and sys ~= "" then
+			loc = sys
+		else
+			loc = "en-us"
+		end
+	end
+	return string.lower(loc)
+end
+
+-- Trim name and fall back to "City <slotId>"
+local function resolveSaveDisplayName(raw: any, slotId: string): string
+	local text = ""
+	if typeof(raw) == "string" then
+		-- remove leading/trailing whitespace
+		text = raw:gsub("^%s+", ""):gsub("%s+$", "")
+	end
+	if text == "" then
+		return ("City %s"):format(slotId)
+	end
+	return text
+end
+
+-- Locale-aware "Last Played" label with seconds/ms handling
+local function formatLastPlayedLabel(timestamp: any): string
+	local value = tonumber(timestamp)
+	if not value or value <= 0 then
+		return "Last Played: —"
+	end
+
+	local ok, dt
+	if value > 1e12 then
+		-- looks like milliseconds
+		ok, dt = pcall(DateTime.fromUnixTimestampMillis, value)
+	else
+		ok, dt = pcall(DateTime.fromUnixTimestamp, value)
+	end
+	if not ok or not dt then
+		return "Last Played: —"
+	end
+
+	local locale = getPreferredLocale()
+	local okFmt, formatted = pcall(function()
+		-- "LLL" = localized long date + time (e.g., "Sep 12, 2025 3:45 PM")
+		return dt:FormatLocalTime("LLL", locale)
+	end)
+	if not okFmt or typeof(formatted) ~= "string" or formatted == "" then
+		-- conservative fallback
+		local okFmt2; okFmt2, formatted = pcall(function()
+			return dt:FormatLocalTime("yyyy-MM-dd HH:mm", locale)
+		end)
+		if not okFmt2 then
+			return "Last Played: —"
+		end
+	end
+
+	return ("Last Played: %s"):format(formatted)
+end
+
 local function resolveGuiButton(obj: Instance?): GuiButton?
 	if not obj then return nil end
 	if obj:IsA("GuiButton") then return obj end
@@ -106,25 +194,15 @@ local function openCityNameGui(): ScreenGui?
 end
 
 local function showLoading(afterSeconds: number?)
-	local start = os.clock()
-	if LoadingHB then LoadingHB:Disconnect(); LoadingHB = nil end
-	LoadingHB = RunService.Heartbeat:Connect(function()
-		if (os.clock() - start) > (afterSeconds or 0.6) then
-			UI_LoadingScreen.Visible = true
-			if SpinTween.PlaybackState ~= Enum.PlaybackState.Playing then
-				SpinTween:Play()
-			end
-			local dots = (math.floor((os.clock() * 3) % 3) + 1)
-			UI_LoadingText.Text = "Loading Save" .. string.rep(".", dots)
-		end
-	end)
+	-- same UX as before: don't flash UI for ultra‑fast calls
+	CityLoader.Show({
+		delay = afterSeconds or 0.6,
+		message = "Loading Save", -- text inside the fancy UI's "Loading..." label
+	})
 end
 
 local function hideLoading()
-	UI_LoadingScreen.Visible = false
-	if SpinTween.PlaybackState == Enum.PlaybackState.Playing then SpinTween:Cancel() end
-	UI_LoadingIcon.Rotation = 0
-	if LoadingHB then LoadingHB:Disconnect(); LoadingHB = nil end
+	CityLoader.Hide()
 end
 
 -- Data ---------------------------------------------------------------------
@@ -169,15 +247,11 @@ local function paintAsSave(frame: Frame, s: SaveRow, isCurrent: boolean, inDelet
 	if icon then
 		icon.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
 	end
-	if nameLbl then nameLbl.Text = s.cityName or ("City " .. s.id) end
+	if nameLbl then
+		nameLbl.Text = resolveSaveDisplayName(s.cityName, s.id)
+	end
 	if dateLbl then
-		local t = tonumber(s.lastPlayed or 0) or 0
-		if t > 0 then
-			local dt = DateTime.fromUnixTimestamp(t)
-			dateLbl.Text = "Last Played: " .. dt:FormatLocalTime("LL", "en-us")
-		else
-			dateLbl.Text = "Last Played: —"
-		end
+		dateLbl.Text = formatLastPlayedLabel(s.lastPlayed)
 	end
 
 	if not (btn and btnText) then return end
@@ -216,16 +290,23 @@ local function paintAsSave(frame: Frame, s: SaveRow, isCurrent: boolean, inDelet
 					return
 				end
 				LoadMutex = true
-				showLoading(0.25)
+
+				-- Show right away for snappy UX; the server will keep it up during the reload window
+				CityLoader.Show({ delay = 0, message = "Switching Save" })
+
 				local ok, res = pcall(function()
 					return (RF_SwitchToSlot :: RemoteFunction):InvokeServer(s.id, false)
 				end)
-				hideLoading()
 				LoadMutex = false
+
 				if not ok or res ~= true then
+					-- No reload will happen on failure, so hide the loader
+					CityLoader.Hide()
 					warn("[LoadMenu] Load failed: ", tostring(res))
 					return
 				end
+
+				-- Success: do NOT hide here. We wait for WorldReloadRE "end".
 				UI.Enabled = false
 			end)
 		end
@@ -243,7 +324,7 @@ local function paintAsNew(frame: Frame)
 	if icon then
 		icon.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
 	end
-	if dateLbl then dateLbl.Text = "" end
+	if dateLbl then dateLbl.Text = "Last Played: —" end
 	if nameLbl then nameLbl.Text = "New Save" end
 
 	if btn and btnText then
@@ -284,7 +365,7 @@ local function paintAsNew(frame: Frame)
 
 			g:SetAttribute("PendingSlotId", free)
 			g:SetAttribute("PendingSlotName", "New Save")
-			print("[LoadMenu] NEW clicked → staged PendingSlotId =", free)
+			print("[LoadMenu] NEW clicked -> staged PendingSlotId =", free)
 
 			UI.Enabled = false
 			LoadMutex = false
@@ -417,11 +498,27 @@ function LoadMenu.Init(): ()
 				return
 			end
 
-			showLoading(0.15)
+			CityLoader.Show({ delay = 0.15, message = "Deleting Save" })
 			local ok, res, reason = pcall(function()
 				return (RF_DeleteSaveFile :: RemoteFunction):InvokeServer(PendingDeleteSlotId :: string)
 			end)
-			hideLoading()
+
+			-- If the delete does NOT trigger a world reload, we hide now.
+			-- If the server does trigger a reload, our WorldReloadRE listener keeps it up and hides on "end".
+			if not ok or res ~= true then
+				CityLoader.Hide()
+				warn("[LoadMenu] Delete failed: ", tostring(reason or res))
+				PendingDeleteSlotId = nil
+				buildTiles()
+				return
+			else
+				-- small defer to allow a possible "begin" to arrive; if none, hide
+				task.defer(function()
+					if not isReloading then
+						CityLoader.Hide()
+					end
+				end)
+			end
 
 			UI_DeleteModal.Visible = false
 			if not ok or res ~= true then

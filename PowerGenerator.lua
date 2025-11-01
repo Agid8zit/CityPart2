@@ -68,6 +68,7 @@ local BUILD_INTERVAL = 0.1
 local Y_OFFSET       = 0.01
 local AVOID_ROPES_THROUGH_NON_ROAD = true
 local BRIDGE_TO_NEAREST_PADPOLE    = false --These are BUILDING ZONE SPECIFIC these are not the normal poles
+local PADPOLE_LINK_MAX_DISTANCE = 80
 print("[PowerGeneratorModule] Loaded")
 
 ---------------------------------------------------------------------
@@ -130,9 +131,22 @@ local function getGlobalBoundsForPlot(plot)
 	return gb, terrains
 end
 
+
 ---------------------------------------------------------------------
 --  Helpers
 ---------------------------------------------------------------------
+
+local _queuedRopeRebuilds = {}
+local function _queueRopeRebuild(player, powerZoneId)
+	local key = tostring(player.UserId) .. "|" .. tostring(powerZoneId)
+	if _queuedRopeRebuilds[key] then return end
+	_queuedRopeRebuilds[key] = true
+	task.defer(function()
+		_queuedRopeRebuilds[key] = nil
+		PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
+		PowerGeneratorModule.ensureOverlapBoxesForPowerZone(player, powerZoneId)
+	end)
+end
 
 local function isRoadCell(occupantTypes)
 	if not occupantTypes then return false end
@@ -484,6 +498,36 @@ local function _nearestPoleModel(zoneFolder: Instance, fromPos: Vector3, maxDist
 		end
 	end
 	return bestModel, best
+end
+
+function PowerGeneratorModule.connectPadPoleToPowerZone(player, padPole)
+	if not (player and padPole) then return end
+
+	local powerZoneId = padPole:GetAttribute("PowerLineZoneId")
+	-- If not stamped yet, try to keep idempotency by leaving it nil,
+	-- but we won't guess here. (Spawn path stamps it for us.)
+	if not powerZoneId then return end
+
+	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
+	local pf   = plot:FindFirstChild("PowerLines"); if not pf then return end
+	local zoneFolder = pf:FindFirstChild(powerZoneId); if not zoneFolder then return end
+
+	-- Find the nearest pole inside this *specific* zone folder
+	local pos = (padPole.PrimaryPart and padPole.PrimaryPart.Position) or padPole:GetPivot().Position
+	local pole, dist = _nearestPoleModel(zoneFolder, pos, PADPOLE_LINK_MAX_DISTANCE)
+	if not pole then
+		-- best-effort: unbounded search as a last resort
+		pole, dist = _nearestPoleModel(zoneFolder, pos, 1e9)
+		if not pole then return end
+	end
+
+	-- Ensure the stamp is present
+	if padPole:GetAttribute("PowerLineZoneId") ~= powerZoneId then
+		padPole:SetAttribute("PowerLineZoneId", powerZoneId)
+	end
+
+	-- Create the two span ropes (uses attachments "1"/"2" with criss‑cross guards)
+	linkPoles(pole, padPole)
 end
 
 -- Find the nearest attachment on any *pole* in zoneFolder to 'fromAtt', within maxDist.
@@ -1494,6 +1538,104 @@ end
 
 
 ---------MORE
+---------------------------------------------------------------------
+--  INTERNAL util used by rebuilders
+---------------------------------------------------------------------
+local function _findPoleInZone(zoneFolder: Instance, gx: number, gz: number)
+	for _, inst in ipairs(zoneFolder:GetChildren()) do
+		if (inst:IsA("Model") or inst:IsA("BasePart"))
+			and inst:GetAttribute("GridX") == gx
+			and inst:GetAttribute("GridZ") == gz
+			and (inst.Name == "PowerLines" or inst:GetAttribute("LineType"))
+		then
+			return inst
+		end
+	end
+	return nil
+end
+
+local function _hasPoleInZone(zoneFolder: Instance, gx: number, gz: number): boolean
+	for _, inst in ipairs(zoneFolder:GetChildren()) do
+		if (inst:IsA("Model") or inst:IsA("BasePart"))
+			and (inst.Name == "PowerLines" or inst:GetAttribute("LineType"))
+			and inst:GetAttribute("GridX") == gx
+			and inst:GetAttribute("GridZ") == gz
+		then
+			return true
+		end
+	end
+	return false
+end
+
+local function _indexOfSeg(segs, gx, gz)
+	for i, seg in ipairs(segs or {}) do
+		local x = (seg.coord and seg.coord.x) or seg.x
+		local z = (seg.coord and seg.coord.z) or seg.z
+		if x == gx and z == gz then return i end
+	end
+	return nil
+end
+
+-- Return true iff all cells between [iA+1, iB-1] are "bridgeable" (road/empty/excluded), and contain no pole.
+local function _cellsBetweenAreRoadOnly(player, zoneFolder, segs, iA, iB)
+	if not iA or not iB or iB - iA <= 1 then return false end
+	for k = iA + 1, iB - 1 do
+		local seg = segs[k]
+		local gx = (seg.coord and seg.coord.x) or seg.x
+		local gz = (seg.coord and seg.coord.z) or seg.z
+
+		-- If any pole still exists mid-run, we don't bridge over it.
+		if _findPoleInZone(zoneFolder, gx, gz) then
+			return false
+		end
+
+		-- Check occupant types
+		local types = ZoneTrackerModule.getGridOccupantTypes(player, gx, gz) or {}
+		-- If there is any non-road occupant (not in exclusions), don't bridge.
+		if hasAnyNonRoad(types) and not isRoadCell(types) then
+			return false
+		end
+	end
+	return true
+end
+
+-- Bridge across **this** removed cell if possible.
+local function _bridgeAcrossRoadGapAt(player, powerZoneId, gx, gz)
+	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
+	local powerFolder = plot:FindFirstChild("PowerLines");                         if not powerFolder then return end
+	local zoneFolder  = powerFolder:FindFirstChild(powerZoneId);                   if not zoneFolder  then return end
+
+	local net  = PowerLinePath.getLineNetworks()[powerZoneId] or PowerLinePath.getLineData(powerZoneId) or {}
+	local segs = net.segments or net.pathCoords or {}
+	if #segs == 0 then return end
+
+	local i0 = _indexOfSeg(segs, gx, gz); if not i0 then return end
+
+	-- Scan backward to nearest existing pole
+	local iL, leftPole = nil, nil
+	for i = i0 - 1, 1, -1 do
+		local s = segs[i]; local x = (s.coord and s.coord.x) or s.x; local z = (s.coord and s.coord.z) or s.z
+		local pole = _findPoleInZone(zoneFolder, x, z)
+		if pole then iL, leftPole = i, pole; break end
+	end
+
+	-- Scan forward to nearest existing pole
+	local iR, rightPole = nil, nil
+	for i = i0 + 1, #segs do
+		local s = segs[i]; local x = (s.coord and s.coord.x) or s.x; local z = (s.coord and s.coord.z) or s.z
+		local pole = _findPoleInZone(zoneFolder, x, z)
+		if pole then iR, rightPole = i, pole; break end
+	end
+
+	if not (leftPole and rightPole and iL and iR) then return end
+
+	-- Only bridge if all the in-between path cells are road/empty/excluded
+	if not _cellsBetweenAreRoadOnly(player, zoneFolder, segs, iL, iR) then return end
+
+	-- Directly link the two neighbors across the road gap
+	linkPoles(leftPole, rightPole)
+end
+
 function PowerGeneratorModule.suppressPoleForRoad(player, roadZoneId, gx, gz)
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return nil end
 	local powerFolder = plot:FindFirstChild("PowerLines");                         if not powerFolder then return nil end
@@ -1539,42 +1681,16 @@ function PowerGeneratorModule.suppressPoleForRoad(player, roadZoneId, gx, gz)
 	-- remove the single conflicting pole
 	target:Destroy()
 
+	-- try an immediate targeted bridge across the just-removed cell
+	_bridgeAcrossRoadGapAt(player, pZoneId, gx, gz)
+
 	-- rope the span across the new road gap
-	PowerGeneratorModule.rebuildRopesForZone(player, pZoneId)
+	_queueRopeRebuild(player, pZoneId)
 
 	-- NEW: recompute boxes for this power zone since a road just suppressed a pole on it
 	PowerGeneratorModule.ensureOverlapBoxesForPowerZone(player, pZoneId)
 
 	return pZoneId
-end
-
----------------------------------------------------------------------
---  INTERNAL util used by rebuilders
----------------------------------------------------------------------
-local function _findPoleInZone(zoneFolder: Instance, gx: number, gz: number)
-	for _, inst in ipairs(zoneFolder:GetChildren()) do
-		if (inst:IsA("Model") or inst:IsA("BasePart"))
-			and inst:GetAttribute("GridX") == gx
-			and inst:GetAttribute("GridZ") == gz
-			and (inst.Name == "PowerLines" or inst:GetAttribute("LineType"))
-		then
-			return inst
-		end
-	end
-	return nil
-end
-
-local function _hasPoleInZone(zoneFolder: Instance, gx: number, gz: number): boolean
-	for _, inst in ipairs(zoneFolder:GetChildren()) do
-		if (inst:IsA("Model") or inst:IsA("BasePart"))
-			and (inst.Name == "PowerLines" or inst:GetAttribute("LineType"))
-			and inst:GetAttribute("GridX") == gx
-			and inst:GetAttribute("GridZ") == gz
-		then
-			return true
-		end
-	end
-	return false
 end
 
 ---------------------------------------------------------------------
@@ -1607,9 +1723,32 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 	local function cx(seg) return seg.coord and seg.coord.x or seg.x end
 	local function cz(seg) return seg.coord and seg.coord.z or seg.z end
 
-	-- NEW: adjacency guard
+	-- Manhattan adjacency (keep original intent when no gap)
 	local function _manhattan1(ax, az, bx, bz)
 		return (math.abs(ax - bx) + math.abs(az - bz)) == 1
+	end
+
+	-- Internal util from earlier in this module:
+	--   _findPoleInZone(zoneFolder, gx, gz)
+	--   hasAnyNonRoad(occupantTypes)
+	--   isRoadCell(occupantTypes)
+	-- are already defined above; we use them here.
+
+	----------------------------------------------------------------------
+	-- NEW: allow bridging across a run of ONLY road (or empty/excluded)
+	--       between the last real pole and the next real pole.
+	----------------------------------------------------------------------
+	local function _canBridgeAcrossRoadOnly(lastIdx, currIdx)
+		if not lastIdx or not currIdx or (currIdx - lastIdx) <= 1 then return false end
+		for k = lastIdx + 1, currIdx - 1 do
+			local seg = segs[k]; local gx, gz = cx(seg), cz(seg)
+			if _findPoleInZone(zoneFolder, gx, gz) then return false end
+			local types = ZoneTrackerModule.getGridOccupantTypes(player, gx, gz) or {}
+			--DEBUG:
+			print(("gap %d,%d types: %s"):format(gx,gz, table.concat((function(t) local a={} for k,v in pairs(t) do if v then table.insert(a,k) end end; return a end)(types),",")))
+			if hasAnyNonRoad(types) and not isRoadCell(types) then return false end
+		end
+		return true
 	end
 
 	-- Prevent last→first (loop) and any re-entrance into already-visited poles
@@ -1618,44 +1757,67 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 
 	local lastPole        = nil
 	local lastGX, lastGZ  = nil, nil
-	local gapSinceLast    = false   -- NEW: track if we saw any missing poles since lastPole
+	local lastIdx         = nil
 
-	for _, seg in ipairs(segs) do
+	for i, seg in ipairs(segs) do
 		local gx, gz = cx(seg), cz(seg)
 		local curr = _findPoleInZone(zoneFolder, gx, gz)
 
 		if curr then
 			local k = key(gx, gz)
-			-- Skip linking *into* an already-visited pole (prevents wrap/dupes)
+
+			-- Skip linking into an already-visited pole (prevents wrap/dupes)
 			if not visited[k] then
-				-- Only link if we did not cross a gap AND cells are adjacent in grid
-				if lastPole and not gapSinceLast and lastGX and lastGZ and _manhattan1(lastGX, lastGZ, gx, gz) then
+				local adjacent = (lastGX and _manhattan1(lastGX, lastGZ, gx, gz)) or false
+				local canBridge = false
+
+				-- If not adjacent, consider a bridge if the gap is ONLY road / empty / excluded
+				if lastIdx and (not adjacent) then
+					canBridge = _canBridgeAcrossRoadOnly(lastIdx, i)
+				end
+
+				if lastPole and (adjacent or canBridge) then
+					-- linkPoles handles any heading and your attachment pairing logic
 					linkPoles(lastPole, curr)
 				end
-				-- Update state
+
 				visited[k]   = true
 				lastPole     = curr
 				lastGX, lastGZ = gx, gz
-				gapSinceLast = false
+				lastIdx      = i
 			else
 				-- Already visited: reset link source so we don't bridge across a loop re-entry
-				lastPole, lastGX, lastGZ = curr, gx, gz
-				gapSinceLast = false
+				lastPole, lastGX, lastGZ, lastIdx = curr, gx, gz, i
 			end
 		else
-			-- Missing pole at this path cell -> treat as a hard break (do not link across)
-			gapSinceLast = true
+			-- Missing pole at this path cell → do nothing here; we may bridge over it later
 		end
 	end
 
-	-- After a rope rebuild, also try to reattach boxes (in case a span changed)
+	----------------------------------------------------------------------
+	-- Re-attach boxes smartly (unchanged behavior, just rerun after ropes)
+	----------------------------------------------------------------------
+	local function _modelPos(m: Instance)
+		return (m.PrimaryPart and m.PrimaryPart.Position) or m:GetPivot().Position
+	end
+	local function _nearestPoleModel(folder: Instance, fromPos: Vector3, maxDist: number)
+		local best, bestModel = math.huge, nil
+		for _, child in ipairs(folder:GetChildren()) do
+			if _isPole(child) then
+				local d = (_modelPos(child) - fromPos).Magnitude
+				if d < best and d <= (maxDist or BOX_LINK_MAX_DISTANCE) then best, bestModel = d, child end
+			end
+		end
+		return bestModel, best
+	end
+
 	local boxesByRun = {}
 	for _, inst in ipairs(zoneFolder:GetDescendants()) do
 		if (inst:IsA("Model") or inst:IsA("BasePart")) and inst:GetAttribute("IsPowerRoadBox") == true then
-			local key = inst:GetAttribute("RunKey")
-			if key then
-				boxesByRun[key] = boxesByRun[key] or {}
-				table.insert(boxesByRun[key], inst)
+			local rkey = inst:GetAttribute("RunKey")
+			if rkey then
+				boxesByRun[rkey] = boxesByRun[rkey] or {}
+				table.insert(boxesByRun[rkey], inst)
 			end
 		end
 	end
@@ -1667,13 +1829,35 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 			da, db = da or math.huge, db or math.huge
 			return da < db
 		end)
-		for i, box in ipairs(pair) do
-			if i == 1 then
+		for iBox, box in ipairs(pair) do
+			if iBox == 1 then
+				-- reuse the helper that pairs two attachments without criss-cross
 				_connectBoxToNearestPole(zoneFolder, box)
 				box:SetAttribute("IsPrimaryLinkEndpoint", true)
 			else
 				_detachAllRopesFromModel(box)
 				box:SetAttribute("IsPrimaryLinkEndpoint", false)
+			end
+		end
+	end
+
+	----------------------------------------------------------------------
+	-- NEW: Re-attach pad-poles that belong to this power zone
+	--      (their ropes were purged by the zone rope clear above)
+	----------------------------------------------------------------------
+	do
+		local populated = plot:FindFirstChild("Buildings") and plot.Buildings:FindFirstChild("Populated")
+		if populated then
+			for _, f in ipairs(populated:GetChildren()) do
+				for _, inst in ipairs(f:GetDescendants()) do
+					if (inst:IsA("Model") or inst:IsA("BasePart")) then
+						local isPadPole = (inst.Name == "PadPole") or (inst:GetAttribute("IsPadPole") == true)
+						if isPadPole and inst:GetAttribute("PowerLineZoneId") == powerZoneId then
+							-- Recreate the two ropes from this pad-pole to the nearest pole in this power zone
+							PowerGeneratorModule.connectPadPoleToPowerZone(player, inst)
+						end
+					end
+				end
 			end
 		end
 	end
@@ -1808,12 +1992,13 @@ end
 ---------------------------------------------------------------------
 function PowerGeneratorModule.removeLines(player, zoneId)
 	local playerPlot  = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not playerPlot then return end
-	local powerFolder = playerPlot:FindFirstChild("PowerLines");                        if not powerFolder then return end
-	local zoneFolder  = powerFolder:FindFirstChild(zoneId);                             if not zoneFolder  then return end
+	local powerFolder = playerPlot:FindFirstChild("PowerLines");                         if not powerFolder then return end
+	local zoneFolder  = powerFolder:FindFirstChild(zoneId);                              if not zoneFolder  then return end
 
+	-- Remove poles/boxes in this power zone folder (existing behavior)
 	for _, child in ipairs(zoneFolder:GetChildren()) do
 		if (child:IsA("Model") or child:IsA("BasePart")) and child:GetAttribute("ZoneId") == zoneId then
-			-- NEW: unmark occupancy if this pole carried GridX/GridZ
+			-- Unmark occupancy if this pole carried GridX/GridZ
 			local gx = tonumber(child:GetAttribute("GridX"))
 			local gz = tonumber(child:GetAttribute("GridZ"))
 			if gx and gz then
@@ -1825,23 +2010,53 @@ function PowerGeneratorModule.removeLines(player, zoneId)
 	end
 	if #zoneFolder:GetChildren() == 0 then zoneFolder:Destroy() end
 
-	-- Boxes live under this same folder and will have been destroyed above.
-	-- If you ever store them elsewhere, you can call:
-	-- PowerGeneratorModule.removeBoxesForPowerZone(player, zoneId)
+	---------------------------------------------------------------------
+	-- NEW: also remove any PadPoles under Buildings/Populated that were
+	--      stamped with PowerLineZoneId == this zoneId
+	---------------------------------------------------------------------
+	do
+		local bFolder = playerPlot:FindFirstChild("Buildings")
+		local populated = bFolder and bFolder:FindFirstChild("Populated") or nil
+		if populated then
+			local removed = 0
+			for _, f in ipairs(populated:GetChildren()) do
+				for _, inst in ipairs(f:GetDescendants()) do
+					if (inst:IsA("Model") or inst:IsA("BasePart")) then
+						local isPadPole = (inst.Name == "PadPole") or (inst:GetAttribute("IsPadPole") == true)
+						if isPadPole and inst:GetAttribute("PowerLineZoneId") == zoneId then
+							inst:Destroy()
+							removed += 1
+						end
+					end
+				end
+			end
+			if DEBUG_LOGS then
+				print(("[PowerGeneratorModule] Removed %d PadPoles tagged to power zone %s"):format(removed, tostring(zoneId)))
+			end
+		end
+	end
 
 	debugPrint("Removed power lines for zone:", zoneId)
 	linesRemovedEvent:Fire(player, zoneId)
 end
 
--- Hook: when a pad pole appears, bridge it to the nearest line
+-- Hook: when a pad pole appears, bridge it to its owning power zone (if tagged)
 local _hookedPadPole = false
 if not _hookedPadPole then
 	_hookedPadPole = true
 	PadPoleSpawned.Event:Connect(function(player, padPole)
-		if not BRIDGE_TO_NEAREST_PADPOLE then return end  -- <- hard off
-		local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
-		if plot and padPole then
-			bridgePadPoleToNearestLine(plot, padPole)
+		if not (player and padPole) then return end
+
+		-- Preferred path: targeted link into the correct power line zone
+		if padPole:GetAttribute("PowerLineZoneId") then
+			PowerGeneratorModule.connectPadPoleToPowerZone(player, padPole)
+			return
+		end
+
+		-- Legacy fallback: optional global nearest-bridge if you ever spawn an untagged pole
+		if BRIDGE_TO_NEAREST_PADPOLE then
+			local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+			if plot then bridgePadPoleToNearestLine(plot, padPole) end
 		end
 	end)
 end
@@ -1851,10 +2066,11 @@ local _hookedRoadOverlap = false
 if not _hookedRoadOverlap then
 	_hookedRoadOverlap = true
 	zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
-		-- Be defensive: look up the zone; only react to road-ish modes
 		local z = ZoneTrackerModule.getZoneById(player, zoneId)
 		local mode = z and z.mode
 		if mode == "DirtRoad" or mode == "Pavement" or mode == "Highway" or mode == "Road" then
+			-- NEW: after the road zone is fully placed, do one authoritative pass
+			PowerGeneratorModule.rebuildRopesForAll(player)
 			PowerGeneratorModule.ensureOverlapBoxesForAll(player)
 		end
 	end)

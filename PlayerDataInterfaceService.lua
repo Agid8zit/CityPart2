@@ -360,7 +360,7 @@ RF_DeleteSaveFile.OnServerInvoke = function(Player: Player, SlotID: string)
 	if PlayerData.currentSaveFile == SlotID then
 		local DefaultDataModule = require(ServerScriptService.PlayerDataService.DefaultData)
 		local EmptySaveFile = DefaultDataModule.newSaveFile()
-		EmptySaveFile.cityName = "New File"
+		EmptySaveFile.cityName = ""
 		PlayerDataService.ModifyData(Player, "savefiles/"..SlotID, EmptySaveFile)
 	end
 	return true

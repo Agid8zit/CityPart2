@@ -1,7 +1,3 @@
--- SaveManager.server.lua
--- Enhanced: progressive per-player phased load, per-server 1/3 wheel, early UI handoff,
--- flush-on-leave, BindToClose reliability, and safe world switching on slot change.
-
 ----------------------------------------------------------------
 --  Init / Logging
 ----------------------------------------------------------------
@@ -69,9 +65,12 @@ local function ensureRemoteEvent(eventsRoot: Instance, sub: string, name: string
 end
 
 -- Internal stage notifications to listeners (suspend/resume consumers)
--- (Added to avoid reusing RequestReloadFromCurrent which triggers reloads.)
 local WorldReloadBeginBE = ensureBindableEvent(BindableEvents, "WorldReloadBegin")
 local WorldReloadEndBE   = ensureBindableEvent(BindableEvents, "WorldReloadEnd")
+
+-- Remote to relay world reload + progress to client
+local WorldReloadRE = ensureRemoteEvent(EventsFolder, "RemoteEvents", "WorldReload")
+
 ----------------------------------------------------------------
 --  Dependencies
 ----------------------------------------------------------------
@@ -102,6 +101,8 @@ local RoadGeneratorModule = require(Roadgen:WaitForChild("RoadGenerator"))
 -- Which zone modes are “roads”
 local ROAD_MODES = { DirtRoad = true, Pavement = true, Highway = true }
 LOG("Core services fetched")
+
+local _saveQueuedOnReloadEnd : { [Player]: boolean } = {}
 
 ----------------------------------------------------------------
 --  Buffer/Schema bridge
@@ -156,6 +157,32 @@ local function toWealthString(w: any): string?
 	return nil
 end
 
+-- [FIX] Treat Metro tunnels as network/non-building style zones too.
+local function isNetworkId(id: string?): boolean
+	local s = id or ""
+	return (s:match("^PowerLinesZone_") ~= nil)
+		or (s:match("^PipeZone_") ~= nil)
+		or (s:match("^WaterLinesZone_") ~= nil)
+		or (s:match("^MetroTunnelZone_") ~= nil) -- [NEW]
+end
+
+-- [ENHANCEMENT] Shallow-normalizing copy of a blueprint array (defensive)
+local function copyBlueprintList(list: {any}?): {any}
+	if type(list) ~= "table" then return {} end
+	local out = table.create(#list)
+	for i, b in ipairs(list) do
+		out[i] = {
+			buildingName = b.buildingName,
+			gridX        = b.gridX,
+			gridZ        = b.gridZ,
+			rotation     = b.rotation or 0,
+			isUtility    = b.isUtility or false,
+			wealth       = b.wealth,
+		}
+	end
+	return out
+end
+
 ----------------------------------------------------------------
 --  Capture (for SAVE)
 ----------------------------------------------------------------
@@ -192,6 +219,9 @@ end
 -- Unlocks safety cache (prevents empty table races)
 local LastUnlockCacheByUid : { [number]: { [string]: boolean } } = {}
 
+-- [ENHANCEMENT] Cache of last known building blueprints per player+zone
+local LastBlueprintByUid : { [number]: { [string]: { [number]: any } } } = {}
+
 local function readUnlockTableFor(player: Player): { [string]: boolean }
 	if not GetUnlocksForPlayer:IsA("BindableFunction") then
 		warn("[SaveManager] GetUnlocksForPlayer is not a BindableFunction (is "..GetUnlocksForPlayer.ClassName..")")
@@ -214,16 +244,70 @@ if UnlockChangedBE and UnlockChangedBE:IsA("BindableEvent") then
 	end)
 end
 
-local function makeUnlockRows(player: Player)
-	local rows, t = {}, readUnlockTableFor(player)
-	for name, on in pairs(t) do
-		if on then rows[#rows+1] = { name = name } end
+-- [ENHANCEMENT] Record final placed blueprints right when a zone finishes populating
+ZonePopulated.Event:Connect(function(player: Player, zoneId: string)
+	if not player or not zoneId then return end
+	local uid = player.UserId
+	local captured = collectBuildings(player, zoneId)
+	if type(captured) == "table" and #captured > 0 then
+		LastBlueprintByUid[uid] = LastBlueprintByUid[uid] or {}
+		LastBlueprintByUid[uid][zoneId] = copyBlueprintList(captured)
+		LOG("ZonePopulated: cached blueprint for", zoneId, "(n="..tostring(#captured)..")")
 	end
-	return rows
+end)
+
+-- [ENHANCEMENT] Also cache when a zone is reconstructed from a predefined list
+ZoneReCreated.Event:Connect(function(player: Player, zoneId: string, mode: string, _coords: any, predefined: any, _rot: any)
+	if player and zoneId and predefined and type(predefined) == "table"
+		and not ROAD_MODES[mode] and not isNetworkId(zoneId) and #predefined > 0 then
+		local uid = player.UserId
+		LastBlueprintByUid[uid] = LastBlueprintByUid[uid] or {}
+		LastBlueprintByUid[uid][zoneId] = copyBlueprintList(predefined)
+		LOG("ZoneReCreated: seeded cache for", zoneId, "(n="..tostring(#predefined)..")")
+	end
+end)
+
+-- Decode previous zones rows into a fast map for per‑zone fallback.
+local function decodePrevZoneRows(prevB64: string?): { [string]: any }
+	local map = {}
+	if not prevB64 or prevB64 == "" then return map end
+	local blob = safeB64(prevB64)
+	if blob == "" then return map end
+	local ok, rowsOrErr = pcall(function() return Sload.Load("Zone", blob) end)
+	if ok and typeof(rowsOrErr) == "table" then
+		for _, r in ipairs(rowsOrErr) do
+			if r and r.id then map[r.id] = r end
+		end
+	end
+	return map
 end
 
-local function makeZoneRows(player: Player)
+-- [NEW] Decode previous road snapshots (per-zone map: zoneId -> snapshot table)
+local function decodePrevRoadRows(prevB64: string?): { [string]: any }
+	local map = {}
+	if not prevB64 or prevB64 == "" then return map end
+	local blob = safeB64(prevB64)
+	if blob == "" then return map end
+	local ok, rowsOrErr = pcall(function() return Sload.Load("RoadSnapshot", blob) end)
+	if ok and typeof(rowsOrErr) == "table" then
+		for _, rr in ipairs(rowsOrErr) do
+			if rr and rr.zoneId and rr.snapshot and rr.snapshot ~= "" then
+				local okJ, snap = pcall(HttpService.JSONDecode, HttpService, rr.snapshot)
+				if okJ and typeof(snap) == "table" then
+					map[rr.zoneId] = snap
+				end
+			end
+		end
+	end
+	return map
+end
+
+-- [FIX] makeZoneRows now accepts prevRowsById and does **per‑zone** fallback instead of global.
+local function makeZoneRows(player: Player): ({any}, { [string]: boolean })
 	local rows = {}
+	local missingSet : { [string]: boolean } = {}
+	local uid = player.UserId
+
 	for id, z in pairs(ZoneTracker.getAllZones(player)) do
 		local wealthArr, reqArr = {}, {}
 		for _, vec in ipairs(z.gridList) do
@@ -233,6 +317,38 @@ local function makeZoneRows(player: Player)
 			reqArr  [#reqArr  +1]   = (z.tileRequirements and z.tileRequirements[tileKey])
 				or { Road = false, Water = false, Power = false }
 		end
+
+		-- Live capture
+		local captured = {}
+		local okCap, capErr = pcall(function()
+			captured = collectBuildings(player, id)
+		end)
+		if not okCap then
+			warn("[SaveManager] collectBuildings failed for zone", id, capErr)
+			captured = {}
+		end
+
+		-- If empty, try last-good cached blueprint, else mark as missing for per-zone fallback
+		if (type(captured) ~= "table" or #captured == 0) and (not ROAD_MODES[z.mode]) and (not isNetworkId(id)) then
+			local cached = LastBlueprintByUid[uid] and LastBlueprintByUid[uid][id]
+			if cached and #cached > 0 then
+				LOG("[SaveManager] Using cached blueprint for", id, "(n="..tostring(#cached)..")")
+				captured = cached
+			else
+				missingSet[id] = true
+				warn("[SaveManager] No buildings captured for zone", id, "; will attempt per-zone fallback to previous save.")
+				captured = {} -- keep empty for now; we may fill from prev save in savePlayer()
+			end
+		end
+
+		local okB, buildingsJSON = pcall(function()
+			return HttpService:JSONEncode(captured)
+		end)
+		if not okB then
+			warn("[SaveManager] JSONEncode buildings failed for zone", id, "; defaulting to empty array.")
+			buildingsJSON = "[]"
+		end
+
 		rows[#rows+1] = {
 			id        = id,
 			mode      = z.mode,
@@ -240,21 +356,48 @@ local function makeZoneRows(player: Player)
 			flags     = z.requirements,
 			wealth    = wealthArr,
 			tileFlags = reqArr,
-			buildings = HttpService:JSONEncode(collectBuildings(player, id)),
+			buildings = buildingsJSON,
 		}
 	end
-	return rows
+
+	return rows, missingSet
 end
 
-local function makeRoadRows(player: Player)
+local function makeRoadRows(player: Player, prevByZone: { [string]: any }?)
 	local rows = {}
 	for id, z in pairs(ZoneTracker.getAllZones(player)) do
 		if ROAD_MODES[z.mode] then
-			local okSnap, snap = pcall(RoadGeneratorModule.captureRoadZoneSnapshot, player, id)
-			if not okSnap then
-				warn("[SaveManager] captureRoadZoneSnapshot failed for", id, snap)
-				snap = { version = 1, zoneId = id, segments = {}, interDecos = {}, strDecos = {}, timeCaptured = os.clock() }
+			local snap = nil
+
+			-- 1) Prefer exact, in-memory snapshot if the generator saved one
+			local okGet, memSnap = pcall(function()
+				if typeof(RoadGeneratorModule.getSnapshot) == "function" then
+					return RoadGeneratorModule.getSnapshot(player, id)
+				end
+				return nil
+			end)
+			if okGet and typeof(memSnap) == "table" and typeof(memSnap.segments) == "table" and #memSnap.segments > 0 then
+				snap = memSnap
+			else
+				-- 2) Fall back to a fresh world capture
+				local okCap, cap = pcall(RoadGeneratorModule.captureRoadZoneSnapshot, player, id)
+				if okCap and typeof(cap) == "table" then
+					snap = cap
+				else
+					warn("[SaveManager] captureRoadZoneSnapshot failed for", id, cap)
+					snap = { version = 1, zoneId = id, segments = {}, interDecos = {}, strDecos = {}, timeCaptured = os.clock() }
+				end
 			end
+
+			-- 3) If still empty, reuse previous saved snapshot for this zone
+			if (not snap.segments) or (#snap.segments == 0) then
+				local prev = prevByZone and prevByZone[id]
+				if prev and typeof(prev.segments) == "table" and #prev.segments > 0 then
+					snap = prev
+					LOG("[SaveManager] RoadSnapshot fallback applied for", id, "(prev segments=", tostring(#prev.segments), ")")
+				end
+			end
+
 			local okJSON, blob = pcall(HttpService.JSONEncode, HttpService, snap)
 			if not okJSON then
 				warn("[SaveManager] JSONEncode snapshot failed for", id, blob)
@@ -265,7 +408,6 @@ local function makeRoadRows(player: Player)
 	end
 	return rows
 end
-
 local function dumpZones(player: Player)
 	print(("---- Loaded zones for %s (%d) ----"):format(player.Name, player.UserId))
 	for zoneId, z in pairs(ZoneTracker.getAllZones(player)) do
@@ -287,14 +429,263 @@ end
 ----------------------------------------------------------------
 --  SAVE
 ----------------------------------------------------------------
-local function savePlayer(player: Player, isFinal: boolean?)
-	-- Capture snapshots into PlayerData
-	local bufferZone   = Sload.Save("Zone", makeZoneRows(player))
 
+local function _countTilesForPlayer(player: Player): number
+	local n = 0
+	for _, z in pairs(ZoneTracker.getAllZones(player)) do
+		n += #z.gridList
+	end
+	return n
+end
+
+-- [TRACKING] in-flight population jobs and reload windows
+local InflightPopByUid : { [number]: number } = {}
+local InReload         : { [Player]: boolean } = {}
+
+-- Drain barrier: wait briefly for zone population pipeline to quiesce
+local function awaitZonePipelinesToDrain(player: Player, timeoutSec: number?): boolean
+	local uid = player.UserId
+	local deadline = os.clock() + (timeoutSec or 2.5)
+	while os.clock() < deadline do
+		local n = InflightPopByUid[uid] or 0
+		if n <= 0 then return true end
+		task.wait(0.05)
+	end
+	return false
+end
+
+-- Hook population counters
+ZoneCreated.Event:Connect(function(player: Player, _zoneId: string, _mode: string, _coords: any)
+	if player then
+		local uid = player.UserId
+		InflightPopByUid[uid] = (InflightPopByUid[uid] or 0) + 1
+	end
+end)
+
+-- ADD THIS: also count rebuild/populate that comes via ZoneReCreated
+ZoneReCreated.Event:Connect(function(player: Player, _zoneId: string, _mode: string, _coords: any, _predef: any, _rotation: any)
+	if player then
+		local uid = player.UserId
+		InflightPopByUid[uid] = (InflightPopByUid[uid] or 0) + 1
+	end
+end)
+
+ZonePopulated.Event:Connect(function(player: Player, _zoneId: string)
+	if player then
+		local uid = player.UserId
+		local cur = InflightPopByUid[uid] or 0
+		if cur > 0 then InflightPopByUid[uid] = cur - 1 else InflightPopByUid[uid] = 0 end
+	end
+end)
+
+-- Hook reload window (relay to client)
+WorldReloadBeginBE.Event:Connect(function(player: Player)
+	InReload[player] = true
+	WorldReloadRE:FireClient(player, "begin")
+	-- Optional early seed of progress band A:
+	WorldReloadRE:FireClient(player, "progress", 2, "Preparing city")
+end)
+WorldReloadEndBE.Event:Connect(function(player: Player)
+	InReload[player] = nil
+	WorldReloadRE:FireClient(player, "end")
+end)
+
+local function waitAllZonesSettled(player: Player, timeoutSec: number?): boolean
+	local deadline = os.clock() + (timeoutSec or 2.5)
+	while os.clock() < deadline do
+		local busy = false
+		for id, _ in pairs(ZoneTracker.getAllZones(player)) do
+			if typeof(ZoneTracker.isZonePopulating) == "function" and ZoneTracker.isZonePopulating(player, id) then
+				busy = true; break
+			end
+		end
+		if not busy then return true end
+		task.wait(0.05)
+	end
+	return false
+end
+
+----------------------------------------------------------------
+-- [NEW] Blueprint‑dirty coalescer & on‑the‑spot save
+----------------------------------------------------------------
+local _refreshDebounce : { [Player]: { [string]: boolean } } = {}
+local _lastSaveAt      : { [Player]: number } = {}
+local savePlayer: (Player, boolean?, {[string]: any}?) -> ()
+
+local function _refreshZoneBlueprintAndMaybeSave(player: Player, zoneId: string, reason: string)
+	if not player or not zoneId or not player.Parent then return end
+
+	-- Coalesce per zone
+	_refreshDebounce[player] = _refreshDebounce[player] or {}
+	if _refreshDebounce[player][zoneId] then return end
+	_refreshDebounce[player][zoneId] = true
+
+	task.spawn(function()
+		-- Tiny debounce so attributes land; if actively populating, wait briefly.
+		task.wait(0.10)
+		local deadline = os.clock() + 3.0
+		while typeof(ZoneTracker.isZonePopulating) == "function"
+			and ZoneTracker.isZonePopulating(player, zoneId)
+			and os.clock() < deadline
+		do
+			task.wait(0.05)
+		end
+
+		-- Refresh cache from live world
+		local uid = player.UserId
+		local captured = collectBuildings(player, zoneId)
+		LastBlueprintByUid[uid] = LastBlueprintByUid[uid] or {}
+		LastBlueprintByUid[uid][zoneId] = copyBlueprintList(captured)
+
+		LOG("[Blueprint] refreshed for", zoneId, "n=", tostring(#captured or 0), "reason=", reason)
+
+		-- Save (throttled) – if reloading, queue for end
+		local now = os.clock()
+		if InReload[player] then
+			_saveQueuedOnReloadEnd[player] = true
+		else
+			if not _lastSaveAt[player] or (now - _lastSaveAt[player] > 2.5) then
+				savePlayer(player, false, {
+					reason = "BlueprintChanged:"..tostring(reason or "?"),
+					awaitPipelines = false,
+					skipWorldWhenReloading = true,
+				})
+				pcall(function() PlayerDataService.Save(player, { reason = "BlueprintChanged" }) end)
+				_lastSaveAt[player] = now
+			end
+		end
+
+		_refreshDebounce[player][zoneId] = nil
+	end)
+end
+
+-- Wire up signals that imply blueprint changes.
+local function _connectIfBE(name: string, fn)
+	local ev = BindableEvents:FindFirstChild(name)
+	if ev and ev:IsA("BindableEvent") then
+		ev.Event:Connect(fn)
+		LOG("Hooked BE:", name)
+	end
+end
+
+-- Your BuildingGenerator fires this per building; we coalesce per zone.
+_connectIfBE("Wigw8mPlaced", function(player: Player, zoneId: string, _payload: any)
+	_refreshZoneBlueprintAndMaybeSave(player, zoneId, "Wigw8mPlaced")
+end)
+
+-- Fires periodically during populate; coalesce per zone.
+_connectIfBE("BuildingsPlaced", function(player: Player, zoneId: string, _count: number)
+	_refreshZoneBlueprintAndMaybeSave(player, zoneId, "BuildingsPlaced")
+end)
+
+-- **Call this when a bucket/cluster finishes** (recommended).
+local ZoneBlueprintChangedBE = ensureBindableEvent(BindableEvents, "ZoneBlueprintChanged")
+ZoneBlueprintChangedBE.Event:Connect(function(player: Player, zoneId: string, opts: any)
+	_refreshZoneBlueprintAndMaybeSave(player, zoneId, (opts and opts.reason) or "ZoneBlueprintChanged")
+end)
+
+----------------------------------------------------------------
+--  SAVE pipeline (full snapshot path; still used by manual/leave/etc.)
+----------------------------------------------------------------
+savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
+	opts = opts or {}
+	local reason = opts.reason or (isFinal and "FinalSave" or "Save")
+	local awaitPipelines = (opts.awaitPipelines ~= false)
+	local tiles = _countTilesForPlayer(player)
+	local base = 2.5
+	local perTile = 0.04  -- ~40ms per tile budget
+	local pipelinesTimeout = math.min(20, (opts.pipelinesTimeoutSec or (base + perTile * tiles)))
+	local skipWorldWhenReloading = (opts.skipWorldWhenReloading ~= false)
+	local force = (opts.force == true)
+
+	-- [BARRIER] If requested, give zone pipelines a brief chance to finish so attributes exist.
+	if awaitPipelines then
+		local drained = awaitZonePipelinesToDrain(player, pipelinesTimeout)
+		if not drained then
+			LOG(("Save barrier timed out (%.1fs) for %s; proceeding."), pipelinesTimeout, player.Name)
+		end
+	end
+	-- tiny yield to allow last attribute sets to commit
+	task.wait(0.03)
+
+	-- [GUARD] Don't clobber a good save with a partial world while loading/reloading.
+	if skipWorldWhenReloading and (InReload[player] or false) and not force then
+		LOG("Skipping world snapshot for", player.Name, "(reload in progress). Saving only session metadata.")
+		PlayerDataService.ModifySaveData(player, "lastPlayed", os.time())
+
+		-- keep a plain unlocks list refreshed from cache (cheap and safe)
+		local unlockNames  = {}
+		for name, on in pairs(LastUnlockCacheByUid[player.UserId] or {}) do
+			if on then unlockNames[#unlockNames+1] = name end
+		end
+		PlayerDataService.ModifySaveData(player, "unlocks", unlockNames)
+
+		if isFinal and PlayerSaved then PlayerSaved:Fire(player) end
+		return
+	end
+
+	if awaitPipelines then
+		waitAllZonesSettled(player, pipelinesTimeout)
+	end
+
+	-- Capture snapshots into PlayerData (world snapshot path)
+	local bufferZone = ""
 	local bufferRoad = ""
+	local bufferUnlock = ""
+	local unlockNames  = {}
+	local missingSetForSummary : { [string]: boolean }? = nil
+
+	-- Keep a reference to previous zonesB64 in case we need to retain it
+	local prevZonesB64 = ""
+	pcall(function()
+		local sf = PlayerDataService.GetSaveFileData(player)
+		prevZonesB64 = (sf and sf.cityStorage and sf.cityStorage.zonesB64) or ""
+	end)
+	
+	local prevRoadsB64 = ""
+	pcall(function()
+		local sf = PlayerDataService.GetSaveFileData(player)
+		prevRoadsB64 = (sf and sf.cityStorage and sf.cityStorage.roadsB64) or ""
+	end)
+	
+	-- [NEW] Decode previous rows once for **per‑zone fallback**
+	local prevRowsById = decodePrevZoneRows(prevZonesB64)
+	local prevRoadById = decodePrevRoadRows(prevRoadsB64)
+	
+	-- Zones & buildings
+	do
+		local zoneRows, missingSet = makeZoneRows(player)
+		missingSetForSummary = missingSet
+
+		-- If any zones are missing buildings, stitch from previous for those zones only.
+		if next(missingSet) ~= nil and prevZonesB64 ~= "" then
+			for _, r in ipairs(zoneRows) do
+				local prev = prevRowsById[r.id]
+				if missingSet[r.id] and prev and prev.buildings and prev.buildings ~= "" then
+					r.buildings = prev.buildings
+					LOG("[SaveManager] Per-zone fallback applied for", r.id)
+				elseif missingSet[r.id] then
+					LOG("[SaveManager] No previous buildings for", r.id, "— leaving empty array.")
+				end
+			end
+		end
+
+		local okZ, outOrErr = pcall(function()
+			return Sload.Save("Zone", zoneRows)
+		end)
+		if okZ then
+			bufferZone = outOrErr
+		else
+			warn("[SaveManager] Zone save skipped:", outOrErr)
+			bufferZone = ""
+		end
+	end
+
+	-- Roads
 	do
 		local okRoad, outOrErr = pcall(function()
-			return Sload.Save("RoadSnapshot", makeRoadRows(player))
+			-- [FIX] robust road snapshotting with in-memory + per-zone previous fallback
+			return Sload.Save("RoadSnapshot", makeRoadRows(player, prevRoadById))
 		end)
 		if okRoad then
 			bufferRoad = outOrErr
@@ -304,11 +695,16 @@ local function savePlayer(player: Player, isFinal: boolean?)
 		end
 	end
 
-	local bufferUnlock = ""
-	local unlockNames  = {}
+	-- Unlocks
 	do
 		local okU, outOrErr = pcall(function()
-			local rows = makeUnlockRows(player)
+			local rows = (function(player: Player)
+				local rows, t = {}, readUnlockTableFor(player)
+				for name, on in pairs(t) do
+					if on then rows[#rows+1] = { name = name } end
+				end
+				return rows
+			end)(player)
 			for _, r in ipairs(rows) do unlockNames[#unlockNames+1] = r.name end
 			return Sload.Save("Unlock", rows)
 		end)
@@ -320,42 +716,97 @@ local function savePlayer(player: Player, isFinal: boolean?)
 		end
 	end
 
-	PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64",   b64enc(bufferZone))
-	PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   b64enc(bufferRoad))
-	PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", b64enc(bufferUnlock))
-	PlayerDataService.ModifySaveData(player, "cityStorage/schema",     1)
-	PlayerDataService.ModifySaveData(player, "lastPlayed",             os.time())
-	PlayerDataService.ModifySaveData(player, "unlocks",                unlockNames)
+	-- Apply to save object
+	pcall(function()
+		PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64", b64enc(bufferZone))
+	end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   b64enc(bufferRoad)) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", b64enc(bufferUnlock)) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/schema",     1) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "lastPlayed",             os.time()) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "unlocks",                unlockNames) end)
 
-	print(("savePlayer: zones=%d  roadBytes=%d  unlockBytes=%d")
-		:format(count(ZoneTracker.getAllZones(player)), #bufferRoad, #bufferUnlock))
-
-	-- Caller decides flush/await; only final calls force flush here
-	if isFinal then
-		PlayerDataService.SaveFlush(player, "savePlayer(isFinal)")
-		if PlayerSaved then PlayerSaved:Fire(player) end
+	do
+		local nZones, nMissing = 0, 0
+		for _ in pairs(ZoneTracker.getAllZones(player)) do
+			nZones += 1
+		end
+		if missingSetForSummary then
+			for _ in pairs(missingSetForSummary) do nMissing += 1 end
+		end
+		LOG(("Save summary: zones=%d  missingFallbacks=%d  roadBytes=%d  unlockBytes=%d")
+			:format(nZones, nMissing, #bufferRoad, #bufferUnlock))
 	end
+
+	print(("savePlayer[%s]: zones=%d  roadBytes=%d  unlockBytes=%d")
+		:format(reason, count(ZoneTracker.getAllZones(player)), #bufferRoad, #bufferUnlock))
+
+	if isFinal and PlayerSaved then PlayerSaved:Fire(player) end
 end
+
+-- Consume any queued save once the world is fully rebuilt
+WorldReloadEndBE.Event:Connect(function(plr: Player)
+	if _saveQueuedOnReloadEnd[plr] then
+		_saveQueuedOnReloadEnd[plr] = nil
+		-- small delay to ensure _loading is cleared by Phase F completion
+		task.delay(0.1, function()
+			if plr and plr.Parent then
+				savePlayer(plr, false, { reason = "QueuedAfterReload" })
+				PlayerDataService.SaveFlush(plr, "QueuedAfterReload")
+			end
+		end)
+	end
+end)
 
 ----------------------------------------------------------------
 --  HARD WIPE before LOAD (critical for slot switching)
 ----------------------------------------------------------------
 local ZoneRemovedBE = ensureBindableEvent(BindableEvents, "ZoneRemoved")
 
-local function wipeLiveWorld(player: Player)
-	-- collect current zones BEFORE clearing ZoneTracker
-	local ids = {}
-	for id, _ in pairs(ZoneTracker.getAllZones(player)) do
-		ids[#ids+1] = id
+-- [NEW] Per-player coalescer for saves triggered by zone deletions
+local _zoneDeleteSaveCoalesce : { [Player]: boolean } = {}
+
+-- [ENHANCED] Drop blueprint cache when zones are removed (wipe/switch) **and trigger a coalesced save**
+ZoneRemovedBE.Event:Connect(function(player: Player, zoneId: string)
+	local uid = player and player.UserId
+	if uid and LastBlueprintByUid[uid] then
+		LastBlueprintByUid[uid][zoneId] = nil
+		LOG("ZoneRemoved: cleared cached blueprint for", zoneId)
 	end
-	if #ids > 0 then
-		for _, id in ipairs(ids) do
-			-- fire standard removal pipeline (Roads/Power/Pipes/Plates/CarSpawner listen to this)
-			ZoneRemovedBE:Fire(player, id)
+
+	-- If we're reloading, don't snapshot; queue for the end of reload.
+	if InReload[player] then
+		_saveQueuedOnReloadEnd[player] = true
+		return
+	end
+
+	-- Coalesce burst deletions (drag delete/multi delete)
+	if _zoneDeleteSaveCoalesce[player] then return end
+	_zoneDeleteSaveCoalesce[player] = true
+
+	task.delay(0.25, function()
+		_zoneDeleteSaveCoalesce[player] = nil
+		if not player or not player.Parent then return end
+
+		-- Throttle quick repeats
+		local now = os.clock()
+		if not _lastSaveAt[player] or (now - _lastSaveAt[player] > 1.0) then
+			savePlayer(player, false, {
+				reason = "ZoneRemoved:"..tostring(zoneId),
+				awaitPipelines = false,            -- nothing to wait for on delete
+				skipWorldWhenReloading = true,
+			})
+			pcall(function() PlayerDataService.Save(player, { reason = "ZoneRemoved" }) end)
+			_lastSaveAt[player] = now
 		end
-		LOG("Wipe: fired ZoneRemoved for", #ids, "zones")
-		task.wait(0.05) -- give listeners a breath to clean up
-	end
+	end)
+end)
+
+local function wipeLiveWorld(player: Player)
+	-- Canonical world wipe (removes every zone; fires ZoneRemoved with mode+gridList for listeners)
+	local removed = ZoneTracker.removeAllZonesForPlayer(player)
+	LOG(("Wipe: removed %d zones via ZoneTracker (canonical)"):format(removed))
+	task.wait(0.05) -- give listeners a breath
 
 	-- defensive cleanup for any leftover instances (including dynamic traffic)
 	local plots = Workspace:FindFirstChild("PlayerPlots")
@@ -380,13 +831,13 @@ end
 --  Progressive LOAD scheduler (server-wide wheel + per-player slicing)
 ----------------------------------------------------------------
 -- You can tune these safely.
-local LOAD_WHEEL_DIV              = 3      -- only ~1/3 of players advance per heartbeat
-local LOAD_BUDGET_MS_PER_SLICE    = 6      -- soft time budget per player per slice
-local LOAD_MAX_ROADS_PER_SLICE    = 28     -- cap per slice to avoid bursty rebuilds
+local LOAD_WHEEL_DIV              = 3
+local LOAD_BUDGET_MS_PER_SLICE    = 6
+local LOAD_MAX_ROADS_PER_SLICE    = 28
 local LOAD_MAX_BUILDINGS_PER_SLICE= 10
 local LOAD_MAX_NETWORKS_PER_SLICE = 20
 
--- Internal structures
+-- Internal structures (LOAD)
 local _loading : { [Player]: boolean } = {}
 local _activeStates : { [Player]: any } = {}
 local _bucketByPlayer : { [Player]: number } = {}
@@ -395,7 +846,14 @@ local _wheelCursor = 0
 
 -- Helpers
 local function isRoadRow(r)    return ROAD_MODES[r.mode] or ((r.id or ""):match("^RoadZone_") ~= nil) end
-local function isNetworkRow(r) local id = r.id or ""; return id:match("^PowerLinesZone_") or id:match("^PipeZone_") or id:match("^WaterLinesZone_") end
+-- [FIX] Treat metro tunnels as network rows for Phase E (network overlays)
+local function isNetworkRow(r)
+	local id = r.id or ""
+	return id:match("^PowerLinesZone_")
+		or id:match("^PipeZone_")
+		or id:match("^WaterLinesZone_")
+		or id:match("^MetroTunnelZone_") -- [NEW]
+end
 
 -- Remote for early UI handoff (+ ack)
 local PlotAssignedEvent = ensureRemoteEvent(EventsFolder, "RemoteEvents", "PlotAssigned")
@@ -421,6 +879,35 @@ local function sendPlotAssignedWithAck(plr: Player, plotName: string, unlocks: t
 	return false
 end
 
+-- Phase progress bands (A..F) shown to the player
+local PHASE_RANGES = {
+	A = {min= 2, max= 5,  label="Preparing city"},
+	B = {min= 5, max=25,  label="Setting up zones"},
+	C = {min=25, max=55,  label="Building roads"},
+	D = {min=55, max=90,  label="Placing buildings"},
+	E = {min=90, max=96,  label="Laying utilities"},
+	F = {min=96, max=100, label="Finalizing"},
+}
+
+local function _blend(range, frac)
+	frac = math.clamp(frac or 0, 0, 1)
+	return range.min + (range.max - range.min) * frac
+end
+
+local function _sendProgress(state, pct, label)
+	local player = state.player
+	if not player or not player.Parent then return end
+	pct = math.clamp(math.floor(pct + 0.5), 0, 100)
+
+	-- Throttle to avoid event spam
+	local now = os.clock()
+	if state._lastProgressPct ~= pct or not state._lastProgressAt or (now - state._lastProgressAt) > 0.20 then
+		state._lastProgressPct = pct
+		state._lastProgressAt  = now
+		WorldReloadRE:FireClient(player, "progress", pct, label)
+	end
+end
+
 -- Build an initial load state (blocking prep in a coroutine; the scheduler consumes slices after)
 local function buildInitialLoadState(player: Player)
 	PlayerDataService.WaitForPlayerData(player)
@@ -431,7 +918,6 @@ local function buildInitialLoadState(player: Player)
 	-- Preload lifecycle + wipe world to truly switch slots/worlds
 	CityInteractions.onCityPreload(player)
 	wipeLiveWorld(player)
-	ZoneTracker.clearPlayerData(player)
 
 	-- Get savefile payload (current slot)
 	local sf        = PlayerDataService.GetSaveFileData(player)
@@ -457,7 +943,8 @@ local function buildInitialLoadState(player: Player)
 		if okU and typeof(rowsOrErr) == "table" then unlockRows = rowsOrErr else warn("[SaveManager] Unlock load skipped:", rowsOrErr) end
 	end
 
-	local roadSnapByZone = {}
+	local roadSnapByZone, hasAnyRoadDecos = {}, false
+	local zonesNeedingIntersections = {}  -- << NEW
 	if bufferRoad ~= "" then
 		local okR, rowsOrErr = pcall(function() return Sload.Load("RoadSnapshot", bufferRoad) end)
 		if okR and typeof(rowsOrErr) == "table" then
@@ -465,6 +952,14 @@ local function buildInitialLoadState(player: Player)
 				local okJ, snap = pcall(HttpService.JSONDecode, HttpService, rr.snapshot)
 				if okJ and typeof(snap) == "table" then
 					roadSnapByZone[rr.zoneId] = snap
+					-- any decos at all?
+					if (snap.interDecos and #snap.interDecos > 0) or (snap.strDecos and #snap.strDecos > 0) then
+						hasAnyRoadDecos = true
+					end
+					-- specifically missing INTERSECTION decos? queue for one-time rebuild
+					if not (snap.interDecos and #snap.interDecos > 0) then
+						table.insert(zonesNeedingIntersections, rr.zoneId)
+					end
 				end
 			end
 		else
@@ -482,6 +977,17 @@ local function buildInitialLoadState(player: Player)
 	end
 	LastUnlockCacheByUid[player.UserId] = unlockTable
 
+	local totalZones, totalRoads, totalBuildings, totalNetworks = #zoneRows, 0, 0, 0
+	for _, r in ipairs(zoneRows) do
+		if isRoadRow(r) then
+			totalRoads += 1
+		elseif isNetworkRow(r) then
+			totalNetworks += 1
+		else
+			totalBuildings += 1
+		end
+	end
+
 	-- state
 	local state = {
 		phase = "A",
@@ -489,6 +995,8 @@ local function buildInitialLoadState(player: Player)
 		zoneRows = zoneRows,
 		unlockRows = unlockRows,
 		roadSnapByZone = roadSnapByZone,
+		hasAnyRoadDecos = hasAnyRoadDecos, -- << NEW
+		zonesNeedingIntersections = zonesNeedingIntersections,
 		havePopulateFromSave = (typeof(RoadGeneratorModule.populateZoneFromSave) == "function"),
 		-- indices for progressive loops
 		idxSkeleton = 1,
@@ -501,7 +1009,20 @@ local function buildInitialLoadState(player: Player)
 		unlockTable = unlockTable,
 		sentPlotAssigned = false,
 		pathingResetDone = false,
+		totalZones      = totalZones,
+		totalRoads      = totalRoads,
+		totalBuildings  = totalBuildings,
+		totalNetworks   = totalNetworks,
+
+		doneSkeleton    = 0,
+		doneRoads       = 0,
+		doneBuildings   = 0,
+		doneNetworks    = 0,
+
+		_lastProgressPct = nil,
+		_lastProgressAt  = nil,
 	}
+
 	return state
 end
 
@@ -520,6 +1041,13 @@ local function ensurePredefinedCache(state, zoneId: string, row)
 		local okJSON, decoded = pcall(HttpService.JSONDecode, HttpService, row.buildings)
 		if okJSON and typeof(decoded) == "table" then
 			predefined = decoded
+		else
+			local preview = string.sub(row.buildings, 1, 120)
+			if #row.buildings > 120 then
+				preview ..= "..."
+			end
+			warn(("[SaveManager] Predefined decode failed for %s (len=%d): %s | %s")
+				:format(zoneId, #row.buildings, okJSON and ("decoded type " .. typeof(decoded)) or tostring(decoded), preview))
 		end
 	end
 	cache[zoneId] = predefined
@@ -531,17 +1059,30 @@ local function ensureRoadPayloadFor(state, row)
 	if state.roadPayloadByZone[zoneId] ~= nil then
 		return state.roadPayloadByZone[zoneId]
 	end
+
 	local payload = nil
 	local snap = state.roadSnapByZone[zoneId]
-	if state.havePopulateFromSave then
+
+	-- Prefer full snapshot when available and non-empty
+	if state.havePopulateFromSave
+		and snap and typeof(snap) == "table"
+		and typeof(snap.segments) == "table" and #snap.segments > 0
+	then
 		payload = snap
-	elseif snap and typeof(snap) == "table" and snap.segments then
+	elseif snap and typeof(snap) == "table" and typeof(snap.segments) == "table" then
+		-- degrade to placed list for older generators
 		local arr = {}
 		for _, seg in ipairs(snap.segments) do
-			arr[#arr+1] = { roadName = seg.roadName, rotation = seg.rotation, gridX = seg.gridX, gridZ = seg.gridZ }
+			arr[#arr+1] = {
+				roadName = seg.roadName,
+				rotation = seg.rotation,
+				gridX    = seg.gridX,
+				gridZ    = seg.gridZ,
+			}
 		end
 		if #arr > 0 then payload = arr end
 	end
+
 	state.roadPayloadByZone[zoneId] = payload
 	return payload
 end
@@ -552,30 +1093,44 @@ local function runLoadSlice(state, budgetMs)
 
 	-- Phase A: Early handoff (pre-commit unlocks, early PlotAssigned)
 	if state.phase == "A" then
-		-- Apply unlocks now so UI can reflect them immediately
-		local SetUnlocksForPlayer = BindableEvents:FindFirstChild("SetUnlocksForPlayer")
-		if SetUnlocksForPlayer and SetUnlocksForPlayer:IsA("BindableFunction") then
-			local okSet, err = pcall(function()
-				return SetUnlocksForPlayer:Invoke(player, state.unlockTable, false)
+		if not state.unlockDispatchScheduled then
+			state.unlockDispatchScheduled = true
+			task.spawn(function()
+				if not player or not player.Parent then return end
+				local SetUnlocksForPlayer = BindableEvents:FindFirstChild("SetUnlocksForPlayer")
+				if SetUnlocksForPlayer and SetUnlocksForPlayer:IsA("BindableFunction") then
+					local okSet, err = pcall(function()
+						return SetUnlocksForPlayer:Invoke(player, state.unlockTable, false)
+					end)
+					if not okSet then
+						warn("[SaveManager] SetUnlocksForPlayer failed:", err)
+					end
+				else
+					warn("[SaveManager] SetUnlocksForPlayer not available; unlock visuals may lag.")
+				end
 			end)
-			if not okSet then
-				warn("[SaveManager] SetUnlocksForPlayer failed:", err)
-			end
-		else
-			warn("[SaveManager] SetUnlocksForPlayer not available; unlock visuals may lag.")
 		end
 
-		-- Early UI handoff: fire PlotAssigned before we start rebuilding zones
 		if not state.sentPlotAssigned then
-			local plotName = player:GetAttribute("PlotName") or waitForPlotName(player, 3)
-			if plotName then
-				sendPlotAssignedWithAck(player, plotName, state.unlockTable)
-			else
-				warn(("[SaveManager] PlotName not set for %s within timeout; continuing."):format(player.Name))
-			end
 			state.sentPlotAssigned = true
+			task.spawn(function()
+				if not player or not player.Parent then return end
+				local plotName = player:GetAttribute("PlotName") or waitForPlotName(player, 3)
+				if plotName then
+					if not player or not player.Parent then return end
+					local okAck, err = pcall(function()
+						sendPlotAssignedWithAck(player, plotName, state.unlockTable)
+					end)
+					if not okAck then
+						warn("[SaveManager] PlotAssigned dispatch failed:", err)
+					end
+				else
+					warn(("[SaveManager] PlotName not set for %s within timeout; continuing."):format(player.Name))
+				end
+			end)
 		end
 
+		_sendProgress(state, PHASE_RANGES.A.min, PHASE_RANGES.A.label)
 		state.phase = "B" -- advance
 		return false -- not done yet
 	end
@@ -609,6 +1164,11 @@ local function runLoadSlice(state, budgetMs)
 				end
 			end
 
+			-- progress
+			state.doneSkeleton += 1
+			local fracB = (state.totalZones == 0) and 1 or (state.doneSkeleton / state.totalZones)
+			_sendProgress(state, _blend(PHASE_RANGES.B, fracB), PHASE_RANGES.B.label)
+
 			state.idxSkeleton += 1
 			if os.clock() >= deadline then return false end
 		end
@@ -617,11 +1177,14 @@ local function runLoadSlice(state, budgetMs)
 		ZoneManager.playerZoneCounters = ZoneManager.playerZoneCounters or {}
 		ZoneManager.playerZoneCounters[player.UserId] = state.maxZoneIdx + 1
 
+		-- end of phase B -> snap to B.max
+		_sendProgress(state, PHASE_RANGES.B.max, PHASE_RANGES.B.label)
+
 		state.phase = "C"
 		return false
 	end
 
-	-- Phase C: ROADS (time-sliced + optional graph reset)
+	-- Phase C: ROADS
 	if state.phase == "C" then
 		if not state.pathingResetDone then
 			-- Prefer per-player reset if available, else global
@@ -643,6 +1206,12 @@ local function runLoadSlice(state, budgetMs)
 			local r = state.zoneRows[state.idxRoads]
 			if isRoadRow(r) then
 				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, ensureRoadPayloadFor(state, r), 0)
+
+				-- progress
+				state.doneRoads += 1
+				local fracC = (state.totalRoads == 0) and 1 or (state.doneRoads / state.totalRoads)
+				_sendProgress(state, _blend(PHASE_RANGES.C, fracC), PHASE_RANGES.C.label)
+
 				processed += 1
 				if processed >= LOAD_MAX_ROADS_PER_SLICE then break end
 			end
@@ -651,22 +1220,31 @@ local function runLoadSlice(state, budgetMs)
 		end
 
 		if state.idxRoads > #state.zoneRows then
+			-- end of phase C -> snap to C.max
+			_sendProgress(state, PHASE_RANGES.C.max, PHASE_RANGES.C.label)
 			state.phase = "D"
 		end
 		return false
 	end
 
-	-- Phase D: BUILDINGS (non-road, non-network) in slices
+	-- Phase D: Buildings
 	if state.phase == "D" then
 		local processed = 0
 		while state.idxBuild <= #state.zoneRows do
 			local r = state.zoneRows[state.idxBuild]
 			if (not isRoadRow(r)) and (not isNetworkRow(r)) then
-				local z = ZoneTracker.getZoneById(player, r.id)
 				local predefined = ensurePredefinedCache(state, r.id, r)
-				if not (z and z.requirements and z.requirements.Populated) or #predefined > 0 then
+				if predefined and #predefined > 0 then
 					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, predefined, 0)
+				else
+					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0)
 				end
+
+				-- progress
+				state.doneBuildings += 1
+				local fracD = (state.totalBuildings == 0) and 1 or (state.doneBuildings / state.totalBuildings)
+				_sendProgress(state, _blend(PHASE_RANGES.D, fracD), PHASE_RANGES.D.label)
+
 				processed += 1
 				if processed >= LOAD_MAX_BUILDINGS_PER_SLICE then break end
 			end
@@ -675,18 +1253,26 @@ local function runLoadSlice(state, budgetMs)
 		end
 
 		if state.idxBuild > #state.zoneRows then
+			-- end of phase D -> snap to D.max
+			_sendProgress(state, PHASE_RANGES.D.max, PHASE_RANGES.D.label)
 			state.phase = "E"
 		end
 		return false
 	end
 
-	-- Phase E: NETWORK OVERLAYS in slices
+	-- Phase E: Networks
 	if state.phase == "E" then
 		local processed = 0
 		while state.idxNet <= #state.zoneRows do
 			local r = state.zoneRows[state.idxNet]
 			if isNetworkRow(r) then
 				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0)
+
+				-- progress
+				state.doneNetworks += 1
+				local fracE = (state.totalNetworks == 0) and 1 or (state.doneNetworks / state.totalNetworks)
+				_sendProgress(state, _blend(PHASE_RANGES.E, fracE), PHASE_RANGES.E.label)
+
 				processed += 1
 				if processed >= LOAD_MAX_NETWORKS_PER_SLICE then break end
 			end
@@ -695,18 +1281,21 @@ local function runLoadSlice(state, budgetMs)
 		end
 
 		if state.idxNet > #state.zoneRows then
+			-- end of phase E -> snap to E.max
+			_sendProgress(state, PHASE_RANGES.E.max, PHASE_RANGES.E.label)
 			state.phase = "F"
 		end
 		return false
 	end
 
-	-- Phase F: post-load hooks (unsuspend listeners, ropes rebuild, advisor, undo seed, dump)
+	-- Phase F: post-load hooks
 	if state.phase == "F" then
-		-- post-load hooks: unsuspend network listeners, rebuild ordered polylines
+		-- Top off to 100% and "Finalizing"
+		_sendProgress(state, PHASE_RANGES.F.max, PHASE_RANGES.F.label)
+
 		local NetworksPostLoadBE = ensureBindableEvent(BindableEvents, "NetworksPostLoad")
 		NetworksPostLoadBE:Fire(player)
 
-		-- optional power rope rebuild
 		local okPower, PowerGeneratorModule2 = pcall(function()
 			local CC = Zones:WaitForChild("CoreConcepts")
 			local PG = CC:FindFirstChild("PowerGen")
@@ -716,7 +1305,15 @@ local function runLoadSlice(state, budgetMs)
 			pcall(function() PowerGeneratorModule2.rebuildRopesForAll(player) end)
 		end
 
-		-- seed undo stack (unchanged behavior)
+		-- [ADD] One-time, full-plot intersection/deco rebuild only for old saves with no deco snapshot
+		if state.zonesNeedingIntersections and #state.zonesNeedingIntersections > 0 then
+			pcall(function()
+				if typeof(RoadGeneratorModule.recalculateIntersectionsForPlot) == "function" then
+					RoadGeneratorModule.recalculateIntersectionsForPlot(player, state.zonesNeedingIntersections)
+				end
+			end)
+		end
+
 		local mgr = PlayerCmdMgr:getManager(player)
 		for i = 1, math.min(2, #state.zoneRows) do
 			local zr = state.zoneRows[i]
@@ -731,7 +1328,7 @@ local function runLoadSlice(state, budgetMs)
 
 		WorldReloadEndBE:Fire(player)
 
-		return true -- DONE
+		return true
 	end
 
 	return false
@@ -741,11 +1338,9 @@ end
 local function enqueueLoad(player: Player, reason: string?)
 	if not player or not player.Parent then return end
 
-	-- cancel any existing job
 	_activeStates[player] = nil
 
 	_loading[player] = true
-	-- Build initial state in its own coroutine (may yield on WaitForPlayerData)
 	task.spawn(function()
 		local state = buildInitialLoadState(player)
 		if not state then
@@ -763,26 +1358,399 @@ local function loadPlayer(player: Player)
 	enqueueLoad(player, "loadPlayer()")
 end
 
--- Global scheduler: rotates a 3-step wheel across heartbeats
+----------------------------------------------------------------
+--  Progressive SAVE scheduler (bucketed + sliced autosave)
+----------------------------------------------------------------
+-- Tunables
+local SAVE_WHEEL_DIV                    = 2   -- bucket players into two groups (e.g., 3 -> 2+1, 4 -> 2+2)
+local SAVE_BUDGET_MS_PER_SLICE          = 6
+local SAVE_MAX_ZONE_ROWS_PER_SLICE      = 14
+local SAVE_MAX_ROAD_SNAPSHOTS_PER_SLICE = 20
+local SAVE_REVERSE_OF_LOAD              = true -- true: Networks->Buildings->Roads; false: Buildings->Roads->Networks
+
+-- Internal structures (SAVE)
+local _activeSaves        : { [Player]: any } = {}
+local _saveBucketByPlayer : { [Player]: number } = {}
+local _saveWheelIndex = 0
+local _saveRound = 0
+
+-- Mark zones dirty for in-flight progressive autosaves
+ZoneBlueprintChangedBE.Event:Connect(function(player: Player, zoneId: string, _opts: any)
+	local st = _activeSaves[player]
+	if st and zoneId then st.dirty[zoneId] = true end
+end)
+-- Also mark on reconstructed zones (roads/buildings/utilities)
+ZoneReCreated.Event:Connect(function(player: Player, zoneId: string)
+	local st = _activeSaves[player]
+	if st and zoneId then st.dirty[zoneId] = true end
+end)
+
+local function classifyZonesFor(player: Player)
+	local roads, nets, builds = {}, {}, {}
+	for id, z in pairs(ZoneTracker.getAllZones(player)) do
+		if isRoadRow({id=id, mode=z.mode}) then
+			roads[#roads+1] = id
+		elseif isNetworkRow({id=id}) then
+			nets[#nets+1] = id
+		else
+			builds[#builds+1] = id
+		end
+	end
+	table.sort(roads)
+	table.sort(nets)
+	table.sort(builds)
+	return roads, nets, builds
+end
+
+local function captureZoneRowForSave(player: Player, id: string, prevRowsById: { [string]: any }, missingSet: { [string]: boolean })
+	local z = ZoneTracker.getZoneById(player, id)
+	if not z then return nil end
+
+	local wealthArr, reqArr = {}, {}
+	for _, vec in ipairs(z.gridList or {}) do
+		wealthArr[#wealthArr+1] = ZoneTracker.getGridWealth(player, id, vec.x, vec.z)
+		local tileKey = ("%d_%d"):format(vec.x, vec.z)
+		reqArr[#reqArr+1] = (z.tileRequirements and z.tileRequirements[tileKey])
+			or { Road=false, Water=false, Power=false }
+	end
+
+	local buildingsJSON = "[]"
+	local needBuildings = (not ROAD_MODES[z.mode]) and (not isNetworkId(id))
+
+	if needBuildings then
+		local captured = {}
+		local okCap, capErr = pcall(function()
+			captured = collectBuildings(player, id)
+		end)
+		if not okCap then
+			warn("[ProgSave] collectBuildings failed for", id, capErr)
+			captured = {}
+		end
+		if type(captured) ~= "table" or #captured == 0 then
+			local uid = player.UserId
+			local cached = LastBlueprintByUid[uid] and LastBlueprintByUid[uid][id]
+			if cached and #cached > 0 then
+				captured = cached
+			else
+				missingSet[id] = true
+			end
+		end
+		local okB, out = pcall(function() return HttpService:JSONEncode(captured) end)
+		buildingsJSON = okB and out or "[]"
+	end
+
+	-- Per-zone fallback from previous save if we had no live/cached buildings
+	if missingSet[id] and prevRowsById then
+		local prev = prevRowsById[id]
+		if prev and prev.buildings and prev.buildings ~= "" then
+			buildingsJSON = prev.buildings
+			LOG("[ProgSave] Per-zone fallback applied for", id)
+		end
+	end
+
+	return {
+		id        = id,
+		mode      = z.mode,
+		coords    = z.gridList,
+		flags     = z.requirements,
+		wealth    = wealthArr,
+		tileFlags = reqArr,
+		buildings = buildingsJSON,
+	}
+end
+
+local function captureRoadSnapshotRow(player: Player, id: string, prevByZone: { [string]: any }?)
+	-- 1) Prefer in-memory exact snapshot
+	local snap = nil
+	local okGet, memSnap = pcall(function()
+		if typeof(RoadGeneratorModule.getSnapshot) == "function" then
+			return RoadGeneratorModule.getSnapshot(player, id)
+		end
+		return nil
+	end)
+	if okGet and typeof(memSnap) == "table" and typeof(memSnap.segments) == "table" and #memSnap.segments > 0 then
+		snap = memSnap
+	else
+		-- 2) Fresh world capture
+		local okSnap, cap = pcall(RoadGeneratorModule.captureRoadZoneSnapshot, player, id)
+		if okSnap and typeof(cap) == "table" then
+			snap = cap
+		else
+			warn("[ProgSave] captureRoadZoneSnapshot failed for", id, cap)
+			snap = { version = 1, zoneId = id, segments = {}, interDecos = {}, strDecos = {}, timeCaptured = os.clock() }
+		end
+	end
+
+	-- 3) If empty, reuse previous saved snapshot
+	if (not snap.segments) or (#snap.segments == 0) then
+		local prev = prevByZone and prevByZone[id]
+		if prev and typeof(prev.segments) == "table" and #prev.segments > 0 then
+			snap = prev
+			LOG("[ProgSave] RoadSnapshot fallback applied for", id, "(prev segments=", tostring(#prev.segments), ")")
+		end
+	end
+
+	local okJSON, blob = pcall(HttpService.JSONEncode, HttpService, snap)
+	if not okJSON then
+		warn("[ProgSave] JSONEncode road snapshot failed for", id, blob)
+		blob = "{}"
+	end
+	return { zoneId = id, snapshot = blob }
+end
+
+local function buildInitialSaveStateForAutosave(player: Player)
+	-- Skip if reloading or already guarded elsewhere
+	if _loading[player] or InReload[player] then
+		_saveQueuedOnReloadEnd[player] = true
+		return nil
+	end
+
+	-- Decode previous zones for per-zone fallback
+	local prevZonesB64 = ""
+	pcall(function()
+		local sf = PlayerDataService.GetSaveFileData(player)
+		prevZonesB64 = (sf and sf.cityStorage and sf.cityStorage.zonesB64) or ""
+	end)
+	local prevRowsById = decodePrevZoneRows(prevZonesB64)
+	
+	local prevRoadsB64 = ""
+	pcall(function()
+		local sf = PlayerDataService.GetSaveFileData(player)
+		prevRoadsB64 = (sf and sf.cityStorage and sf.cityStorage.roadsB64) or ""
+	end)
+	local prevRoadById = decodePrevRoadRows(prevRoadsB64)
+
+	-- Classify ids now; we re-validate existence on capture
+	local roadIds, netIds, buildIds = classifyZonesFor(player)
+
+	-- Order: reverse-of-load by default: Networks→Buildings→Roads
+	local phases = SAVE_REVERSE_OF_LOAD
+		and { "Z_NET", "Z_BLD", "Z_RD", "ROAD_SNAP", "UNLOCKS", "FINALIZE" }
+		or  { "Z_BLD", "Z_RD", "Z_NET", "ROAD_SNAP", "UNLOCKS", "FINALIZE" }
+
+	return {
+		player    = player,
+		phase     = phases[1],
+		phases    = phases,
+		phaseIdx  = 1,
+
+		netIds    = netIds,
+		buildIds  = buildIds,
+		roadIds   = roadIds,
+
+		idxNet    = 1,
+		idxBuild  = 1,
+		idxRoad   = 1,
+		idxRoadSnap = 1,
+
+		outZoneRows   = {},
+		outZoneIndex  = {}, -- zoneId -> index in outZoneRows
+		outRoadRows   = {},
+		missingSet    = {},
+		prevRowsById  = prevRowsById,
+		prevRoadById  = prevRoadById,
+		dirty         = {},
+
+		startedAt = os.clock(),
+	}
+end
+
+local function _advanceSavePhase(state)
+	state.phaseIdx += 1
+	state.phase = state.phases[state.phaseIdx]
+end
+
+local function runSaveSlice(state, budgetMs)
+	local player = state.player
+	if not player or not player.Parent then return true end -- done/abort
+	if InReload[player] then return true end -- abort autosave during reload
+
+	local deadline = os.clock() + (budgetMs / 1000.0)
+
+	-- Phase: zone rows (Networks / Buildings / Roads)
+	if state.phase == "Z_NET" or state.phase == "Z_BLD" or state.phase == "Z_RD" then
+		local list =
+			(state.phase == "Z_NET" and state.netIds)
+			or (state.phase == "Z_BLD" and state.buildIds)
+			or state.roadIds
+
+		local idxName =
+			(state.phase == "Z_NET" and "idxNet") or
+			(state.phase == "Z_BLD" and "idxBuild") or
+			"idxRoad"
+
+		local processed = 0
+		while state[idxName] <= #list do
+			local zoneId = list[state[idxName]]
+
+			-- Only capture if zone still exists
+			local z = ZoneTracker.getZoneById(player, zoneId)
+			if z then
+				local row = captureZoneRowForSave(player, zoneId, state.prevRowsById, state.missingSet)
+				if row then
+					-- Store or replace (if we recaptured a dirty one earlier)
+					local curIndex = state.outZoneIndex[zoneId]
+					if curIndex then
+						state.outZoneRows[curIndex] = row
+					else
+						table.insert(state.outZoneRows, row)
+						state.outZoneIndex[zoneId] = #state.outZoneRows
+					end
+				end
+			end
+
+			state[idxName] += 1
+			processed += 1
+
+			if processed >= SAVE_MAX_ZONE_ROWS_PER_SLICE or os.clock() >= deadline then
+				return false -- not done yet
+			end
+		end
+		_advanceSavePhase(state)
+		return false
+	end
+
+	-- Phase: road snapshots
+	if state.phase == "ROAD_SNAP" then
+		local processed = 0
+		while state.idxRoadSnap <= #state.roadIds do
+			local zoneId = state.roadIds[state.idxRoadSnap]
+			-- Only capture if zone still exists
+			if ZoneTracker.getZoneById(player, zoneId) then
+				local rr = captureRoadSnapshotRow(player, zoneId, state.prevRoadById)
+				if rr then table.insert(state.outRoadRows, rr) end
+			end
+			state.idxRoadSnap += 1
+			processed += 1
+			if processed >= SAVE_MAX_ROAD_SNAPSHOTS_PER_SLICE or os.clock() >= deadline then
+				return false
+			end
+		end
+		_advanceSavePhase(state)
+		return false
+	end
+
+	-- Phase: unlocks (cheap)
+	if state.phase == "UNLOCKS" then
+		state.unlockRows = {}
+		state.unlockNames = {}
+		local t = readUnlockTableFor(player)
+		for name, on in pairs(t) do
+			if on then
+				state.unlockRows[#state.unlockRows+1] = { name = name }
+				state.unlockNames[#state.unlockNames+1] = name
+			end
+		end
+		_advanceSavePhase(state)
+		return false
+	end
+
+	-- Phase: finalize (re-check dirties, serialize, commit)
+	if state.phase == "FINALIZE" then
+		-- Re-capture dirty zones (if they still exist)
+		for zoneId, _ in pairs(state.dirty) do
+			local z = ZoneTracker.getZoneById(player, zoneId)
+			if z then
+				local row = captureZoneRowForSave(player, zoneId, state.prevRowsById, state.missingSet)
+				if row then
+					local i = state.outZoneIndex[zoneId]
+					if i then state.outZoneRows[i] = row
+					else
+						table.insert(state.outZoneRows, row)
+						state.outZoneIndex[zoneId] = #state.outZoneRows
+					end
+				end
+			else
+				-- Zone was removed; drop from saved rows if present
+				local i = state.outZoneIndex[zoneId]
+				if i then
+					state.outZoneRows[i] = nil
+					state.outZoneIndex[zoneId] = nil
+				end
+			end
+		end
+
+		-- Compact outZoneRows in case we niled any
+		local compact = {}
+		for _, r in ipairs(state.outZoneRows) do
+			if r then compact[#compact+1] = r end
+		end
+		state.outZoneRows = compact
+
+		-- Serialize & commit
+		local bufferZone, bufferRoad, bufferUnlock = "", "", ""
+
+		local okZ, outZ = pcall(function() return Sload.Save("Zone", state.outZoneRows) end)
+		if okZ then bufferZone = outZ else warn("[ProgSave] Zone Save skipped:", outZ) end
+
+		local okR, outR = pcall(function() return Sload.Save("RoadSnapshot", state.outRoadRows) end)
+		if okR then bufferRoad = outR else warn("[ProgSave] RoadSnapshot Save skipped:", outR) end
+
+		local okU, outU = pcall(function() return Sload.Save("Unlock", state.unlockRows or {}) end)
+		if okU then bufferUnlock = outU else warn("[ProgSave] Unlock Save skipped:", outU) end
+
+		-- Apply to savefile (will stage automatically if a reload window is open)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64", b64enc(bufferZone)) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   b64enc(bufferRoad)) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", b64enc(bufferUnlock)) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/schema",     1) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "lastPlayed",             os.time()) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "unlocks",                state.unlockNames or {}) end)
+
+		-- Coalesced DataStore write (non-flush)
+		PlayerDataService.Save(player, { reason = "AutoSave" })
+
+		LOG(("[ProgSave] Commit complete for %s  zones=%d  roads=%d  unlocks=%d")
+			:format(player.Name, #state.outZoneRows, #state.outRoadRows, #(state.unlockRows or {})))
+
+		return true -- done
+	end
+
+	return true -- safety: unknown phase -> done
+end
+
+----------------------------------------------------------------
+--  Global scheduler (LOAD + SAVE wheels)
+----------------------------------------------------------------
 RunService.Heartbeat:Connect(function(_dt)
+	-- LOAD wheel (existing)
 	_wheelIndex = (_wheelIndex % LOAD_WHEEL_DIV) + 1
-	local budgetMs = LOAD_BUDGET_MS_PER_SLICE
+	local budgetMsLoad = LOAD_BUDGET_MS_PER_SLICE
 
 	for plr, state in pairs(_activeStates) do
 		if plr and plr.Parent and _bucketByPlayer[plr] == _wheelIndex then
 			local done = false
-			-- Protect each slice
 			local ok, err = pcall(function()
-				done = runLoadSlice(state, budgetMs)
+				done = runLoadSlice(state, budgetMsLoad)
 			end)
 			if not ok then
 				warn("[SaveManager] load slice failed for ", plr.Name, " : ", err)
-				done = true -- abort this job; avoid stuck state
+				done = true
 			end
 			if done then
 				_activeStates[plr] = nil
 				_loading[plr] = nil
 				LOG("Load complete for", plr.Name)
+			end
+		end
+	end
+
+	-- SAVE wheel (new)
+	_saveWheelIndex = (_saveWheelIndex % SAVE_WHEEL_DIV) + 1
+	local budgetMsSave = SAVE_BUDGET_MS_PER_SLICE
+	for plr, st in pairs(_activeSaves) do
+		if plr and plr.Parent and _saveBucketByPlayer[plr] == _saveWheelIndex then
+			local done = false
+			local ok, err = pcall(function()
+				done = runSaveSlice(st, budgetMsSave)
+			end)
+			if not ok then
+				warn("[SaveManager] save slice failed for ", plr.Name, " : ", err)
+				done = true
+			end
+			if done then
+				_activeSaves[plr] = nil
+				LOG("Autosave complete for", plr.Name)
 			end
 		end
 	end
@@ -792,12 +1760,14 @@ end)
 --  BindToClose / Manual save hooks
 ----------------------------------------------------------------
 game:BindToClose(function()
-	-- capture -> SaveFlush -> wait-for-drain for each player
 	for _, plr in ipairs(Players:GetPlayers()) do
-		savePlayer(plr, false)
+		if not _loading[plr] then
+			savePlayer(plr, false, { reason = "BindToClose" })
+		else
+			LOG("BindToClose: skipping world snapshot for", plr.Name, "(still loading)")
+		end
 		PlayerDataService.SaveFlush(plr, "BindToClose")
 	end
-	-- Ensure all saves drained before returning
 	local deadline = os.clock() + 25
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if not PlayerDataService.WaitForSavesToDrain(plr, math.max(0, deadline - os.clock())) then
@@ -809,7 +1779,12 @@ end)
 local manualSaveBE = BindableEvents:FindFirstChild("ManualSave")
 if manualSaveBE and manualSaveBE:IsA("BindableEvent") then
 	manualSaveBE.Event:Connect(function(plr: Player)
-		savePlayer(plr, false)
+		if _loading[plr] then
+			_saveQueuedOnReloadEnd[plr] = true
+			LOG("ManualSave deferred until reload end for", plr.Name)
+			return
+		end
+		savePlayer(plr, false, { reason = "ManualSave" })
 		PlayerDataService.SaveFlush(plr, "ManualSave")
 	end)
 end
@@ -831,31 +1806,80 @@ end)
 ----------------------------------------------------------------
 Players.PlayerAdded:Connect(function(plr)
 	LOG("Players.PlayerAdded", plr.Name)
+	InflightPopByUid[plr.UserId] = 0
 	enqueueLoad(plr, "PlayerAdded")
 end)
 
 Players.PlayerRemoving:Connect(function(plr)
 	LOG("Players.PlayerRemoving", plr.Name)
-	-- cancel any inflight progressive job
 	_activeStates[plr] = nil
+
+	InflightPopByUid[plr.UserId] = 0
+	InReload[plr] = nil
+
+	if _loading[plr] then
+		LOG("PlayerRemoving: skipping world snapshot for", plr.Name, "(still loading)")
+	else
+		local needsSettle = false
+		for id, _ in pairs(ZoneTracker.getAllZones(plr)) do
+			if typeof(ZoneTracker.isZonePopulating) == "function" and ZoneTracker.isZonePopulating(plr, id) then
+				needsSettle = true; break
+			end
+		end
+		if needsSettle then
+			task.wait(0.1)
+			pcall(function() waitAllZonesSettled(plr, 10.0) end)
+		end
+
+		savePlayer(plr, false, {
+			skipWorldWhenReloading = true,
+			awaitPipelines = true,
+			reason = "PlayerRemoving",
+		})
+	end
+
 	_loading[plr] = nil
 
-	-- capture -> SaveFlush -> wait-for-drain to avoid dropped saves
-	savePlayer(plr, false)
 	PlayerDataService.SaveFlush(plr, "PlayerRemoving")
 	PlayerDataService.WaitForSavesToDrain(plr, 25)
 end)
 
--- autosave loop (unchanged behavior; PDS coalescing removes data loss risk)
+----------------------------------------------------------------
+--  Autosave round driver (bucketed + progressive)
+----------------------------------------------------------------
 task.spawn(function()
 	while true do
 		local dt = 120 + math.random(0, 10)
 		LOG("Autosave loop sleeping", dt, "seconds")
 		task.wait(dt)
-		for _, plr in ipairs(Players:GetPlayers()) do
-			savePlayer(plr, false)
-			PlayerDataService.Save(plr, { reason = "AutoSave" })
-			task.wait(0.15)
+
+		local list = Players:GetPlayers()
+		if #list == 0 then continue end
+
+		-- Round-robin the first bucket so the same players aren't always saved first
+		_saveRound += 1
+		if (_saveRound % 2) == 1 then
+			local rev = table.create(#list)
+			for i = #list, 1, -1 do rev[#rev+1] = list[i] end
+			list = rev
+		end
+
+		local half = math.ceil(#list / 2)
+		for i, plr in ipairs(list) do
+			if _loading[plr] then
+				_saveQueuedOnReloadEnd[plr] = true
+				LOG("Autosave deferred (loading) for", plr.Name)
+			else
+				if not _activeSaves[plr] then
+					local st = buildInitialSaveStateForAutosave(plr)
+					if st then
+						_activeSaves[plr] = st
+						_saveBucketByPlayer[plr] = (i <= half) and 1 or 2
+						LOG("Enqueued progressive autosave for", plr.Name, ("bucket=%d"):format(_saveBucketByPlayer[plr]))
+					end
+				end
+			end
+			task.wait(0.02) -- light pacing between enqueue ops
 		end
 	end
 end)
