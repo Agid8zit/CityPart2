@@ -5,6 +5,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
 
 -- Dependencies
 local Abr = require(ReplicatedStorage.Scripts.UI.Abrv)
@@ -15,11 +16,16 @@ local BalanceEconomy = require(Balancing:WaitForChild("BalanceEconomy"))
 local SoundController = require(ReplicatedStorage.Scripts.Controllers.SoundController)
 local InputController = require(ReplicatedStorage.Scripts.Controllers.InputController)
 
+-- Onboarding wires (for resilient Build button pulse/arrow)
+local UITargetRegistry = require(ReplicatedStorage.Scripts.UI.UITargetRegistry)
+local RE_OnboardingStepCompleted = ReplicatedStorage.Events.RemoteEvents:WaitForChild("OnboardingStepCompleted")
+
 -- Defines
 local UI = script.Parent
-local LocalPlayer = game.Players.LocalPlayer
-local PlayerGui = game.Players.LocalPlayer.PlayerGui
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer.PlayerGui
 local ExitFunctions = {}
+local OBArrow = UI.OnboardingArrow
 
 -- UI References
 local UI_ChartsButton = UI.right.charts.ImageButton
@@ -62,6 +68,7 @@ local UI_PopulationBtn = UI.top.population.Background  -- (already present in yo
 -- Networking
 local UIUpdateEvent = ReplicatedStorage.Events.RemoteEvents:WaitForChild("UpdateStatsUI")
 local RE_EquipBoombox = ReplicatedStorage.Events.RemoteEvents.EquipBoombox
+local RE_PlayerDataChanged_Money = ReplicatedStorage.Events.RemoteEvents:WaitForChild("PlayerDataChanged_Money")
 
 -- Defaults
 UI_BoomboxButton.Visible = false
@@ -73,10 +80,7 @@ local UtilityAlertsRE = ReplicatedStorage.Events.RemoteEvents:WaitForChild("Util
 local SpawnToDrive = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents"):WaitForChild("SpawnCarToFarthest")
 local CameraAttachEvt = ReplicatedStorage.Events.RemoteEvents:WaitForChild("CameraAttachToCar")
 local camera = workspace.CurrentCamera
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
 local activeFollowConn
-
 
 local deleteMode   = false
 local selectedPart = nil
@@ -185,13 +189,20 @@ local function setChartsPulse(on: boolean)
 end
 
 
+local function isDeleteIgnorable(part: Instance): boolean
+	return part
+		and part:IsA("BasePart")
+		and part:GetAttribute("IsRangeVisual") == true
+end
+
+
 -- Keep new parts in sync across all containers while in delete mode
 -- We hook at the container level; if any are created later we’ll also hook them.
 local function hookContainerChildAdded(folder: Folder)
 	folder.ChildAdded:Connect(function(c)
 		if c:IsA("BasePart") then
 			-- ensure newly spawned plates reflect current delete-mode
-			if deleteMode then
+			if deleteMode and not isDeleteIgnorable(c) then
 				-- store original fields if first touch
 				if c:GetAttribute("_OrigTransparency") == nil then
 					c:SetAttribute("_OrigTransparency", c.Transparency)
@@ -201,9 +212,6 @@ local function hookContainerChildAdded(folder: Folder)
 				end
 				c.Transparency = 0.75
 				c.CanQuery     = true
-			else
-				-- default is invisible and not hittable unless ZoneDisplay changed it
-				-- do nothing
 			end
 		end
 	end)
@@ -469,11 +477,18 @@ local function toggleDeleteMode(on: boolean)
 	-- Pass 0: collect all parts so we can compact layers per XY bucket
 	local allParts = {}
 	forEachZonePart(playerPlot, function(part: BasePart)
-		table.insert(allParts, part)
+		if not isDeleteIgnorable(part) then
+			table.insert(allParts, part)
+		end
 	end)
 
 	-- Pass 1: ensure originals are saved once
 	for _, part in ipairs(allParts) do
+		if isDeleteIgnorable(part) then
+			-- never touch range visuals in delete mode
+			continue
+		end
+
 		if part:GetAttribute("_OrigTransparency") == nil then
 			part:SetAttribute("_OrigTransparency", part.Transparency)
 		end
@@ -502,6 +517,11 @@ local function toggleDeleteMode(on: boolean)
 
 	-- Pass 2: apply delete-mode or restore
 	for _, part in ipairs(allParts) do
+		if isDeleteIgnorable(part) then
+			-- never modify/touch range visuals during delete-mode
+			continue
+		end
+
 		if on then
 			-- DELETE-MODE: show & click
 			part.Transparency = 0.25
@@ -519,34 +539,22 @@ local function toggleDeleteMode(on: boolean)
 			-- base altitude = original Y
 			local baseY = part:GetAttribute("_OrigPosY") or part.Position.Y
 
-			-- compacted layer index if layered; otherwise no lift
+			-- compact stack for layered parts
 			local newY = baseY
 			if isLayeredPart(part) then
 				local baseL = resolveLayerForPart(part)
-				-- take the MAX compact rank across all cells this part covers
 				local compactIdx = maxCompactIndexForPart(part, compactRanksByCell, baseL)
 
-				-- thickness-aware spacing using representative per-layer thickness
-				local function layerThicknessFor(baseLayer: number): number
-					-- your utilities (roads/water/power/tunnel) are all 1.5 in delete-mode
-					return 1.5
-				end
-
-				-- We need the 'order' of layers for at least one cell the part covers.
-				-- Choose any cell the part covers that exists in ranks; if none, compactIdx==1 and lift=0.
 				local anyOrder = nil
 				for _, key in ipairs(cellsForPart(part)) do
 					local cell = compactRanksByCell[key]
-					if cell then
-						anyOrder = cell.order
-						break
-					end
+					if cell then anyOrder = cell.order break end
 				end
 
 				local lift = 0
 				if anyOrder and compactIdx > 1 then
 					for i = 1, (compactIdx - 1) do
-						lift += layerThicknessFor(anyOrder[i]) + DELETE_MODE_SPACING
+						lift += 1.5 + DELETE_MODE_SPACING -- utilities use 1.5 in delete-mode
 					end
 				end
 				newY = baseY + lift
@@ -557,8 +565,10 @@ local function toggleDeleteMode(on: boolean)
 
 		else
 			-- NORMAL MODE: restore everything exactly
-			part.Transparency = part:GetAttribute("_OrigTransparency")
-			part.CanQuery     = part:GetAttribute("_OrigCanQuery")
+			local ot = part:GetAttribute("_OrigTransparency")
+			if ot ~= nil then part.Transparency = ot end
+			local oq = part:GetAttribute("_OrigCanQuery")
+			if oq ~= nil then part.CanQuery = oq end
 
 			local ox = part:GetAttribute("_OrigSizeX")
 			local oy = part:GetAttribute("_OrigSizeY")
@@ -770,6 +780,16 @@ function MainGui.Init()
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			local Demands = PlayerGui.Demands
 			Demands.Enabled = not Demands.Enabled
+			if Demands.Enabled then
+				local ok = pcall(function()
+					SoundController.PlaySoundOnce("Misc", "Woosh1")
+				end)
+				if not ok then
+					local mainMenu = UI:FindFirstChild("MainMenu")
+					local s = mainMenu and mainMenu:FindFirstChild("Woosh1")
+					if s and s:IsA("Sound") then s:Play() end
+				end
+			end
 
 		elseif InputObject.KeyCode == Enum.KeyCode.V then
 			SoundController.PlaySoundOnce("UI", "SmallClick")
@@ -847,6 +867,7 @@ function MainGui.Init()
 
 		local target = mouse.Target
 		if not target or not target:GetAttribute("ZoneType") then return end  -- only zone parts
+		if isDeleteIgnorable(target) then return end                          -- ignore range visuals
 
 		-- highlight the newly picked zone, unhighlight previous
 		if selectedPart then tintZone(selectedPart,false) end
@@ -867,6 +888,9 @@ function MainGui.Init()
 	confirmDelete.OnClientEvent:Connect(function(zoneId, wasDeleted)
 		if selectedPart and selectedPart.Name == zoneId then
 			if wasDeleted then
+				-- NEW: success SFX for delete
+				SoundController.PlaySoundOnce("Misc", "PurchaseFail")
+
 				selectedPart:Destroy()         -- display part; ZoneDisplayModule will clean too
 			else
 				tintZone(selectedPart,false)
@@ -890,12 +914,22 @@ function MainGui.Init()
 	--SideButtonVFX(UI_CoopButton, UI_CoopButton.ImageButton.Size)
 
 	-- Button Interaction
-	UI_ChartsButton.MouseButton1Down:Connect(function()
+	UI_Top_HappinessButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		local Demands = PlayerGui.Demands
 		Demands.Enabled = not Demands.Enabled
+		if Demands.Enabled then
+			local ok = pcall(function()
+				SoundController.PlaySoundOnce("Misc", "Woosh1")
+			end)
+			if not ok then
+				local mainMenu = UI:FindFirstChild("MainMenu")
+				local s = mainMenu and mainMenu:FindFirstChild("Woosh1")
+				if s and s:IsA("Sound") then s:Play() end
+			end
+		end
 	end)
-
+	
 	UI_DestroyButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		UI.right.removal.Delete.Visible = not UI.right.removal.Delete.Visible
@@ -1036,7 +1070,14 @@ function MainGui.Init()
 		-- Fire remote; server will compute origin->farthest path and spawn
 		SpawnToDrive:FireServer()
 	end
-
+	
+	local PlayUISoundRE = ReplicatedStorage.Events.RemoteEvents:FindFirstChild("PlayUISound")
+	if PlayUISoundRE then
+		PlayUISoundRE.OnClientEvent:Connect(function(cat, name)
+			pcall(function() SoundController.PlaySoundOnce(cat or "Misc", name or "PurchaseFail") end)
+		end)
+	end
+	
 	-- Mouse/touch
 	UI_DriveBtn.MouseButton1Down:Connect(triggerDrive)
 	-- Gamepad/Touch unified activation
@@ -1137,7 +1178,18 @@ function MainGui.Init()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		local Demands = PlayerGui.Demands
 		Demands.Enabled = not Demands.Enabled
+		if Demands.Enabled then
+			local ok = pcall(function()
+				SoundController.PlaySoundOnce("Misc", "Woosh1")
+			end)
+			if not ok then
+				local mainMenu = UI:FindFirstChild("MainMenu")
+				local s = mainMenu and mainMenu:FindFirstChild("Woosh1")
+				if s and s:IsA("Sound") then s:Play() end
+			end
+		end
 	end)
+	
 	UtilityGUI.VisualMouseInteraction(
 		UI_Top_HappinessButton, UI_Top_HappinessButton.UIStroke,
 		TweenInfo.new(0.15),
@@ -1168,6 +1220,12 @@ function MainGui.Init()
 			UI_Top_Money_Gain_TextLabel.Text = "+ $" .. tostring(Abr.abbreviateNumber(data.income))
 		end
 	end)
+	RE_PlayerDataChanged_Money.OnClientEvent:Connect(function(balance)
+		if typeof(balance) ~= "number" then
+			return
+		end
+		UI_Top_Money_Amount_TextLabel.Text = "$" .. tostring(Abr.abbreviateNumber(balance))
+	end)
 	UI_Top_Money_Amount_TextLabel.Text = "..."
 	UI_Top_Money_Gain_TextLabel.Text = "..."
 
@@ -1178,6 +1236,16 @@ function MainGui.Init()
 		MainGui.DisableDeleteMode()
 		require(PlayerGui.BuildMenu.Logic).Toggle()
 	end)
+	-- (Optional) also support Activated for touch/gamepad if present
+	if UI_HotbarBuildButton.Activated then
+		UI_HotbarBuildButton.Activated:Connect(function()
+			SoundController.PlaySoundOnce("UI", "SmallClick")
+			MainGui.SetBuildButtonNotification(false)
+			MainGui.DisableDeleteMode()
+			require(PlayerGui.BuildMenu.Logic).Toggle()
+		end)
+	end
+
 	UtilityGUI.VisualMouseInteraction(
 		UI_HotbarBuildButton, UI_HotbarBuildButton.UIStroke,
 		TweenInfo.new(0.15),
@@ -1231,12 +1299,54 @@ function MainGui.Init()
 		end
 	end)
 
-	-- Show/Hide Build when BuildMenu UI is visible
-	UI_HotbarBuildFrame.Visible = not PlayerGui.BuildMenu.Enabled
-	PlayerGui.BuildMenu:GetPropertyChangedSignal("Enabled"):Connect(function()
-		UI_HotbarBuildFrame.Visible = not PlayerGui.BuildMenu.Enabled
-	end)
-end
+	----------------------------------------------------------------------
+	-- ✅ Onboarding: robust Build button target registration + open signal
+	----------------------------------------------------------------------
 
+	-- Always keep the Build button registered under the canonical key the
+	-- OnboardingController expects ("BuildButton"). This lets the controller
+	-- (and Notification/Arrow) re-pin reliably after any UI changes.
+	local function _registerBuildButtonTarget()
+		-- tolerate missing registry or instance swaps without throwing
+		pcall(function()
+			if UI_HotbarBuildButton and UI_HotbarBuildButton:IsA("GuiObject") then
+				UITargetRegistry.Register("BuildButton", UI_HotbarBuildButton)
+			end
+		end)
+	end
+
+	-- Initial register (deferred so layout is settled)
+	task.defer(_registerBuildButtonTarget)
+
+	-- Re-register if the button moves/reparents (e.g., UI reload/skin swap)
+	UI_HotbarBuildButton.AncestryChanged:Connect(function()
+		task.defer(_registerBuildButtonTarget)
+	end)
+
+	-- Mirror visibility of the hotbar build frame with BuildMenu, and:
+	--  • Fire "BuildMenuOpened" to the server on open (drives gate + item pulse)
+	--  • Re-register the BuildButton target on close to help the client-side
+	--    controller repin arrow/pulse immediately (paired with controller gate)
+	UI_HotbarBuildFrame.Visible = not PlayerGui.BuildMenu.Enabled
+	local _prevBMEnabled = PlayerGui.BuildMenu.Enabled
+	PlayerGui.BuildMenu:GetPropertyChangedSignal("Enabled"):Connect(function()
+		local enabled = PlayerGui.BuildMenu.Enabled
+		UI_HotbarBuildFrame.Visible = not enabled
+
+		if enabled and not _prevBMEnabled then
+			-- Tell the server we opened the Build Menu (the OnboardingServerBridge
+			-- listens for this and will gate/pulse the first required item).
+			RE_OnboardingStepCompleted:FireServer("BuildMenuOpened")
+		elseif (not enabled) and _prevBMEnabled then
+			-- Menu just closed: ensure the Build button target is fresh so the
+			-- controller can immediately repin visuals to "BuildButton".
+			_registerBuildButtonTarget()
+		end
+
+		_prevBMEnabled = enabled
+	end)
+	----------------------------------------------------------------------
+
+end
 
 return MainGui

@@ -9,7 +9,7 @@ local ONBOARDING_COMPLETED_BADGE_ID = 0  -- TODO: set real ID
 local ONBOARDING_SKIPPED_BADGE_ID   = 0  -- TODO: set real ID
 
 -- --------------------------------------------------------------------------
--- Server-safe profile accessor (tries likely server modules; never touches client controllers)
+-- Server-safe module accessor + smart invoker (supports ":" and ".")
 -- --------------------------------------------------------------------------
 local function _tryRequire(path: Instance?): any
 	if not path then return nil end
@@ -18,26 +18,50 @@ local function _tryRequire(path: Instance?): any
 	return nil
 end
 
--- Attempt a few common server-side data modules in your project:
+-- Try common locations in your project
 local _SaveManager =
 	_tryRequire(ServerScriptService:FindFirstChild("SaveManager")) or
 	_tryRequire((ServerScriptService:FindFirstChild("Players") or ServerScriptService):FindFirstChild("SaveManager")) or
 	_tryRequire((ServerScriptService:FindFirstChild("Services") or ServerScriptService):FindFirstChild("PlayerDataService")) or
 	_tryRequire(ServerScriptService:FindFirstChild("PlayerDataService"))
 
+-- Call a module function that might be defined with "." or ":".
+-- We try method style first (":"), then function style (".").
+-- FIX: capture varargs and pass them to pcall without a closure (prevents '... outside of vararg').
+local function _smartCall(mod, fnName: string, player: Player, ...)
+	if not mod then return nil end
+	local f = mod[fnName]
+	if typeof(f) ~= "function" then return nil end
+
+	local args = table.pack(...)
+
+	-- 1) Try method-call style (adds 'self' = mod)
+	local ok, res = pcall(f, mod, player, table.unpack(args, 1, args.n))
+	if ok and res ~= nil then
+		return res
+	end
+
+	-- 2) Try function-call style (no 'self')
+	ok, res = pcall(f, player, table.unpack(args, 1, args.n))
+	if ok then
+		return res
+	end
+
+	return nil
+end
+
 local function getProfile(player: Player): table?
-	-- Prefer a canonical server API if present
+	-- Prefer canonical server API if present
 	if _SaveManager then
-		-- Try common method names you've used before
-		if typeof(_SaveManager.GetProfile) == "function" then
-			return _SaveManager:GetProfile(player)
-		elseif typeof(_SaveManager.GetData) == "function" then
-			return _SaveManager:GetData(player)
-		elseif typeof(_SaveManager.ProfileFor) == "function" then
-			return _SaveManager:ProfileFor(player)
+		-- Try common method names you've used before (both ":" and ".")
+		local prof = _smartCall(_SaveManager, "GetProfile", player)
+			or _smartCall(_SaveManager, "GetData", player)
+			or _smartCall(_SaveManager, "ProfileFor", player)
+		if typeof(prof) == "table" then
+			return prof
 		end
 	end
-	-- As a safe fallback, return nil; caller will simply no-op
+	-- Safe fallback -> nil (callers no-op)
 	return nil
 end
 
@@ -59,21 +83,36 @@ local function fireClientState(player: Player, stepName: string, payload: any?)
 	StateChanged:FireClient(player, stepName, payload)
 end
 
--- Initialize the onboarding blob in the player's profile if missing.
-local function ensureOnboardingBlob(profile)
-	profile.Onboarding = profile.Onboarding or {
-		version      = 1,
-		state        = "NotStarted",
-		steps        = {},
-		firstSeenAt  = os.time(),
-		completedAt  = nil,
-		completionAwarded = false,
-		skipAwarded       = false,
-		progress     = { sequences = {} }, -- <-- ADD
+-- Initialize the onboarding blob in the player's (account‑wide) profile if missing.
+local function ensureOnboardingBlob(profile: table)
+	-- Add or normalize structure (account‑wide)
+	profile.Onboarding = profile.Onboarding or {}
+	local ob = profile.Onboarding
+
+	-- Core envelope
+	ob.version  = ob.version or 1
+	ob.state    = ob.state or "NotStarted"   -- "NotStarted" | "InProgress" | "Completed" | "Skipped"
+	ob.steps    = ob.steps or {}
+	ob.firstSeenAt  = ob.firstSeenAt or os.time()
+	ob.completedAt  = ob.completedAt or nil
+	ob.skippedAt    = ob.skippedAt or nil   -- when we consumed "skip" from the audit store
+	ob.completionAwarded = ob.completionAwarded == true
+	ob.skipAwarded       = ob.skipAwarded == true
+
+	-- Progress: sequences and B2 phase
+	ob.progress = ob.progress or {}
+	ob.progress.sequences = ob.progress.sequences or {}           -- { [seq] = { lastIndex, total } }
+	ob.progress.lastStage = ob.progress.lastStage or {            -- convenience mirror
+		seq   = "",
+		index = 0,
+		total = 0,
 	}
-	-- If existing saves are missing progress, ensure it exists.
-	profile.Onboarding.progress = profile.Onboarding.progress or { sequences = {} }
-	return profile.Onboarding
+	ob.progress.b2 = ob.progress.b2 or {                          -- Barrage 2 coarse resume
+		phase = "",                                              -- "" | "water" | "power"
+		lastSeenAt = 0,
+	}
+
+	return ob
 end
 
 -- Helpful internal: Badge award with debounce+pcall.
@@ -98,7 +137,6 @@ end
 -- --------------------------------------------------------------------------
 
 -- Call on PlayerAdded (after profile is loaded) IF you want gated kickoff.
--- You said you'll hook later; leaving this intact is harmless.
 function OnboardingService.StartIfNeeded(player: Player)
 	local profile = getProfile(player)
 	if not profile then return end
@@ -112,25 +150,21 @@ function OnboardingService.StartIfNeeded(player: Player)
 		record = AUDIT_STORE:GetAsync(key)
 	end)
 	if record and record.pendingSkip == true then
-		-- award skip badge once
+		-- Historical "skip" – persist account‑wide facts
 		if not ob.skipAwarded then
-			-- BadgeService check + award
 			if not safeUserHasBadgeAsync(player.UserId, ONBOARDING_SKIPPED_BADGE_ID) then
 				safeAwardBadge(player.UserId, ONBOARDING_SKIPPED_BADGE_ID)
 			end
 			ob.skipAwarded = true
 		end
-		-- Clear the audit flag so we don't keep re-awarding
+		ob.state     = (ob.state == "Completed") and "Completed" or "Skipped"
+		ob.skippedAt = record.skipAt or os.time()
+
+		-- Clear the audit flag (so we don't keep reprocessing)
 		pcall(function()
-			AUDIT_STORE:SetAsync(key, { pendingSkip = false, skipAt = record.skipAt })
+			AUDIT_STORE:SetAsync(key, { pendingSkip = false, skipAt = ob.skippedAt })
 		end)
-		-- Optionally, reset their onboarding for fresh run if you want:
-		if ob.state ~= "Completed" then
-			ob.state = "NotStarted"
-			ob.steps = {}
-			ob.completedAt = nil
-			-- Don't touch completionAwarded/skipAwarded—they are historical
-		end
+		-- NOTE: We do NOT reset steps/progress here; "Skipped" is terminal until you explicitly re‑enable.
 	end
 
 	-- 2) If already completed from a past run, ensure they get the completion badge
@@ -141,22 +175,18 @@ function OnboardingService.StartIfNeeded(player: Player)
 			end
 			ob.completionAwarded = true
 		end
-		return -- nothing more to do
+		return
 	end
 
-	-- 3) Otherwise, we transition to InProgress if not started yet.
+	-- 3) Otherwise, ensure we are InProgress (unless Skipped)
 	if ob.state == "NotStarted" then
 		ob.state = "InProgress"
 	end
-
-	-- (Optional) If you want this to immediately prompt the client:
-	-- fireClientState(player, "CityNaming")
 end
 
 -- Use this NOW while you're not gating with StartIfNeeded.
 -- It simply tells the client to show the city-naming prompt.
 function OnboardingService.KickoffCityNaming(player: Player)
-	-- No profile dependency; this just nudges the client UX.
 	fireClientState(player, "CityNaming")
 end
 
@@ -176,6 +206,12 @@ function OnboardingService.Complete(player: Player)
 	local ob = ensureOnboardingBlob(profile)
 	ob.state = "Completed"
 	ob.completedAt = ob.completedAt or os.time()
+
+	-- Clear coarse B2 phase tracker (not strictly required)
+	if ob.progress and ob.progress.b2 then
+		ob.progress.b2.phase = ""
+		ob.progress.b2.lastSeenAt = os.time()
+	end
 
 	if not ob.completionAwarded then
 		if not safeUserHasBadgeAsync(player.UserId, ONBOARDING_COMPLETED_BADGE_ID) then
@@ -199,12 +235,11 @@ function OnboardingService.Advance(player: Player, stepName: string, payload: an
 		ob.state = "InProgress"
 	end
 	ob.steps[stepName] = true
-	-- Notify the client which step the server wants to show
 	fireClientState(player, stepName, payload)
 end
 
--- Call this EXACTLY when the player presses "Delete Save" WHILE onboarding is InProgress.
--- It writes to the audit store that is not cleared by your wipe.
+-- Exactly when the player presses "Delete Save" WHILE onboarding is InProgress.
+-- Writes to an audit store not cleared by your per-save wipe.
 function OnboardingService.RecordDeletionDuringOnboarding(userId: number)
 	local key = ("onboarding_audit:%d"):format(userId)
 	local now = os.time()
@@ -215,6 +250,52 @@ function OnboardingService.RecordDeletionDuringOnboarding(userId: number)
 		AUDIT_STORE:SetAsync(key, current)
 	end)
 end
+
+-- === Progress (Barrage 1 guard) ============================================
+
+function OnboardingService.RecordGuardProgress(player: Player, seq: string, idx: number, total: number?)
+	local profile = getProfile(player); if not profile then return end
+	local ob = ensureOnboardingBlob(profile)
+	ob.progress = ob.progress or { sequences = {} }
+	local rec = ob.progress.sequences[seq] or {}
+	rec.lastIndex = idx
+	if type(total) == "number" and total > 0 then rec.total = total end
+	ob.progress.sequences[seq] = rec
+
+	-- Mirror into lastStage (coarse, for dashboards)
+	ob.progress.lastStage = {
+		seq   = seq,
+		index = idx,
+		total = rec.total or total or 0,
+	}
+end
+
+function OnboardingService.GetGuardProgress(player: Player, seq: string): (number?, number?)
+	local profile = getProfile(player); if not profile then return nil end
+	local ob = ensureOnboardingBlob(profile)
+	local rec = ob.progress and ob.progress.sequences and ob.progress.sequences[seq]
+	if not rec then return nil end
+	return rec.lastIndex, rec.total
+end
+
+-- === Progress (Barrage 2 coarse phase) =====================================
+
+function OnboardingService.SetB2Phase(player: Player, phase: "water"|"power"|""?)
+	local profile = getProfile(player); if not profile then return end
+	local ob = ensureOnboardingBlob(profile)
+	ob.progress = ob.progress or {}
+	ob.progress.b2 = ob.progress.b2 or { phase = "", lastSeenAt = 0 }
+	ob.progress.b2.phase = phase or ""
+	ob.progress.b2.lastSeenAt = os.time()
+end
+
+function OnboardingService.GetB2Phase(player: Player): string?
+	local profile = getProfile(player); if not profile then return nil end
+	local ob = ensureOnboardingBlob(profile)
+	return ob.progress and ob.progress.b2 and ob.progress.b2.phase or nil
+end
+
+-- === Queries ================================================================
 
 function OnboardingService.IsCompleted(player: Player): boolean
 	local profile = getProfile(player); if not profile then return false end
@@ -228,28 +309,67 @@ function OnboardingService.IsInProgress(player: Player): boolean
 	return ob.state == "InProgress"
 end
 
-function OnboardingService.RecordGuardProgress(player: Player, seq: string, idx: number, total: number?)
-	local profile = getProfile(player); if not profile then return end
-	local ob = ensureOnboardingBlob(profile)
-	ob.progress = ob.progress or { sequences = {} }
-	local rec = ob.progress.sequences[seq] or {}
-	rec.lastIndex = idx
-	if type(total) == "number" and total > 0 then rec.total = total end
-	ob.progress.sequences[seq] = rec
-end
-
-function OnboardingService.GetGuardProgress(player: Player, seq: string): (number?, number?)
-	local profile = getProfile(player); if not profile then return nil end
-	local ob = ensureOnboardingBlob(profile)
-	local rec = ob.progress and ob.progress.sequences and ob.progress.sequences[seq]
-	if not rec then return nil end
-	return rec.lastIndex, rec.total
-end
-
-function OnboardingService.HasStep(player: Player, stepId: string): boolean
+function OnboardingService.IsSkipped(player: Player): boolean
 	local profile = getProfile(player); if not profile then return false end
 	local ob = ensureOnboardingBlob(profile)
-	return ob.steps and ob.steps[stepId] == true
+	return (ob.state == "Skipped") or (ob.skipAwarded == true)
+end
+
+-- Returns a compact account-wide status snapshot
+function OnboardingService.GetStatus(player: Player): table
+	local profile = getProfile(player)
+	if not profile then
+		return { state = "Unknown" }
+	end
+	local ob = ensureOnboardingBlob(profile)
+	local idx, total = OnboardingService.GetGuardProgress(player, "barrage1")
+	return {
+		state       = ob.state,                        -- "NotStarted" | "InProgress" | "Completed" | "Skipped"
+		completed   = ob.state == "Completed",
+		skipped     = (ob.state == "Skipped") or (ob.skipAwarded == true),
+		completedAt = ob.completedAt,
+		skippedAt   = ob.skippedAt,
+		stage = {
+			seq   = idx and "barrage1" or nil,
+			index = idx,
+			total = total,
+			b2    = { phase = OnboardingService.GetB2Phase(player) },
+		}
+	}
+end
+
+function OnboardingService.Reset(player: Player)
+	local profile = getProfile(player)
+	if not profile then return false, "No profile" end
+
+	-- Ensure blob exists, then hard‑reset it
+	local ob = ensureOnboardingBlob(profile)
+
+	ob.state    = "NotStarted"
+	ob.steps    = {}
+	ob.firstSeenAt = ob.firstSeenAt or os.time() -- keep firstSeenAt for analytics if you want
+	ob.completedAt = nil
+	ob.skippedAt   = nil
+
+	-- You generally can’t “unaward” badges, but clearing these booleans prevents your code
+	-- from treating the profile as completed/skipped next time.
+	ob.completionAwarded = false
+	ob.skipAwarded       = false
+
+	-- Progress reset
+	ob.progress = {
+		sequences = {},                     -- clears barrage1 guard progress
+		lastStage = { seq = "", index = 0, total = 0 },
+		b2 = { phase = "", lastSeenAt = os.time() }
+	}
+
+	-- Also clear the audit “pending skip” record so StartIfNeeded won’t skip again
+	local key = ("onboarding_audit:%d"):format(player.UserId)
+	pcall(function()
+		AUDIT_STORE:SetAsync(key, { pendingSkip = false, skipAt = nil })
+	end)
+
+	return true
 end
 
 return OnboardingService

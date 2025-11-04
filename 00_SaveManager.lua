@@ -483,7 +483,7 @@ WorldReloadBeginBE.Event:Connect(function(player: Player)
 	InReload[player] = true
 	WorldReloadRE:FireClient(player, "begin")
 	-- Optional early seed of progress band A:
-	WorldReloadRE:FireClient(player, "progress", 2, "Preparing city")
+	WorldReloadRE:FireClient(player, "progress", 2, "LOAD_Preparing")
 end)
 WorldReloadEndBE.Event:Connect(function(player: Player)
 	InReload[player] = nil
@@ -881,12 +881,12 @@ end
 
 -- Phase progress bands (A..F) shown to the player
 local PHASE_RANGES = {
-	A = {min= 2, max= 5,  label="Preparing city"},
-	B = {min= 5, max=25,  label="Setting up zones"},
-	C = {min=25, max=55,  label="Building roads"},
-	D = {min=55, max=90,  label="Placing buildings"},
-	E = {min=90, max=96,  label="Laying utilities"},
-	F = {min=96, max=100, label="Finalizing"},
+	A = {min= 2, max= 5,  key="LOAD_Preparing"},
+	B = {min= 5, max=25,  key="LOAD_SettingUpZones"},
+	C = {min=25, max=55,  key="LOAD_BuildingRoads"},
+	D = {min=55, max=90,  key="LOAD_PlacingBuildings"},
+	E = {min=90, max=96,  key="LOAD_LayingUtilities"},
+	F = {min=96, max=100, key="LOAD_Finalizing"},
 }
 
 local function _blend(range, frac)
@@ -1130,7 +1130,7 @@ local function runLoadSlice(state, budgetMs)
 			end)
 		end
 
-		_sendProgress(state, PHASE_RANGES.A.min, PHASE_RANGES.A.label)
+		_sendProgress(state, PHASE_RANGES.A.min, PHASE_RANGES.A.key)
 		state.phase = "B" -- advance
 		return false -- not done yet
 	end
@@ -1167,7 +1167,7 @@ local function runLoadSlice(state, budgetMs)
 			-- progress
 			state.doneSkeleton += 1
 			local fracB = (state.totalZones == 0) and 1 or (state.doneSkeleton / state.totalZones)
-			_sendProgress(state, _blend(PHASE_RANGES.B, fracB), PHASE_RANGES.B.label)
+			_sendProgress(state, _blend(PHASE_RANGES.B, fracB), PHASE_RANGES.B.key)
 
 			state.idxSkeleton += 1
 			if os.clock() >= deadline then return false end
@@ -1178,7 +1178,7 @@ local function runLoadSlice(state, budgetMs)
 		ZoneManager.playerZoneCounters[player.UserId] = state.maxZoneIdx + 1
 
 		-- end of phase B -> snap to B.max
-		_sendProgress(state, PHASE_RANGES.B.max, PHASE_RANGES.B.label)
+		_sendProgress(state, PHASE_RANGES.B.max, PHASE_RANGES.B.key)
 
 		state.phase = "C"
 		return false
@@ -1210,7 +1210,7 @@ local function runLoadSlice(state, budgetMs)
 				-- progress
 				state.doneRoads += 1
 				local fracC = (state.totalRoads == 0) and 1 or (state.doneRoads / state.totalRoads)
-				_sendProgress(state, _blend(PHASE_RANGES.C, fracC), PHASE_RANGES.C.label)
+				_sendProgress(state, _blend(PHASE_RANGES.C, fracC), PHASE_RANGES.C.key)
 
 				processed += 1
 				if processed >= LOAD_MAX_ROADS_PER_SLICE then break end
@@ -1221,7 +1221,7 @@ local function runLoadSlice(state, budgetMs)
 
 		if state.idxRoads > #state.zoneRows then
 			-- end of phase C -> snap to C.max
-			_sendProgress(state, PHASE_RANGES.C.max, PHASE_RANGES.C.label)
+			_sendProgress(state, PHASE_RANGES.C.max, PHASE_RANGES.C.key)
 			state.phase = "D"
 		end
 		return false
@@ -1243,7 +1243,7 @@ local function runLoadSlice(state, budgetMs)
 				-- progress
 				state.doneBuildings += 1
 				local fracD = (state.totalBuildings == 0) and 1 or (state.doneBuildings / state.totalBuildings)
-				_sendProgress(state, _blend(PHASE_RANGES.D, fracD), PHASE_RANGES.D.label)
+				_sendProgress(state, _blend(PHASE_RANGES.D, fracD), PHASE_RANGES.D.key)
 
 				processed += 1
 				if processed >= LOAD_MAX_BUILDINGS_PER_SLICE then break end
@@ -1254,7 +1254,7 @@ local function runLoadSlice(state, budgetMs)
 
 		if state.idxBuild > #state.zoneRows then
 			-- end of phase D -> snap to D.max
-			_sendProgress(state, PHASE_RANGES.D.max, PHASE_RANGES.D.label)
+			_sendProgress(state, PHASE_RANGES.D.max, PHASE_RANGES.D.key)
 			state.phase = "E"
 		end
 		return false
@@ -1271,7 +1271,7 @@ local function runLoadSlice(state, budgetMs)
 				-- progress
 				state.doneNetworks += 1
 				local fracE = (state.totalNetworks == 0) and 1 or (state.doneNetworks / state.totalNetworks)
-				_sendProgress(state, _blend(PHASE_RANGES.E, fracE), PHASE_RANGES.E.label)
+				_sendProgress(state, _blend(PHASE_RANGES.E, fracE), PHASE_RANGES.E.key)
 
 				processed += 1
 				if processed >= LOAD_MAX_NETWORKS_PER_SLICE then break end
@@ -1282,7 +1282,7 @@ local function runLoadSlice(state, budgetMs)
 
 		if state.idxNet > #state.zoneRows then
 			-- end of phase E -> snap to E.max
-			_sendProgress(state, PHASE_RANGES.E.max, PHASE_RANGES.E.label)
+			_sendProgress(state, PHASE_RANGES.E.max, PHASE_RANGES.E.key)
 			state.phase = "F"
 		end
 		return false
@@ -1291,7 +1291,7 @@ local function runLoadSlice(state, budgetMs)
 	-- Phase F: post-load hooks
 	if state.phase == "F" then
 		-- Top off to 100% and "Finalizing"
-		_sendProgress(state, PHASE_RANGES.F.max, PHASE_RANGES.F.label)
+		_sendProgress(state, PHASE_RANGES.F.max, PHASE_RANGES.F.key)
 
 		local NetworksPostLoadBE = ensureBindableEvent(BindableEvents, "NetworksPostLoad")
 		NetworksPostLoadBE:Fire(player)

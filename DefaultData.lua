@@ -55,7 +55,7 @@ DefaultData.SaveFile = {
 
 	-- Economy
 	economy = {
-		money        = 30000,
+		money        = 40000,
 		bustickets   = 0,
 		planetickets = 0,
 	},
@@ -125,7 +125,7 @@ function DefaultData.newSaveFile(): table
 	sf.UniqueBuildings = {}
 
 	sf.economy = {
-		money        = 3000000,
+		money        = 40000,
 		bustickets   = 0,
 		planetickets = 0,
 	}
@@ -170,6 +170,24 @@ DefaultData.StartingData = {
 
 	-- Monetization (ACCOUNT-WIDE)
 	OwnedGamepasses = {},
+	
+
+	Onboarding = {
+		version      = 1,
+		state        = "NotStarted",      -- "NotStarted" | "InProgress" | "Completed" | "Skipped"
+		steps        = {},
+		firstSeenAt  = 0,
+		completedAt  = nil,
+		skippedAt    = nil,
+		completionAwarded = false,
+		skipAwarded       = false,
+		progress = {
+			sequences = {},               -- e.g. barrage1 { lastIndex, total }
+			lastStage = { seq="", index=0, total=0 },
+			b2 = { phase = "", lastSeenAt = 0 }, -- "" | "water" | "power"
+		},
+	},
+
 
 	-- === Player-wide section (ACCOUNT-WIDE, NOT per save) ===
 	PlayerWide = {

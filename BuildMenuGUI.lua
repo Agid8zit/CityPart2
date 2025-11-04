@@ -30,6 +30,7 @@ local RE_BusSupportStatus = RE:WaitForChild("BusSupportStatus")
 local RE_MetroSupportStatus = RE:FindFirstChild("MetroSupportStatus")
 local RangeVisualsClient = require(ReplicatedStorage.Scripts.UI.RangeVisualsClient)
 local UITargetRegistry = require(ReplicatedStorage.Scripts.UI.UITargetRegistry)
+local RE_OnboardingStepCompleted = RE:WaitForChild("OnboardingStepCompleted")
 
 -- [ADDED] bring in UpdateStatsUI for balance cache (you were already using this later)
 local UIUpdate_RemoteEvent = RE:WaitForChild("UpdateStatsUI")
@@ -47,22 +48,42 @@ local FrameButtons = {} -- [BuildingID] = Frame
 local CachedLevel = 0
 local CachedBalance = 0               -- [ADDED] numeric balance cache
 
+local OBArrow = UI.OnboardingArrow
+
 local BE_TabChanged   = BE:WaitForChild("OBBuildMenuTabChanged")       -- :Fire("major", "Zones" | "Transport" | "Supply" | "Services")
 local BF_GetMajorTab  = BF:WaitForChild("OBBuildMenuGetMajorTab")      -- :Invoke() -> string?
+local BF_GetHub = BF:FindFirstChild("OBBuildMenuGetHub")
 
 BF_GetMajorTab.OnInvoke = function()
 	return MajorCurrentTabName
 end
 
+-- Return "Water" or "Power" when Supply is the context; nil otherwise.
+BF_GetHub.OnInvoke = function(majorName)
+	majorName = tostring(majorName or MajorCurrentTabName)
+	if majorName == "Supply" then
+		if CurrentTabName == "Water" then return "Water" end
+		if CurrentTabName == "Power" then return "Power" end
+	end
+	return nil
+end
+
 -- === PULSE: token-safe UI pulse controller ===================================
 local _pulseTargets: {[string]: GuiObject?} = {}   -- key -> GuiObject
 
+-- [ADDED] local arrow tracking state for OBArrow
+local _obArrowConn = nil
+local _obArrowOwnerKey = nil
+local _obArrowToken = 0
+
 local function _regTarget(key: string, gui: GuiObject?)
 	_pulseTargets[key] = gui
-	-- also publish to the shared UI target registry so other systems can reuse
 	pcall(function() UITargetRegistry.Register(key, gui) end)
 end
 local PULSE_COLOR = Color3.fromRGB(90, 255, 120)
+
+-- Forward-declare: other code calls this before we assign it.
+local _updatePulses: (() -> ())? = nil
 
 local function _ensurePulseRing(gui: GuiObject)
 	local ring = gui:FindFirstChild("_PulseRing")
@@ -75,155 +96,198 @@ local function _ensurePulseRing(gui: GuiObject)
 		end
 		return ring, stroke
 	end
-
 	ring = Instance.new("Frame")
 	ring.Name = "_PulseRing"
 	ring.BackgroundTransparency = 1
 	ring.AnchorPoint = Vector2.new(0.5, 0.5)
 	ring.Position = UDim2.fromScale(0.5, 0.5)
-	ring.Size = UDim2.fromScale(1, 1)             -- <- no size oscillation
+	ring.Size = UDim2.fromScale(1, 1)
 	ring.ZIndex = (gui.ZIndex or 1) + 5
-
-	-- match corners if the target has them
 	local baseCorner = gui:FindFirstChildOfClass("UICorner")
 	if baseCorner then
 		local c = Instance.new("UICorner")
 		c.CornerRadius = baseCorner.CornerRadius
 		c.Parent = ring
 	end
-
 	local stroke = Instance.new("UIStroke")
 	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Color = PULSE_COLOR
-	stroke.Thickness = 3                         -- <- fixed thickness
-	stroke.Transparency = 0.6                    -- <- start slightly faint
+	stroke.Thickness = 3
+	stroke.Transparency = 0.6
 	stroke.Parent = ring
-
 	ring.Parent = gui
 	return ring, stroke
 end
 
+-- [FIX] central arrow release so we can hide even if the GUI target is gone
+local function _releaseArrowIfOwner(key: string?)
+	if _obArrowOwnerKey and (_obArrowOwnerKey == key or key == nil) then
+		if _obArrowConn then _obArrowConn:Disconnect() end
+		_obArrowConn = nil
+		_obArrowOwnerKey = nil
+		_obArrowToken += 1
+		if OBArrow and OBArrow:IsA("GuiObject") then
+			OBArrow.Visible = false
+		end
+	end
+end
+
 local function _startPulseFor(gui: GuiObject?, key: string)
-	if not gui or not gui.Parent then return end
+	-- If no target exists, make sure any previous arrow owned by this key is gone.
+	if not gui or not gui.Parent then
+		_releaseArrowIfOwner(key)
+		return false
+	end
+
 	local token = (gui:GetAttribute("_PulseToken") or 0) + 1
 	gui:SetAttribute("_PulseToken", token)
 	gui:SetAttribute("_PulseKey", key)
 
 	local ring, stroke = _ensurePulseRing(gui)
 	ring.Visible = true
-
-	-- Stable baseline: no size/thickness tweens, just a soft green fade
 	stroke.Color = PULSE_COLOR
 	stroke.Thickness = 3
 	ring.Size = UDim2.fromScale(1, 1)
 
+	-- Position & show our local arrow over the pulsing button
+	if OBArrow and OBArrow:IsA("GuiObject") then
+		if _obArrowConn then _obArrowConn:Disconnect() end
+		_obArrowToken += 1
+		_obArrowOwnerKey = key
+		OBArrow.Visible = true
+		OBArrow.Rotation = 180
+		pcall(function() OBArrow.AnchorPoint = Vector2.new(0.5, 1) end)
+		OBArrow.ZIndex = math.max((gui.ZIndex or 1) + 10, OBArrow.ZIndex or 1)
+		local myToken = _obArrowToken
+		local myKey = key
+
+		_obArrowConn = RunService.RenderStepped:Connect(function()
+			-- Abort if ownership changed
+			if _obArrowToken ~= myToken then return end
+
+			-- If the target or arrow went away, hide immediately
+			if not (gui.Parent and OBArrow.Parent) then
+				_releaseArrowIfOwner(myKey)
+				return
+			end
+
+			local pos = gui.AbsolutePosition
+			local size = gui.AbsoluteSize
+			OBArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y - 2)
+		end)
+	end
+
 	task.spawn(function()
 		while gui.Parent and gui:GetAttribute("_PulseToken") == token do
-			-- fade in to brighter
-			local tIn = TweenService:Create(
-				stroke,
-				TweenInfo.new(0.42, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
-				{ Transparency = 0.15 }
-			)
+			local tIn = TweenService:Create(stroke, TweenInfo.new(0.42, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Transparency = 0.15 })
 			tIn:Play(); tIn.Completed:Wait()
 			if not (gui.Parent and gui:GetAttribute("_PulseToken") == token) then break end
-
-			-- fade out to fainter
-			local tOut = TweenService:Create(
-				stroke,
-				TweenInfo.new(0.58, Enum.EasingStyle.Sine, Enum.EasingDirection.In),
-				{ Transparency = 0.65 }
-			)
+			local tOut = TweenService:Create(stroke, TweenInfo.new(0.58, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { Transparency = 0.65 })
 			tOut:Play(); tOut.Completed:Wait()
 		end
-
-		-- settle at faint if we stop naturally
 		if gui:GetAttribute("_PulseToken") == token then
 			stroke.Transparency = 0.65
-			ring.Visible = true  -- keep it present but subtle
+			ring.Visible = true
 		end
 	end)
+
+	return true
 end
 
 local function _stopPulseForKey(key: string)
 	local gui = _pulseTargets[key]
-	if not gui then return end
-	local token = (gui:GetAttribute("_PulseToken") or 0) + 1
-	gui:SetAttribute("_PulseToken", token)
-	gui:SetAttribute("_PulseKey", nil)
 
-	local ring = gui:FindFirstChild("_PulseRing")
-	if ring and ring:IsA("Frame") then
-		local stroke = ring:FindFirstChildOfClass("UIStroke")
-		if stroke then
-			-- quick fade to invisible, then hide the ring
-			local t = TweenService:Create(
-				stroke,
-				TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
-				{ Transparency = 1 }
-			)
-			t:Play()
-			t.Completed:Connect(function()
-				if ring and ring.Parent then
-					ring.Visible = false
-				end
-			end)
-		else
-			ring.Visible = false
+	-- If we still have the GUI reference, stop its ring tween/token.
+	if gui then
+		local token = (gui:GetAttribute("_PulseToken") or 0) + 1
+		gui:SetAttribute("_PulseToken", token)
+		gui:SetAttribute("_PulseKey", nil)
+		local ring = gui:FindFirstChild("_PulseRing")
+		if ring and ring:IsA("Frame") then
+			local stroke = ring:FindFirstChildOfClass("UIStroke")
+			if stroke then
+				local t = TweenService:Create(stroke, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Transparency = 1 })
+				t:Play()
+				t.Completed:Connect(function()
+					if ring and ring.Parent then
+						ring.Visible = false
+					end
+				end)
+			else
+				ring.Visible = false
+			end
 		end
+	end
+
+	-- Always hide the arrow if this key owned it, even if the GUI is gone.
+	if _obArrowOwnerKey == key then
+		_releaseArrowIfOwner(key)
 	end
 end
 
 local function _stopAllPulses()
 	for key, gui in pairs(_pulseTargets) do
-		if gui then _stopPulseForKey(key) end
+		if gui then _stopPulseForKey(key) else
+			-- key registered but no gui; still ensure arrow gets released if it was owned by this key
+			if _obArrowOwnerKey == key then _releaseArrowIfOwner(key) end
+		end
 	end
+	_releaseArrowIfOwner(nil) -- absolute guarantee
 end
 
-local _obEnabled = false
-local _obGateItemID = nil
+
+-- === Gate + pulse targets ====================================================
+local _obEnabled: boolean = false
+local _obGateItemID: string? = nil  -- single source of truth
 
 local function _refreshPulseTargets()
-	-- Transport top tab background (clickable)
-	local transportBtn
-	pcall(function() transportBtn = UI.main.tabs.transport.Background end)
-	if transportBtn then _regTarget("BM_Transport", transportBtn) end
+	-- Transport
+	local transportBtn; pcall(function() transportBtn = UI.main.tabs.transport.Background end)
+	_regTarget("BM_Transport", transportBtn)
 
-	-- Zones top tab
-	local zonesBtn
-	pcall(function() zonesBtn = UI.main.tabs.zones.Background end)
-	if zonesBtn then _regTarget("BM_Zones", zonesBtn) end
+	-- Zones
+	local zonesBtn; pcall(function() zonesBtn = UI.main.tabs.zones.Background end)
+	_regTarget("BM_Zones", zonesBtn)
 
-	-- (optional, handy later) Services + Supply top tabs
-	local servicesBtn
-	pcall(function() servicesBtn = UI.main.tabs.services.Background end)
-	if servicesBtn then _regTarget("BM_Services", servicesBtn) end
+	-- Services / Supply (optional)
+	local servicesBtn; pcall(function() servicesBtn = UI.main.tabs.services.Background end)
+	_regTarget("BM_Services", servicesBtn)
 
-	local supplyBtn
-	pcall(function() supplyBtn = UI.main.tabs.supply.Background end)
-	if supplyBtn then _regTarget("BM_Supply", supplyBtn) end
+	local supplyBtn; pcall(function() supplyBtn = UI.main.tabs.supply.Background end)
+	_regTarget("BM_Supply", supplyBtn)
 
-	-- Road button inside Transport section
-	local roadBtn = FrameButtons and FrameButtons["DirtRoad"]
-	if roadBtn then _regTarget("BM_DirtRoad", roadBtn) end
+	-- Road button
+	local roadBtn = FrameButtons and FrameButtons["DirtRoad"] or nil
+	_regTarget("BM_DirtRoad", roadBtn)
 end
 
+-- BuildMenu is being gated to a specific next-step item while onboarding runs
+function BuildMenu.ApplyGateVisual(itemID: string?)
+	if type(itemID) == "string" and itemID ~= "" then
+		_obGateItemID = itemID
+	else
+		_obGateItemID = nil
+	end
+	if _updatePulses then _updatePulses() end
+end
 
--- Default pulsing logic (now yields to onboarding gate)
-local function _updatePulses()
+-- Default pulsing logic (gate ALWAYS wins)
+_updatePulses = function()
 	_refreshPulseTargets()
-	if not UI.Enabled then
+
+	-- If UI is hidden, or onboarding is disabled, stop everything.
+	if not UI.Enabled or _obEnabled == false then
 		_stopAllPulses()
 		return
 	end
 
-	-- If onboarding is gating to a specific item, let it own pulses/arrows.
-	if _obEnabled and _obGateItemID ~= nil then
+	-- Gate active → suppress BuildMenu's default nudge (server/client onboarding scripts will drive gates)
+	if _obGateItemID ~= nil then
 		_stopAllPulses()
 		return
 	end
 
-	-- Default nudge (only when no gate is active)
+	-- Default nudge (only when onboarding is enabled AND no gate is active)
 	if MajorCurrentTabName ~= "Transport" then
 		_stopPulseForKey("BM_DirtRoad")
 		_startPulseFor(_pulseTargets["BM_Transport"], "BM_Transport")
@@ -233,39 +297,13 @@ local function _updatePulses()
 	end
 end
 
-local _obGateItemID = nil  -- <- gate is true when this is a non-empty string
-
--- Optional: we still listen for a toggle if your controller broadcasts it,
--- but the gate suppression below does NOT depend on this being present.
+-- Listen to onboarding toggle (optional; does not modify gate)
 do
-	local ok, ev = pcall(function()
-		return BE:FindFirstChild("OnboardingToggle")
-	end)
-	if ok and ev and ev:IsA("BindableEvent") then
-		ev.Event:Connect(function(_enabled)
-			-- no-op; default pulses are suppressed solely by _obGateItemID
-			_updatePulses()
-		end)
-	end
-end
-
-function BuildMenu.ApplyGateVisual(itemID)
-	if type(itemID) == "string" and itemID ~= "" then
-		_obGateItemID = itemID
-	else
-		_obGateItemID = nil
-	end
-	_updatePulses()
-end
-
-do
-	local ok, ev = pcall(function()
-		return BE:FindFirstChild("OnboardingToggle")
-	end)
-	if ok and ev and ev:IsA("BindableEvent") then
+	local ev = BE:FindFirstChild("OnboardingToggle")
+	if ev and ev:IsA("BindableEvent") then
 		ev.Event:Connect(function(enabled)
 			_obEnabled = (enabled ~= false)
-			_updatePulses()
+			if _updatePulses then _updatePulses() end
 		end)
 	end
 end
@@ -1363,7 +1401,7 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 		else
 			local target = (ITEMNAME_TO_SECTION[Data.itemName] or Data.itemName)
 			CategoryButtonForSection[target] = Choice
-
+			_regTarget("BM_" .. target, Choice)
 			if SectionHasPending[target] then
 				dot.Visible = true
 			end
@@ -1436,9 +1474,11 @@ function BuildMenu.SetTab(TabName: string)
 	local isMajor = (TabName == "Services" or TabName == "Supply" or TabName == "Transport" or TabName == "Zones")
 	local hasConcrete = TabSections[TabName] ~= nil
 
-	if not isMajor and not hasConcrete then
-		warn(("[BuildMenu] SetTab('%s'): no such section"):format(tostring(TabName)))
-		return
+	if not isMajor then
+		local parentMajor = SECTION_TO_MAJOR[TabName]
+		if parentMajor == "Supply" then
+			BE_TabChanged:Fire("hub", TabName)  -- "Water" or "Power"
+		end
 	end
 
 	CurrentTabName = TabName
@@ -1742,6 +1782,7 @@ function BuildMenu.Init()
 			onClick = function()
 				SetPlayerZonesVisible(true)
 				selectZoneEvent:FireServer("DirtRoad")
+				pcall(function() RE_OnboardingStepCompleted:FireServer("RoadToolSelected") end)
 			end,
 		},
 		{
