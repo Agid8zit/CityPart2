@@ -224,6 +224,7 @@ local guard = { active=false, spec=nil, stage=nil }
 local guardMarks = {}  -- [BasePart] = true
 local alarmModel = nil
 local YELLOW = Color3.new(1,1,0)
+local _pendingPointGuardPayload = nil
 
 local function _gridPartAt(coord)
 	if not coord then return nil end
@@ -974,13 +975,23 @@ local function click(target)
 				end
 
 			else
-				-- point (e.g., WaterTower). We lock the one cell, but let your normal
-				-- ghost-aware placement code run on click.
+				-- point (e.g., WaterTower). Require exact cell; then defer "done"
+				-- until the actual placement call runs in the base logic below.
 				local p = spec.point or spec.from
 				if not p or gx ~= p.x or gz ~= p.z then return end
+
+				-- Stash a payload so we can report completion after placement.
+				_pendingPointGuardPayload = {
+					item = spec.item or spec.mode,
+					mode = spec.mode,
+				}
+
+				-- Clear visuals now; let normal placement path run next.
 				_clearGuardUI()
-				guard.active=false; guard.spec=nil; guard.stage=nil
-				-- fall through to base logic for actual placement
+				guard.active=false
+				guard.spec=nil
+				guard.stage=nil
+				-- fall through to base logic for the actual BuildZone call
 			end
 		end
 		-- === end Guided lock ================================================
@@ -1182,6 +1193,13 @@ local function click(target)
 
 			print("Placing", currentMode, "from:", coord.x, coord.z, "to", endCoord.x, endCoord.z)
 			ExecuteCommandEvent:FireServer("BuildZone", coord, endCoord, currentMode, buildingRotation)
+			
+			if _pendingPointGuardPayload and _pendingPointGuardPayload.mode == currentMode then
+				pcall(function() BE_GuardFB:Fire("done", _pendingPointGuardPayload) end)
+				_pendingPointGuardPayload = nil
+			end
+
+			
 			target.Color = Color3.new(0, 0, 1)
 			removeGhost()
 			clearAll()

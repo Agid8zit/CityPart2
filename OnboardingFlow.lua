@@ -62,9 +62,10 @@ local stepIdx: number  = 0
 local expectedItemID: string? = nil
 local running: boolean = false
 
+-- Prefer concrete tool/mode id (e.g., "DirtRoad") over abstract item ("Road")
 local function _expectedFromStep(step: Step?): string?
 	if not step then return nil end
-	local v = step.item or step.mode
+	local v = step.mode or step.item
 	if v == nil then return nil end
 	return tostring(v)
 end
@@ -136,17 +137,27 @@ local function _advanceInternal()
 	end
 end
 
-function OnboardingFlow.StartSequence(steps: {Step})
+-- Start (or resume) a sequence. If resumeAt is provided (1-based),
+-- we seed the internal index so the next advance lands on resumeAt.
+function OnboardingFlow.StartSequence(steps: {Step}, resumeAt: number?)
 	if typeof(steps) ~= "table" then
 		obf("StartSequence called with invalid steps (%s) -> ignoring", typeof(steps))
 		return
 	end
 
 	stepList = steps
-	stepIdx  = 0
+
+	-- Seed to the last-completed index so _advanceInternal() lands on resumeAt.
+	local seedIdx = 0
+	if typeof(resumeAt) == "number" then
+		local n = math.clamp(math.floor(resumeAt), 1, #stepList)
+		seedIdx = n - 1
+	end
+	stepIdx  = seedIdx
 	running  = (#stepList > 0)
 
-	obf("StartSequence len=%d -> running=%s", #stepList, fmtBool(running))
+	obf("StartSequence len=%d resumeAt=%s -> running=%s (seed idx=%d)",
+		#stepList, tostring(resumeAt), fmtBool(running), stepIdx)
 
 	if running then
 		_advanceInternal()
@@ -184,7 +195,8 @@ end
 BE_GridGuardFB.Event:Connect(function(tag: string, info: any?)
 	local infoItem = nil
 	if info and typeof(info) == "table" then
-		infoItem = tostring(info.item or info.mode or "")
+		-- Prefer concrete tool id reported by GV
+		infoItem = tostring(info.mode or info.item or "")
 	end
 
 	obf("GuardFB tag=%s running=%s idx=%d len=%d infoItem=%s expected=%s",

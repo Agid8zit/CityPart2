@@ -319,7 +319,8 @@ local function getFlowItem()
 	end
 	if OnboardingFlow and type(OnboardingFlow.GetState)=="function" then
 		local st = OnboardingFlow.GetState()
-		return st and st.current and canonItem(st.current.item or st.current.mode) or nil
+		-- Prefer mode (concrete tool id) over abstract item
+		return st and st.current and canonItem(st.current.mode or st.current.item) or nil
 	end
 	return nil
 end
@@ -873,10 +874,66 @@ BE_GuardFB.Event:Connect(function(tag, info)
 		return
 	end
 
+	-- Detect if the flow module is running (Barrage‑1 canonical progression)
+	local flowRunning = false
+	do
+		local F = OnboardingFlow
+		if not F then
+			local ok, mod = pcall(function() return require(ReplicatedStorage.Scripts.Onboarding.OnboardingFlow) end)
+			if ok then F = mod; OnboardingFlow = mod end
+		end
+		if F and type(F.GetState)=="function" then
+			local st = F.GetState()
+			flowRunning = (st and st.running) == true
+		end
+	end
+
 	-- =========================================================
-	-- DONE  → advance (unchanged logic, with minor safety)
+	-- DONE  → advance
 	-- =========================================================
 	if tag == "done" then
+		if flowRunning then
+			-- Flow owns persistence & advancing; controller provides UI only.
+			local F  = OnboardingFlow
+			local st = F and F.GetState and F.GetState() or nil
+			local justDone = math.max(((st and st.index) or 1) - 1, 1)
+
+			-- Sequence-specific "done" toast
+			if activeSeq == "barrage1" then
+				local doneKey = OB1_STEP_DONE_KEYS[justDone]
+				if doneKey then showOB1(doneKey, DUR.DONE) end
+			elseif activeSeq == "barrage3" then
+				showB3(LANG.OB3_Industrial_Done, DUR.DONE)
+			end
+
+			-- Stop any pulse for the reported (or expected) item
+			local id = fbItem or (st and st.expected and canonItem(st.expected)) or expected
+			if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
+
+			-- Refresh UI routing/pulses
+			clearBuildMenuPulsesExcept(nil)
+			local bm = buildMenu()
+			if bm and bm.Enabled then
+				arrowAndGateToCurrentStep()
+			else
+				requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+				showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
+			end
+
+			-- Next step hint (or sequence complete)
+			if st and st.running and st.current and activeSeq == "barrage1" then
+				local nextIdx = math.min(st.index, #OB1_STEP_HINT_KEYS)
+				local hintKey = OB1_STEP_HINT_KEYS[nextIdx]
+				if hintKey then showOB1(hintKey, DUR.HINT) end
+				local nextId = canonItem(st.current.mode or st.current.item)
+				if nextId then showRoutingHintsForItemId(nextId) end
+			elseif activeSeq == "barrage1" then
+				showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
+			end
+			return
+		end
+
+		-- ===== Legacy / local guard driver path (B3 or pre‑Flow) =====
 		local justDone = math.max(guardIdx, 1)
 
 		-- Sequence-specific "done" toast
@@ -936,9 +993,20 @@ BE_GuardFB.Event:Connect(function(tag, info)
 		end
 
 		-- =========================================================
-		-- CANCELED → re‑guard the current step (do NOT kill loop)
+		-- CANCELED → re‑guard the current step
 		-- =========================================================
 	elseif tag == "canceled" then
+		if flowRunning then
+			-- Flow will re-issue guard; we just tidy UI.
+			if fbItem then
+				Stop(fbItem)
+				if guardPulseItem == fbItem then guardPulseItem = nil end
+			end
+			local bm = buildMenu()
+			if bm and bm.Enabled then arrowAndGateToCurrentStep() end
+			return
+		end
+
 		-- Stop any pulse for what was attempted
 		if fbItem then
 			Stop(fbItem)
@@ -965,9 +1033,21 @@ BE_GuardFB.Event:Connect(function(tag, info)
 		end
 
 		-- =========================================================
-		-- CLEARED → gentle re‑guard (mirror OnboardingFlow behavior)
+		-- CLEARED → gentle re‑guard
 		-- =========================================================
 	elseif tag == "cleared" then
+		if flowRunning then
+			-- Mirror Flow behavior gently: pulse the expected tool again.
+			local F = OnboardingFlow
+			local st = F and F.GetState and F.GetState() or nil
+			if fbItem then Stop(fbItem) end
+			if st and st.current then
+				local want = canonItem(st.current.mode or st.current.item)
+				if want then Pulse(want); guardPulseItem = want end
+			end
+			return
+		end
+
 		-- Don’t mutate indices here; just re-issue the current guard.
 		local cur = guardSeq[math.max(guardIdx, 1)]
 		if cur then
@@ -1075,7 +1155,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	if stepName == "BuildMenu_GateOnly_Current" then arrowAndGateToCurrentStep(); return end
 	if stepName == "BuildMenu_GateClear"        then clearArrowAndGate(); return end
 
-	-- Honor resumeAt from the server so we don't restart from step 1
+	-- Barrage 1 (Flow-driven; resume supported)
 	if stepName == "Onboarding_StartBarrage1" then
 		if guardPulseItem  then Stop(guardPulseItem);  guardPulseItem  = nil end
 		if serverPulseItem then Stop(serverPulseItem); serverPulseItem = nil end
@@ -1095,8 +1175,30 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 			}
 		end
 		local resumeAt = (typeof(payload)=="table" and tonumber(payload.resumeAt)) or 1
-		GuardStart(barrage1(), resumeAt)
-		local cur = guardSeq[guardIdx]; if cur then Pulse(canonItem(cur.mode or cur.item)) end
+
+		-- Flow is the canonical source of truth for Barrage‑1 (enables BF_CheckItemAllowed gating).
+		local Flow = OnboardingFlow or (function()
+			local ok, mod = pcall(function()
+				return require(ReplicatedStorage.Scripts.Onboarding.OnboardingFlow)
+			end)
+			if ok then OnboardingFlow = mod end
+			return OnboardingFlow
+		end)()
+
+		-- Disable local guard driver for B1; let Flow own BE_GridGuard emissions & persistence.
+		guardSeq, guardIdx = {}, 0
+		if Flow and type(Flow.StartSequence)=="function" then
+			pcall(function() Flow.StartSequence(barrage1(), resumeAt) end)
+		end
+
+		-- Begin banner only on a true start (not resume)
+		if resumeAt <= 1 then showOB1(LANG.OB1_BEGIN, DUR.BEGIN) end
+
+		-- Pulse & route to the current expected tool.
+		local st = (Flow and type(Flow.GetState)=="function") and Flow.GetState() or nil
+		local cur = st and st.current
+		if cur then Pulse(canonItem(cur.mode or cur.item)) end
+		arrowAndGateToCurrentStep()
 		return
 	end
 
