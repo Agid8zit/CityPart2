@@ -392,6 +392,11 @@ end
 local PULSE_GREEN = Color3.fromRGB(0,255,140)
 local pulseByKey, wantPulse, arrowOffset = {}, {}, {}
 local BM_LocalArrow = { gui=nil, ownerKey=nil, conn=nil, token=0 }
+local ARROW_VERTICAL_OFFSET = 50
+local ARROW_VERTICAL_OFFSET   = 50      -- px baseline above target
+local ARROW_BOUNCE_AMPLITUDE  = 6       -- px max bob
+local ARROW_BOUNCE_SPEED_HZ   = 0.9     -- cycles per second
+local ARROW_FOLLOW_LERP_SPEED = 12      -- 1/s: higher = snappier follow
 
 local function ensureStroke(gui)
 	local stroke = gui:FindFirstChild("_OBStroke")
@@ -427,20 +432,42 @@ local function attachLocalBMArrowFor(targetGui: GuiObject, key: string)
 	local bm = PlayerGui:FindFirstChild("BuildMenu")
 	local obArrow = bm and bm:FindFirstChild("OnboardingArrow", true)
 	if not (obArrow and obArrow:IsA("GuiObject")) then return end
+
+	-- Disconnect any prior tracker
 	if BM_LocalArrow.conn then BM_LocalArrow.conn:Disconnect() end
+
 	BM_LocalArrow.token += 1
 	BM_LocalArrow.ownerKey = key
-	BM_LocalArrow.gui = obArrow
+	BM_LocalArrow.gui      = obArrow
+	BM_LocalArrow.phase    = 0
+	BM_LocalArrow.prevPos  = nil
+
 	obArrow.Visible = true
 	obArrow.Rotation = 180
 	pcall(function() obArrow.AnchorPoint = Vector2.new(0.5, 1) end)
 	obArrow.ZIndex = math.max((targetGui.ZIndex or 1) + 10, obArrow.ZIndex or 1)
+
 	local my = BM_LocalArrow.token
-	BM_LocalArrow.conn = RunService.RenderStepped:Connect(function()
+	BM_LocalArrow.conn = RunService.RenderStepped:Connect(function(dt)
+		-- Bail if superseded
 		if BM_LocalArrow.token ~= my then return end
 		if not (obArrow.Parent and targetGui.Parent) then return end
+
+		-- Compute target screen point (center bottom of target + baseline offset)
 		local pos, size = targetGui.AbsolutePosition, targetGui.AbsoluteSize
-		obArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y - 2)
+		local targetPos = Vector2.new(pos.X + size.X * 0.5, pos.Y + ARROW_VERTICAL_OFFSET)
+
+		-- Smooth follow (exponential/low-pass). Clamp lerp alpha to [0,1].
+		local alpha = math.clamp(dt * ARROW_FOLLOW_LERP_SPEED, 0, 1)
+		local smoothPos = BM_LocalArrow.prevPos and BM_LocalArrow.prevPos:Lerp(targetPos, alpha) or targetPos
+		BM_LocalArrow.prevPos = smoothPos
+
+		-- Smooth bob: cosine easing (ease-in/out both directions, no hard turn at peaks)
+		BM_LocalArrow.phase += dt * (ARROW_BOUNCE_SPEED_HZ * 2 * math.pi)
+		local bob = (1 - math.cos(BM_LocalArrow.phase)) * 0.5 * ARROW_BOUNCE_AMPLITUDE
+
+		-- Apply
+		obArrow.Position = UDim2.fromOffset(smoothPos.X, smoothPos.Y + bob)
 	end)
 end
 
@@ -690,8 +717,8 @@ end
 local hubWatchToken = 0
 
 local function arrowAndGateToCurrentStep()
-	-- Prefer the explicit gate (B2/B3), else Barrage‑1 guard/flow.
-	local id = currentGateId or guardCurrentItem() or getFlowItem()
+	-- Prefer guard/flow hints when present; fall back to explicit server gates (B2/B3).
+	local id = guardCurrentItem() or getFlowItem() or currentGateId
 	if not id then return end
 
 	applyGate(id)
@@ -702,10 +729,39 @@ local function arrowAndGateToCurrentStep()
 		return
 	end
 
+	local bm = buildMenu()
+	if not (bm and bm.Enabled) then
+		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+		clearBuildMenuPulsesExcept(nil)
+		return
+	end
+
 	local wantMajor = majorForItem(id)
 	local wantHub   = hubForItem(id)
 	local curMajor  = getCurrentMajor()
 	local curHub    = getCurrentHub(curMajor)
+
+	-- When the menu is up, auto-route to the expected major/hub so the target button is visible.
+	do
+		local mod = getBMLogic()
+		if mod and type(mod.SetTab) == "function" then
+			if wantMajor and curMajor ~= wantMajor then
+				pcall(mod.SetTab, wantMajor)
+				curMajor = getCurrentMajor()
+				curHub   = getCurrentHub(curMajor)
+			end
+			if wantHub and curHub ~= wantHub then
+				pcall(mod.SetTab, wantHub)
+				curMajor = getCurrentMajor()
+				curHub   = getCurrentHub(curMajor)
+			end
+		end
+	end
+
+	-- Fallback: if the BuildMenu doesn't expose helpers for the current tab/hub,
+	-- assume our programmatic SetTab calls succeeded so we can still highlight the target button.
+	if wantMajor and curMajor == nil then curMajor = wantMajor end
+	if wantHub and curHub == nil then curHub = wantHub end
 
 	local targetKey
 	if not wantMajor or curMajor ~= wantMajor then
@@ -778,7 +834,7 @@ task.defer(function()
 		if not _G.OB_ENABLED then HideArrow(); return end
 		if bm.Enabled then
 			bmOpenHintShown = false
-			local id = currentGateId or guardCurrentItem() or getFlowItem()
+			local id = guardCurrentItem() or getFlowItem() or currentGateId
 			if not id then id = "DirtRoad" end
 			applyGate(id)
 			if _G.OB_CurrentTool == id then
@@ -790,9 +846,11 @@ task.defer(function()
 			local curMajor, curHub = getCurrentMajor(), getCurrentHub(getCurrentMajor())
 			local key
 			if wantMajor and (curMajor ~= wantMajor) then
+				if curMajor == nil then curMajor = wantMajor end
 				key = MAJOR_TO_KEY[wantMajor] or "BM_Transport"
 				requestPulseAndArrow(key, UDim2.new(0,0,-0.12,0))
 			else
+				if wantHub and curHub == nil then curHub = wantHub end
 				if wantHub and curHub ~= wantHub then
 					key = resolveHubKey(wantMajor or "Supply", wantHub)
 					requestPulseAndArrow(key or "BM_Supply", UDim2.new(0,0,-0.12,0))
@@ -804,7 +862,7 @@ task.defer(function()
 			clearBuildMenuPulsesExcept(key)
 		else
 			if _G.OB_ENABLED then
-				local id = currentGateId or guardCurrentItem() or getFlowItem()
+				local id = guardCurrentItem() or getFlowItem() or currentGateId
 				applyGate(id)
 				requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
 				if not bmOpenHintShown then
@@ -856,6 +914,17 @@ RE_Toggle.OnClientEvent:Connect(applyToggle)
 ------------------------
 -- Guard FB → advance --
 ------------------------
+do
+	if not OnboardingFlow then
+		local ok, mod = pcall(function()
+			return require(ReplicatedStorage.Scripts.Onboarding.OnboardingFlow)
+		end)
+		if ok and type(mod) == "table" then
+			OnboardingFlow = mod
+		end
+	end
+end
+
 BE_GuardFB.Event:Connect(function(tag, info)
 	if not _G.OB_ENABLED then return end
 
@@ -893,43 +962,47 @@ BE_GuardFB.Event:Connect(function(tag, info)
 	-- =========================================================
 	if tag == "done" then
 		if flowRunning then
-			-- Flow owns persistence & advancing; controller provides UI only.
-			local F  = OnboardingFlow
-			local st = F and F.GetState and F.GetState() or nil
-			local justDone = math.max(((st and st.index) or 1) - 1, 1)
+			local reportedItem = fbItem
+			local prevExpected = expected
+			task.defer(function()
+				local F = OnboardingFlow
+				if not (F and type(F.GetState)=="function") then return end
+				local st = F.GetState()
+				local justDone = math.max(((st and st.index) or 1) - 1, 1)
 
-			-- Sequence-specific "done" toast
-			if activeSeq == "barrage1" then
-				local doneKey = OB1_STEP_DONE_KEYS[justDone]
-				if doneKey then showOB1(doneKey, DUR.DONE) end
-			elseif activeSeq == "barrage3" then
-				showB3(LANG.OB3_Industrial_Done, DUR.DONE)
-			end
+				-- Sequence-specific "done" toast
+				if activeSeq == "barrage1" then
+					local doneKey = OB1_STEP_DONE_KEYS[justDone]
+					if doneKey then showOB1(doneKey, DUR.DONE) end
+				elseif activeSeq == "barrage3" then
+					showB3(LANG.OB3_Industrial_Done, DUR.DONE)
+				end
 
-			-- Stop any pulse for the reported (or expected) item
-			local id = fbItem or (st and st.expected and canonItem(st.expected)) or expected
-			if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
+				-- Stop any pulse for the reported (or expected) item
+				local id = reportedItem or (st and st.expected and canonItem(st.expected)) or prevExpected
+				if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
 
-			-- Refresh UI routing/pulses
-			clearBuildMenuPulsesExcept(nil)
-			local bm = buildMenu()
-			if bm and bm.Enabled then
-				arrowAndGateToCurrentStep()
-			else
-				requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-				showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-			end
+				-- Refresh UI routing/pulses
+				clearBuildMenuPulsesExcept(nil)
+				local bm = buildMenu()
+				if bm and bm.Enabled then
+					arrowAndGateToCurrentStep()
+				else
+					requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+					showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
+				end
 
-			-- Next step hint (or sequence complete)
-			if st and st.running and st.current and activeSeq == "barrage1" then
-				local nextIdx = math.min(st.index, #OB1_STEP_HINT_KEYS)
-				local hintKey = OB1_STEP_HINT_KEYS[nextIdx]
-				if hintKey then showOB1(hintKey, DUR.HINT) end
-				local nextId = canonItem(st.current.mode or st.current.item)
-				if nextId then showRoutingHintsForItemId(nextId) end
-			elseif activeSeq == "barrage1" then
-				showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
-			end
+				-- Next step hint (or sequence complete)
+				if st and st.running and st.current and activeSeq == "barrage1" then
+					local nextIdx = math.min(st.index, #OB1_STEP_HINT_KEYS)
+					local hintKey = OB1_STEP_HINT_KEYS[nextIdx]
+					if hintKey then showOB1(hintKey, DUR.HINT) end
+					local nextId = canonItem(st.current.mode or st.current.item)
+					if nextId then showRoutingHintsForItemId(nextId) end
+				elseif activeSeq == "barrage1" then
+					showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
+				end
+			end)
 			return
 		end
 
@@ -1093,15 +1166,38 @@ end)
 local function bmGateOnly(id, offset)
 	applyGate(id)
 	local bm = buildMenu()
-	if not (bm and bm.Enabled) then return end
+	if not (bm and bm.Enabled) then
+		arrowAndGateToCurrentStep()
+		return
+	end
+
+	local wantMajor, wantHub = majorForItem(id), hubForItem(id)
+	local curMajor = getCurrentMajor()
+	local curHub   = getCurrentHub(curMajor)
+	local mod = getBMLogic()
+	if mod and type(mod.SetTab) == "function" then
+		if wantMajor and curMajor ~= wantMajor then
+			pcall(mod.SetTab, wantMajor)
+			curMajor = getCurrentMajor()
+			curHub   = getCurrentHub(curMajor)
+		end
+		if wantHub and curHub ~= wantHub then
+			pcall(mod.SetTab, wantHub)
+			curMajor = getCurrentMajor()
+			curHub   = getCurrentHub(curMajor)
+		end
+	end
+
+	-- Assume success if the menu can't report its state back.
+	if wantMajor and curMajor == nil then curMajor = wantMajor end
+	if wantHub and curHub == nil then curHub = wantHub end
+
 	if _G.OB_CurrentTool == id then
 		clearBuildMenuPulsesExcept(nil)
 		HideArrow()
 		return
 	end
-	local wantMajor, wantHub = majorForItem(id), hubForItem(id)
-	local curMajor = getCurrentMajor()
-	local curHub   = getCurrentHub(curMajor)
+
 	local key
 	if wantMajor and (curMajor ~= wantMajor) then
 		key = MAJOR_TO_KEY[wantMajor] or "BM_Transport"
@@ -1277,6 +1373,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		end
 		GuardStart(barrage3(), 1)
 		local cur = guardSeq[guardIdx]; if cur then Pulse(canonItem(cur.mode or cur.item)) end
+		arrowAndGateToCurrentStep()
 		return
 	end
 

@@ -49,6 +49,9 @@ local CachedLevel = 0
 local CachedBalance = 0               -- [ADDED] numeric balance cache
 
 local OBArrow = UI.OnboardingArrow
+local ARROW_VERTICAL_OFFSET = -5
+local ARROW_BOUNCE_AMPLITUDE = 4
+local ARROW_BOUNCE_SPEED = 2
 
 local BE_TabChanged   = BE:WaitForChild("OBBuildMenuTabChanged")       -- :Fire("major", "Zones" | "Transport" | "Supply" | "Services")
 local BF_GetMajorTab  = BF:WaitForChild("OBBuildMenuGetMajorTab")      -- :Invoke() -> string?
@@ -173,7 +176,8 @@ local function _startPulseFor(gui: GuiObject?, key: string)
 
 			local pos = gui.AbsolutePosition
 			local size = gui.AbsoluteSize
-			OBArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y - 2)
+			local bounce = math.sin(os.clock() * ARROW_BOUNCE_SPEED) * ARROW_BOUNCE_AMPLITUDE
+			OBArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y + ARROW_VERTICAL_OFFSET + bounce)
 		end)
 	end
 
