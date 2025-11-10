@@ -914,6 +914,22 @@ function MainGui.Init()
 	--SideButtonVFX(UI_CoopButton, UI_CoopButton.ImageButton.Size)
 
 	-- Button Interaction
+	UI_ChartsButton.MouseButton1Down:Connect(function()
+		SoundController.PlaySoundOnce("UI", "SmallClick")
+		local Demands = PlayerGui.Demands
+		Demands.Enabled = not Demands.Enabled
+		if Demands.Enabled then
+			local ok = pcall(function()
+				SoundController.PlaySoundOnce("Misc", "Woosh1")
+			end)
+			if not ok then
+				local mainMenu = UI:FindFirstChild("MainMenu")
+				local s = mainMenu and mainMenu:FindFirstChild("Woosh1")
+				if s and s:IsA("Sound") then s:Play() end
+			end
+		end
+	end)
+	
 	UI_Top_HappinessButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		local Demands = PlayerGui.Demands
@@ -1171,22 +1187,6 @@ function MainGui.Init()
 		UI_BoomboxEditButton.Visible = LocalPlayer:GetAttribute("EquippedBoombox")
 		if not UI_BoomboxEditButton.Visible then
 			require(PlayerGui.BoomboxSelection.Logic).OnHide()
-		end
-	end)
-
-	UI_Top_HappinessButton.MouseButton1Down:Connect(function()
-		SoundController.PlaySoundOnce("UI", "SmallClick")
-		local Demands = PlayerGui.Demands
-		Demands.Enabled = not Demands.Enabled
-		if Demands.Enabled then
-			local ok = pcall(function()
-				SoundController.PlaySoundOnce("Misc", "Woosh1")
-			end)
-			if not ok then
-				local mainMenu = UI:FindFirstChild("MainMenu")
-				local s = mainMenu and mainMenu:FindFirstChild("Woosh1")
-				if s and s:IsA("Sound") then s:Play() end
-			end
 		end
 	end)
 	

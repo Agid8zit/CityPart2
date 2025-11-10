@@ -1,11 +1,12 @@
 -- ServerScriptService/Players/OnboardingServerBridge.server.lua
--- Unified pulse + flow kick: arrow -> pulse "DirtRoad" -> start barrage1 after selection.
--- Idempotent and toggle-aware. Uses per-player enable based on account-wide onboarding state.
 
 -- Services
 local ReplicatedStorage    = game:GetService("ReplicatedStorage")
 local Players              = game:GetService("Players")
 local ServerScriptService  = game:GetService("ServerScriptService")
+local RunService           = game:GetService("RunService")
+
+-- Modules
 local ZoneReq     = require(ServerScriptService.Build.Zones.ZoneManager.ZoneRequirementsCheck)
 local ZoneTracker = require(ServerScriptService.Build.Zones.ZoneManager.ZoneTracker)
 
@@ -14,15 +15,18 @@ local RE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents")
 local RF = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteFunctions")
 local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
 
-local StepCompleted = RE:WaitForChild("OnboardingStepCompleted")   -- client -> server
-local StateChanged  = RE:WaitForChild("OnboardingStateChanged")    -- server -> client
-local ToggleRE      = RE:WaitForChild("OnboardingToggle")          -- server -> client
+local StepCompleted   = RE:WaitForChild("OnboardingStepCompleted")   -- client -> server
+local StateChanged    = RE:WaitForChild("OnboardingStateChanged")     -- server -> client
+local ToggleRE        = RE:WaitForChild("OnboardingToggle")           -- server -> client
 local OnboardingAdmin = RF:FindFirstChild("OnboardingAdmin")
 local BE_StatsChanged = BE:FindFirstChild("StatsChanged")
 
-local RunService = game:GetService("RunService")
-local WHITELIST = {[40044289170] = true, }  -- optionally put userIds here for live test, e.g. [12345678] = true
+-- >>> ADD: listen for SaveManager-driven world reloads (SaveEndpoints fires this)
+local ReloadFromCurrentBE = BE:FindFirstChild("RequestReloadFromCurrent")
 
+local WHITELIST = {
+	[40044289170] = true, -- optionally put userIds here for live test, e.g. [12345678] = true
+}
 
 -- Service (server-side, account-wide state + badges)
 local OnboardingService = require(ServerScriptService.Players.OnboardingService)
@@ -59,7 +63,7 @@ local B2_GLOBAL_HINT_COOLDOWN  = 5.0
 local B2_HINT_COOLDOWN         = 6.0
 
 -- --------------------------------------------------------------------------------------
--- Barrage 3 (Industrial zone then connect it) — NEW
+-- Barrage 3 (Industrial zone then connect it)
 -- --------------------------------------------------------------------------------------
 -- State
 local barrage3Started   : {[number]: "placing"|"connect"|nil} = {}
@@ -74,6 +78,17 @@ local b3LastHintKey     : {[number]: string} = {}
 -- Tunables (B3)
 local B3_PRINT_HEARTBEAT = 5.0
 local B3_HINT_COOLDOWN   = 6.0
+
+-- --------------------------------------------------------------------------------------
+-- Barrage 1 idempotency / debounce + tunables
+-- --------------------------------------------------------------------------------------
+local b1LastKickIdx     : {[number]: number} = {}
+local b1KickCooldownAt  : {[number]: number} = {}
+local B1_KICK_DEBOUNCE  = 1.0  -- seconds; prevents rapid re-kicks while UI registers targets
+
+-- New tunables to control automatic starts
+local B1_AUTOSTART_ON_JOIN       = false  -- keep false to avoid auto-routing without a click
+local B1_AUTOSTART_ON_FIRST_OPEN = false  -- reserved for client parity; not used here by default
 
 -- --------------------------------------------------------------------------------------
 -- Helpers
@@ -108,11 +123,14 @@ local function setOnboardingEnabled(player: Player, enabled: boolean)
 		barrage1Completed[uid] = nil
 		_clearB2Caches(uid)
 
-		-- B3 cleanup (NEW)
+		-- B3 cleanup
 		if barrage3Conn[uid] then barrage3Conn[uid]:Disconnect(); barrage3Conn[uid] = nil end
 		barrage3Started[uid] = nil
 		b3ZoneId[uid], b3KnownZones[uid] = nil, nil
 		b3EvalQueued[uid], b3LastPrintAt[uid], b3LastHintAt[uid], b3LastHintKey[uid] = nil, nil, nil, nil
+
+		-- B1 debounce cleanup
+		b1LastKickIdx[uid], b1KickCooldownAt[uid] = nil, nil
 	end
 end
 
@@ -129,8 +147,17 @@ local function stopPulseItem(p: Player, name: string)
 	if lastPulsed[p.UserId] == name then lastPulsed[p.UserId] = nil end
 end
 
+-- Stamp kick idx + cooldown
 local function startBarrage1(p: Player, resumeAt: number?)
-	barrageStarted[p.UserId] = true
+	local uid = p.UserId
+	barrageStarted[uid] = true
+	if type(resumeAt) == "number" then
+		b1LastKickIdx[uid] = resumeAt
+	else
+		b1LastKickIdx[uid] = 1
+	end
+	b1KickCooldownAt[uid] = os.clock()
+
 	if type(resumeAt) == "number" then
 		StateChanged:FireClient(p, "Onboarding_StartBarrage1", { resumeAt = resumeAt })
 	else
@@ -138,7 +165,7 @@ local function startBarrage1(p: Player, resumeAt: number?)
 	end
 end
 
--- Race-safe re‑emitter: only restarts from scratch if nothing is running and no snapshot exists.
+-- Race-safe re-emitter: prevent restarts while already running / recently kicked
 local function ensureBarrage1Running(p: Player)
 	local uid = p.UserId
 	local idx, total
@@ -147,20 +174,42 @@ local function ensureBarrage1Running(p: Player)
 			idx, total = OnboardingService.GetGuardProgress(p, "barrage1")
 		end
 	end)
+
+	-- With snapshot: compute the step we need to resume at
 	if type(idx) == "number" and idx >= 0 then
+		local desired = idx + 1
+
+		-- Already kicked this (or a later) step? Just refresh the current gate.
+		if barrageStarted[uid] and (b1LastKickIdx[uid] or 0) >= desired then
+			StateChanged:FireClient(p, "BuildMenu_GateOnly_Current")
+			return
+		end
+		-- Debounce rapid re-kicks
+		if (os.clock() - (b1KickCooldownAt[uid] or 0)) < B1_KICK_DEBOUNCE then
+			StateChanged:FireClient(p, "BuildMenu_GateOnly_Current")
+			return
+		end
+
 		if not total or idx < total then
-			startBarrage1(p, idx + 1)
+			startBarrage1(p, desired)
+		else
+			-- Completed snapshot; don't restart, just show the current gate.
+			StateChanged:FireClient(p, "BuildMenu_GateOnly_Current")
 		end
 		return
 	end
+
+	-- No snapshot: if already running, only show current gate.
 	if barrageStarted[uid] then
 		StateChanged:FireClient(p, "BuildMenu_GateOnly_Current")
 		return
 	end
+
+	-- Fresh start
 	startBarrage1(p)
 end
 
--- ===== Barrage 2 helpers (unchanged logic) =====
+-- ===== Barrage 2 helpers =====
 local function _uid(p: Player?) return p and p.UserId end
 local function _count(t) local n=0; for _ in pairs(t or {}) do n+=1 end; return n end
 
@@ -261,7 +310,7 @@ local function maybePushB2Hint(p: Player, tag: string, payload: table?)
 end
 
 -- --------------------------------------------------------------------------------------
--- Barrage 3 helpers (NEW)
+-- Barrage 3 helpers
 -- --------------------------------------------------------------------------------------
 local function _snapshotZones(p: Player): {[string]: boolean}
 	local zones = ZoneTracker.getAllZones(p) or {}
@@ -323,7 +372,6 @@ local function _roadAdjacencyHeuristic(p: Player, z): ("none"|"adjacent_isolated
 	return "none"
 end
 
-
 local function startBarrage3(p: Player)
 	local uid = p.UserId
 	if barrage3Started[uid] then return end
@@ -372,9 +420,8 @@ local function checkBarrage2(p: Player): boolean
 		barrage2Started[uid] = nil
 		_clearB2Caches(uid)
 
-		-- ▶ Begin Barrage 3 after B2 completes (NEW)
+		-- ▶ Begin Barrage 3 after B2 completes
 		task.defer(function()
-			-- Only start if onboarding still active
 			if onboardingActive(p) then
 				startBarrage3(p)
 			end
@@ -457,7 +504,7 @@ local function startBarrage2(p: Player)
 end
 
 -- --------------------------------------------------------------------------------------
--- Barrage 3 main (NEW)
+-- Barrage 3 main
 -- --------------------------------------------------------------------------------------
 local function checkBarrage3(p: Player, rectFrom, rectTo): boolean
 	local uid, now = p.UserId, os.clock()
@@ -574,19 +621,35 @@ local function _beginBarrage3Connectivity(p: Player, rectFrom, rectTo)
 end
 
 -- --------------------------------------------------------------------------------------
--- Lifecycle
+-- Reseed onboarding after SaveManager reload (slot switch/delete)
 -- --------------------------------------------------------------------------------------
-Players.PlayerAdded:Connect(function(plr: Player)
-	if not plr:GetAttribute("_PlayerDataLoaded") then
-		plr:GetAttributeChangedSignal("_PlayerDataLoaded"):Wait()
+local function _reseedOnboardingFor(plr: Player)
+	if not plr or not plr.Parent then return end
+
+	-- Ensure account-wide onboarding state exists
+	pcall(function()
+		OnboardingService.StartIfNeeded(plr)
+	end)
+
+	-- Decide enabled vs completed/skipped
+	local completed, skipped = false, false
+	pcall(function()
+		completed = OnboardingService.IsCompleted and OnboardingService.IsCompleted(plr) or false
+		skipped   = OnboardingService.IsSkipped   and OnboardingService.IsSkipped(plr)   or false
+	end)
+
+	-- Disable onboarding entirely if either Completed or Skipped
+	setOnboardingEnabled(plr, not (completed or skipped))
+
+	if not onboardingActive(plr) then
+		-- Completed or Skipped → ensure client UI is clean
+		StateChanged:FireClient(plr, "BuildMenu_GateClear")
+		StateChanged:FireClient(plr, "UIPulse_Stop", { key = "BM_DirtRoad" })
+		StateChanged:FireClient(plr, "HideArrow")
+		return
 	end
-	pcall(function() OnboardingService.StartIfNeeded(plr) end)
 
-	local completed = false
-	local ok, res = pcall(function() return OnboardingService.IsCompleted and OnboardingService.IsCompleted(plr) end)
-	if ok and res == true then completed = true end
-	setOnboardingEnabled(plr, not completed)
-
+	-- If enabled, resume where appropriate
 	local resumeAt: number? = nil
 	pcall(function()
 		if OnboardingService.GetGuardProgress then
@@ -601,34 +664,43 @@ Players.PlayerAdded:Connect(function(plr: Player)
 		end
 	end)
 
-	if onboardingActive(plr) then
-		if barrage1Completed[plr.UserId] then
-			print("[OB_B2] B1 previously complete → starting B2")
-			hideArrow(plr)
-			roadPending[plr.UserId] = false
-			if not barrage2Started[plr.UserId] then startBarrage2(plr) end
-		elseif resumeAt then
-			print("[OB] Resuming Barrage 1 at step", resumeAt)
-			hideArrow(plr)
-			roadPending[plr.UserId] = false
-			startBarrage1(plr, resumeAt)
-			task.delay(2.0, function()
-				if plr.Parent and onboardingActive(plr) and not barrage2Started[plr.UserId] then
-					print("[OB] Re-emitting Barrage 1 start after delay (safety)")
-					ensureBarrage1Running(plr)
-				end
-			end)
-		else
-			-- ENHANCED: On a truly fresh join, start Barrage 1 (idempotent) instead of nudge-only
-			print("[OB] Fresh join → START Barrage 1 + nudge Build")
-			showBuildArrow(plr)
+	if barrage1Completed[plr.UserId] then
+		print("[OB_B2] Reseed: B1 previously complete → starting B2")
+		hideArrow(plr)
+		roadPending[plr.UserId] = false
+		if not barrage2Started[plr.UserId] then
+			startBarrage2(plr)
+		end
+	elseif resumeAt then
+		print("[OB] Reseed: Resuming Barrage 1 at step", resumeAt)
+		hideArrow(plr)
+		roadPending[plr.UserId] = false
+		startBarrage1(plr, resumeAt)
+	else
+		-- Fresh resume, no auto-start to avoid auto-routing
+		print("[OB] Reseed: nudge Build (no auto-start)")
+		showBuildArrow(plr)
+		StateChanged:FireClient(plr, "BuildMenu_GateClear")
+		if B1_AUTOSTART_ON_JOIN then
 			task.defer(function()
-				if plr.Parent and onboardingActive(plr) and not barrage2Started[plr.UserId] then
+				if plr.Parent and onboardingActive(plr)
+					and not barrage2Started[plr.UserId]
+				then
 					ensureBarrage1Running(plr)
 				end
 			end)
 		end
 	end
+end
+-- --------------------------------------------------------------------------------------
+-- Lifecycle
+-- --------------------------------------------------------------------------------------
+Players.PlayerAdded:Connect(function(plr: Player)
+	if not plr:GetAttribute("_PlayerDataLoaded") then
+		plr:GetAttributeChangedSignal("_PlayerDataLoaded"):Wait()
+	end
+	-- >>> CHANGE: unify join behavior with reload behavior
+	_reseedOnboardingFor(plr)
 end)
 
 Players.PlayerRemoving:Connect(function(plr: Player)
@@ -639,11 +711,14 @@ Players.PlayerRemoving:Connect(function(plr: Player)
 	barrage2Started[uid], barrage1Completed[uid] = nil, nil
 	_clearB2Caches(uid)
 
-	-- B3 cleanup (NEW)
+	-- B3 cleanup
 	if barrage3Conn[uid] then barrage3Conn[uid]:Disconnect(); barrage3Conn[uid] = nil end
 	barrage3Started[uid] = nil
 	b3ZoneId[uid], b3KnownZones[uid] = nil, nil
 	b3EvalQueued[uid], b3LastPrintAt[uid], b3LastHintAt[uid], b3LastHintKey[uid] = nil, nil, nil, nil
+
+	-- B1 debounce cleanup
+	b1LastKickIdx[uid], b1KickCooldownAt[uid] = nil, nil
 end)
 
 local BE_Toggle = BE:FindFirstChild("OnboardingToggle")
@@ -652,6 +727,16 @@ if BE_Toggle then
 		for _, p in ipairs(Players:GetPlayers()) do
 			setOnboardingEnabled(p, enabled ~= false)
 		end
+	end)
+end
+
+-- >>> ADD: reseed when SaveEndpoints asks the server to reload the active slot
+if ReloadFromCurrentBE and ReloadFromCurrentBE:IsA("BindableEvent") then
+	ReloadFromCurrentBE.Event:Connect(function(plr: Player)
+		-- Let SaveManager finish swapping live data before we inspect
+		task.delay(0.25, function()
+			pcall(_reseedOnboardingFor, plr)
+		end)
 	end)
 end
 
@@ -668,13 +753,12 @@ StepCompleted.OnServerEvent:Connect(function(player: Player, stepName: any, data
 		return
 	end
 
-	-- Tool picks clear gates AND safely re‑sync barrage if needed
+	-- Tool picks clear gates; if B1 is running, do NOT restart it (gate-only refresh)
 	if stepName == "WaterToolSelected" then
 		print("[OB_B2] Water tool selected by", player.Name)
 		StateChanged:FireClient(player, "BuildMenu_GateClear")
-		-- Only try to re-sync Barrage 1 if it's actually running (avoid interfering with B3)
 		if barrageStarted[player.UserId] then
-			ensureBarrage1Running(player)
+			StateChanged:FireClient(player, "BuildMenu_GateOnly_Current")
 		end
 		return
 	end
@@ -682,7 +766,7 @@ StepCompleted.OnServerEvent:Connect(function(player: Player, stepName: any, data
 		print("[OB_B2] Power tool selected by", player.Name)
 		StateChanged:FireClient(player, "BuildMenu_GateClear")
 		if barrageStarted[player.UserId] then
-			ensureBarrage1Running(player)
+			StateChanged:FireClient(player, "BuildMenu_GateOnly_Current")
 		end
 		return
 	end
@@ -693,23 +777,23 @@ StepCompleted.OnServerEvent:Connect(function(player: Player, stepName: any, data
 	end
 
 	if stepName == "BuildMenuOpened" then
-		-- If B1 is done OR B2/B3 flows are active, don't kick the road pulse again.
+		-- If we are beyond B1, never repulse/gate for DirtRoad; just clear.
 		if barrage1Completed[player.UserId] or barrage2Started[player.UserId] or barrage3Started[player.UserId] then
 			StateChanged:FireClient(player, "UIPulse_Stop", { key = "BM_DirtRoad" })
 			stopPulseItem(player, "DirtRoad")
 			StateChanged:FireClient(player, "BuildMenu_GateClear")
 			return
 		end
+
 		hideArrow(player)
 
-		-- If Barrage1 is already "started" for this player, re-sync and show current gate
+		-- If Barrage1 is already running, only refresh the current gate.
 		if barrageStarted[player.UserId] then
-			ensureBarrage1Running(player)    -- race-safe re‑sync
 			StateChanged:FireClient(player, "BuildMenu_GateOnly_Current")
 			return
 		end
 
-		-- If there is saved progress, resume it
+		-- If there is saved progress, DO NOT kick here; only gate to current.
 		local idx, total
 		local ok = pcall(function()
 			if OnboardingService.GetGuardProgress then
@@ -717,14 +801,14 @@ StepCompleted.OnServerEvent:Connect(function(player: Player, stepName: any, data
 			end
 		end)
 		if ok and type(idx) == "number" and (not total or idx < total) then
-			ensureBarrage1Running(player)
 			StateChanged:FireClient(player, "BuildMenu_GateOnly_Current")
 			return
 		end
 
-		-- ENHANCED: On truly fresh state, actually start the flow now (not just a pulse)
-		ensureBarrage1Running(player)
-		StateChanged:FireClient(player, "BuildMenu_GateOnly_Current")
+		-- Truly fresh: do not start B1 on open. Just clear (client can do passive pulse).
+		StateChanged:FireClient(player, "BuildMenu_GateClear")
+		-- If you *really* want auto-start on first open, turn on B1_AUTOSTART_ON_FIRST_OPEN and call ensure here.
+		-- (left disabled by default to prevent auto-routing on open)
 		return
 	end
 
@@ -804,48 +888,57 @@ local function _isAllowedInvoker(plr: Player)
 	return WHITELIST[plr.UserId] == true
 end
 
-OnboardingAdmin.OnServerInvoke = function(plr: Player, cmd: string, args: any)
-	if not _isAllowedInvoker(plr) then
-		return false, "Not allowed"
-	end
-	cmd = tostring(cmd or ""):lower()
+if OnboardingAdmin then
+	OnboardingAdmin.OnServerInvoke = function(plr: Player, cmd: string, args: any)
+		if not _isAllowedInvoker(plr) then
+			return false, "Not allowed"
+		end
+		cmd = tostring(cmd or ""):lower()
 
-	if cmd == "reset" or cmd == "resetonboarding" then
-		local ok, err = require(ServerScriptService.Players.OnboardingService).Reset(plr)
-		if not ok then return false, err or "Reset failed" end
+		if cmd == "reset" or cmd == "resetonboarding" then
+			local okReset, err = require(ServerScriptService.Players.OnboardingService).Reset(plr)
+			if not okReset then return false, err or "Reset failed" end
 
-		-- Clear all running flows/watchers and set onboarding ON
-		local uid = plr.UserId
+			-- Clear all running flows/watchers and set onboarding ON
+			local uid = plr.UserId
 
-		-- Kill B2 watchers
-		if barrage2Conn[uid] then barrage2Conn[uid]:Disconnect(); barrage2Conn[uid] = nil end
-		barrage2Started[uid] = nil
-		_clearB2Caches(uid)
+			-- Kill B2 watchers
+			if barrage2Conn[uid] then barrage2Conn[uid]:Disconnect(); barrage2Conn[uid] = nil end
+			barrage2Started[uid] = nil
+			_clearB2Caches(uid)
 
-		-- Kill B3 watchers
-		if barrage3Conn[uid] then barrage3Conn[uid]:Disconnect(); barrage3Conn[uid] = nil end
-		barrage3Started[uid] = nil
-		b3ZoneId[uid], b3KnownZones[uid] = nil, nil
-		b3EvalQueued[uid], b3LastPrintAt[uid], b3LastHintAt[uid], b3LastHintKey[uid] = nil, nil, nil, nil
+			-- Kill B3 watchers
+			if barrage3Conn[uid] then barrage3Conn[uid]:Disconnect(); barrage3Conn[uid] = nil end
+			barrage3Started[uid] = nil
+			b3ZoneId[uid], b3KnownZones[uid] = nil, nil
+			b3EvalQueued[uid], b3LastPrintAt[uid], b3LastHintAt[uid], b3LastHintKey[uid] = nil, nil, nil, nil
 
-		-- Clear Barrage1 locals
-		roadPending[uid], lastPulsed[uid], barrageStarted[uid] = nil, nil, nil
-		barrage1Completed[uid] = nil
+			-- Clear Barrage1 locals
+			roadPending[uid], lastPulsed[uid], barrageStarted[uid] = nil, nil, nil
+			barrage1Completed[uid] = nil
 
-		-- Re‑enable onboarding for this session and nudge the Build button
-		setOnboardingEnabled(plr, true)
-		showBuildArrow(plr)
-		StateChanged:FireClient(plr, "BuildMenu_GateClear")
+			-- B1 debounce cleanup
+			b1LastKickIdx[uid], b1KickCooldownAt[uid] = nil, nil
 
-		-- ENHANCED: after reset, actually (re)start Barrage 1 shortly after UI is up
-		task.delay(0.75, function()
-			if plr.Parent and onboardingActive(plr) then
-				ensureBarrage1Running(plr)
+			-- Re-enable onboarding for this session and nudge the Build button
+			setOnboardingEnabled(plr, true)
+			showBuildArrow(plr)
+			StateChanged:FireClient(plr, "BuildMenu_GateClear")
+
+			-- Optional: auto-start immediately after reset (off by default)
+			if B1_AUTOSTART_ON_JOIN then
+				task.delay(0.75, function()
+					if plr.Parent and onboardingActive(plr) then
+						ensureBarrage1Running(plr)
+					end
+				end)
 			end
-		end)
 
-		return true, "Onboarding reset"
+			return true, "Onboarding reset"
+		end
+
+		return false, "Unknown command"
 	end
-
-	return false, "Unknown command"
+else
+	warn("[Onboarding] OnboardingAdmin RemoteFunction not found; admin commands disabled.")
 end

@@ -1,4 +1,6 @@
-﻿local CityName = {}
+﻿-- ModuleScript: CityName
+
+local CityName = {}
 
 -- Services
 local Players           = game:GetService("Players")
@@ -45,70 +47,56 @@ local function findRF(name: string): RemoteFunction?
 	return nil
 end
 
-local RF_FilterCityName: RemoteFunction? = findRF("FilterCityName")
+local REFolder = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents")
+local StepCompleted = REFolder:WaitForChild("OnboardingStepCompleted")
+
+-- We no longer call FilterCityName while typing; we only confirm at the end.
 local RF_ConfirmCityName: RemoteFunction? = findRF("ConfirmCityName")
 local RF_SwitchToSlot: RemoteFunction?    = findRF("SwitchToSlot")
 
 -- Local state
-local storedFilteredText: string = ""
-local lastFilterToken = 0
-
-local function normalizeName(value: any): string
-	if typeof(value) ~= "string" then return "" end
-	return value:gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function setStoredName(value: any)
-	storedFilteredText = normalizeName(value)
-end
+-- RENAMED: we now store the user's *raw* local text (not filtered).
+local storedRawText: string = ""
 
 -- Helpers ------------------------------------------------------------------
+local MIN_LEN = 3
+local MAX_LEN = 32
+
 local function playClick()
 	if SoundControllerOk and SoundController and typeof(SoundController.PlaySoundOnce) == "function" then
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 	end
 end
 
-local function filterTextServer(raw: string): string
-	if raw == "" then return "" end
-	if not RF_FilterCityName then
-		warn("[CityName] RF_FilterCityName missing")
-		return ""
-	end
-	local ok, result = pcall(function()
-		return (RF_FilterCityName :: RemoteFunction):InvokeServer(raw)
-	end)
-	if ok and typeof(result) == "string" then
-		return result :: string
-	end
-	warn("[CityName] Filter invoke failed: ", result)
-	return ""
+local function normalizeName(value: any): string
+	if typeof(value) ~= "string" then return "" end
+	-- keep trimming only; the server will collapse internal whitespace during confirm
+	return value:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
-local MIN_LEN = 3
-local MAX_LEN = 32
-local function isBadName(filtered: string): boolean
-	if filtered == "" then return true end
-	local trimmed = filtered:gsub("^%s+", ""):gsub("%s+$", "")
+local function setStoredRaw(value: any)
+	storedRawText = normalizeName(value)
+end
+
+local function ulen(s: string): number
+	local ok, n = pcall(function() return utf8.len(s) end)
+	if ok and n then return n :: number end
+	return #s
+end
+
+local function isBadNameLocal(raw: string): boolean
+	local trimmed = normalizeName(raw)
+	if trimmed == "" then return true end
+	-- reject pure whitespace after collapsing visually
 	if trimmed:gsub("%s+", "") == "" then return true end
-	local n = #trimmed
+	local n = ulen(trimmed)
 	return (n < MIN_LEN) or (n > MAX_LEN)
 end
 
 local function needsPromptName(current: any): boolean
 	local trimmed = normalizeName(current)
 	if trimmed == "" then return true end
-	return (#trimmed < MIN_LEN)
-end
-
-local function debounceFilterApply()
-	lastFilterToken += 1
-	local token = lastFilterToken
-	task.delay(0.25, function()
-		if token ~= lastFilterToken then return end
-		UI_SearchBox.Text = filterTextServer(UI_SearchBox.Text or "")
-		setStoredName(UI_SearchBox.Text)
-	end)
+	return (ulen(trimmed) < MIN_LEN)
 end
 
 local function focusForController()
@@ -138,9 +126,13 @@ function CityName.OnShow(): ()
 		UI_Header:SetAttribute("LangKey", "City Name")
 	end
 	UI_SearchBox.PlaceholderText = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
-	UI_SearchBox.Text = storedFilteredText
+	UI_SearchBox.Text = storedRawText
 	pcall(function() UI_SearchBox.ClearTextOnFocus = false end)
 	focusForController()
+	-- place caret at end for convenience
+	pcall(function()
+		UI_SearchBox.CursorPosition = #UI_SearchBox.Text + 1
+	end)
 end
 
 function CityName.OnHide(): ()
@@ -181,12 +173,11 @@ function CityName.Init(): ()
 	UI_Ok.Activated:Connect(function()
 		playClick()
 
-		-- 1) filter + validate
-		local filtered = filterTextServer(UI_SearchBox.Text or "")
-		UI_SearchBox.Text = filtered
-		setStoredName(filtered)
+		-- 1) local validate only (no server filtering here)
+		local raw = normalizeName(UI_SearchBox.Text or "")
+		setStoredRaw(raw)
 
-		if isBadName(filtered) then
+		if isBadNameLocal(raw) then
 			UI_SearchBox.Text = ""
 			UI_SearchBox.PlaceholderText = ("Name must be %d-%d chars."):format(MIN_LEN, MAX_LEN)
 			return
@@ -196,7 +187,7 @@ function CityName.Init(): ()
 		local pendingAttr = UI:GetAttribute("PendingSlotId")
 		local pending: string? = (typeof(pendingAttr) == "string") and (pendingAttr :: string) or nil
 
-		print(("[CityName] OK. pending=%s, name='%s'"):format(tostring(pending), filtered))
+		print(("[CityName] OK. pending=%s, raw='%s'"):format(tostring(pending), raw))
 
 		-- 2) create/switch NOW (saves current inside SwitchToSlot). Only if NEW was pressed.
 		if pending then
@@ -216,14 +207,14 @@ function CityName.Init(): ()
 			UI:SetAttribute("PendingSlotId", nil)
 		end
 
-		-- 3) confirm the city name on the *current* slot (server validates + saves)
+		-- 3) confirm the city name on the *current* slot (server validates + saves + filters)
 		if not RF_ConfirmCityName then
 			warn("[CityName] RF_ConfirmCityName missing")
 			UI_SearchBox.PlaceholderText = "Save failed. Try again."
 			return
 		end
 		local okC, result = pcall(function()
-			return (RF_ConfirmCityName :: RemoteFunction):InvokeServer(filtered)
+			return (RF_ConfirmCityName :: RemoteFunction):InvokeServer(raw)
 		end)
 		if not okC or typeof(result) ~= "table" then
 			warn("[CityName] ConfirmCityName invoke error: ", result)
@@ -236,6 +227,10 @@ function CityName.Init(): ()
 			if resTbl.reason == "BAD_NAME" then
 				UI_SearchBox.Text = ""
 				UI_SearchBox.PlaceholderText = ("Name must be %d-%d chars."):format(MIN_LEN, MAX_LEN)
+			elseif resTbl.reason == "REJECTED_BY_FILTER" then
+				-- The raw text filtered to hashes or empty; prompt user to try another name.
+				UI_SearchBox.Text = ""
+				UI_SearchBox.PlaceholderText = "That name isn’t allowed. Try a different one."
 			else
 				UI_SearchBox.PlaceholderText = "Save failed. Try again."
 			end
@@ -243,19 +238,21 @@ function CityName.Init(): ()
 		end
 
 		print("[CityName] Name saved.")
+		StepCompleted:FireServer("CityNamed")
 		-- 4) close
 		doExit()
 	end)
 
+	-- While typing, we *only* keep the local raw string in sync (no server filtering).
 	UI_SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
 		if not UI.Enabled then return end
-		debounceFilterApply()
+		setStoredRaw(UI_SearchBox.Text or "")
 	end)
 
+	-- On focus lost, just trim locally; do not filter via server.
 	UI_SearchBox.FocusLost:Connect(function()
-		local filtered = filterTextServer(UI_SearchBox.Text or "")
-		UI_SearchBox.Text = filtered
-		setStoredName(filtered)
+		UI_SearchBox.Text = normalizeName(UI_SearchBox.Text or "")
+		setStoredRaw(UI_SearchBox.Text)
 	end)
 
 	if PlayerDataControllerOk and PlayerDataController then
@@ -268,15 +265,18 @@ function CityName.Init(): ()
 			local sf = savefiles[currentSlot]
 			if typeof(sf) ~= "table" then return end
 
+			-- Prefer saved filtered cityName if present, otherwise prompt.
 			if needsPromptName(sf.cityName) then
 				if not UI.Enabled then
-					setStoredName("")
+					setStoredRaw("")
 					UI_SearchBox.Text = ""
 					UI_SearchBox.PlaceholderText = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
 					CityName.OnShow()
 				end
 			else
-				setStoredName(sf.cityName)
+				-- Show what players previously saw (filtered). Keep raw buffer aligned.
+				UI_SearchBox.Text = tostring(sf.cityName or "")
+				setStoredRaw(UI_SearchBox.Text)
 			end
 		end
 
@@ -296,4 +296,3 @@ function CityName.Init(): ()
 end
 
 return CityName
-

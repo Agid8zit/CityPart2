@@ -2,7 +2,7 @@
 --  Init / Logging
 ----------------------------------------------------------------
 local START_TIME = os.clock()
-local Debug      = true
+local Debug      = false
 local function LOG(...)
 	if Debug then
 		print(("[SaveManager][+%.3fs] "):format(os.clock() - START_TIME), ...)
@@ -409,7 +409,7 @@ local function makeRoadRows(player: Player, prevByZone: { [string]: any }?)
 	return rows
 end
 local function dumpZones(player: Player)
-	print(("---- Loaded zones for %s (%d) ----"):format(player.Name, player.UserId))
+	--print(("---- Loaded zones for %s (%d) ----"):format(player.Name, player.UserId))
 	for zoneId, z in pairs(ZoneTracker.getAllZones(player)) do
 		local req = z.requirements
 		local reqStr = ("%s%s%s"):format(
@@ -420,10 +420,9 @@ local function dumpZones(player: Player)
 		local tiles = #z.gridList
 		local first = z.gridList[1]
 		local coordStr = first and ("(%d,%d)"):format(first.x, first.z) or "nil"
-		print(("%s  mode=%s  tiles=%d  req=%s  first=%s")
-			:format(zoneId, z.mode, tiles, reqStr, coordStr))
+		--print(("%s  mode=%s  tiles=%d  req=%s  first=%s"):format(zoneId, z.mode, tiles, reqStr, coordStr))
 	end
-	print("----------------------------------")
+	--print("----------------------------------")
 end
 
 ----------------------------------------------------------------
@@ -738,8 +737,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 			:format(nZones, nMissing, #bufferRoad, #bufferUnlock))
 	end
 
-	print(("savePlayer[%s]: zones=%d  roadBytes=%d  unlockBytes=%d")
-		:format(reason, count(ZoneTracker.getAllZones(player)), #bufferRoad, #bufferUnlock))
+	--print(("savePlayer[%s]: zones=%d  roadBytes=%d  unlockBytes=%d"):format(reason, count(ZoneTracker.getAllZones(player)), #bufferRoad, #bufferUnlock))
 
 	if isFinal and PlayerSaved then PlayerSaved:Fire(player) end
 end

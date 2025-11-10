@@ -16,6 +16,7 @@ local UtilityGUI = require(ReplicatedStorage.Scripts.UI.UtilityGUI)
 local DevProducts = require(ReplicatedStorage.Scripts.DevProducts)
 local SoundController = require(ReplicatedStorage.Scripts.Controllers.SoundController)
 local PlayerDataController = require(ReplicatedStorage.Scripts.Controllers.PlayerDataController)
+local LocalizationLoader = require(ReplicatedStorage.Localization.Localizing)
 
 local Balancing = ReplicatedStorage:WaitForChild("Balancing")
 local BalanceEconomy = require(Balancing:WaitForChild("BalanceEconomy"))
@@ -47,6 +48,68 @@ local TabSections = {} -- [TabName] = FrameContainer
 local FrameButtons = {} -- [BuildingID] = Frame
 local CachedLevel = 0
 local CachedBalance = 0               -- [ADDED] numeric balance cache
+
+local function _resolveLang(key: string?, fallback: string?)
+	if type(key) ~= "string" or key == "" then
+		return fallback
+	end
+
+	local lang: string? = nil
+	local player = LocalPlayer
+	if player then
+		local attr = player:GetAttribute("Language")
+		if type(attr) == "string" and attr ~= "" then
+			lang = attr
+		end
+	end
+
+	if not lang or lang == "" then
+		local data = PlayerDataController.GetData()
+		if type(data) == "table" then
+			local savedLang = data.Language
+			if type(savedLang) == "string" and savedLang ~= "" then
+				lang = savedLang
+			end
+		end
+	end
+
+	if not lang or lang == "" then
+		lang = "English"
+	end
+
+	if LocalizationLoader and LocalizationLoader.isValidLanguage then
+		local ok, valid = pcall(LocalizationLoader.isValidLanguage, lang)
+		if ok and not valid then
+			lang = "English"
+		end
+	end
+
+	local localized
+	if LocalizationLoader and LocalizationLoader.get then
+		local ok, value = pcall(LocalizationLoader.get, key, lang)
+		if ok and type(value) == "string" and value ~= "" then
+			localized = value
+		end
+	end
+
+	if localized then
+		return localized
+	end
+
+	if LocalizationLoader and LocalizationLoader.get then
+		local okEnglish, englishValue = pcall(LocalizationLoader.get, key, "English")
+		if okEnglish and type(englishValue) == "string" and englishValue ~= "" then
+			return englishValue
+		end
+	end
+
+	if type(fallback) == "string" and fallback ~= "" then
+		return fallback
+	end
+
+	return key
+end
+
 
 local OBArrow = UI.OnboardingArrow
 local ARROW_VERTICAL_OFFSET = -5
@@ -377,12 +440,36 @@ end
 
 local BuildingLevelRequirement = {} -- [BuildingID] = MinLevel
 -- Populate Level Requirements
-for level, buildingList in pairs(BalanceEconomy.ProgressionConfig.unlocksByLevel) do
-	local lvlNum = tonumber(level) or 0
-	for _, buildingID in ipairs(buildingList) do
-		BuildingLevelRequirement[buildingID] = lvlNum
+local UnlockOrderIndex = {}        -- [BuildingID] = global sort index to preserve config ordering
+
+local unlocksByLevel = BalanceEconomy.ProgressionConfig.unlocksByLevel
+local levelKeys = {}
+for level in pairs(unlocksByLevel) do
+	levelKeys[#levelKeys + 1] = tonumber(level) or 0
+end
+table.sort(levelKeys)
+
+local function getUnlockList(levelNumber: number)
+	return unlocksByLevel[levelNumber] or unlocksByLevel[tostring(levelNumber)]
+end
+
+local orderSeed = 0
+for _, levelNumber in ipairs(levelKeys) do
+	local buildingList = getUnlockList(levelNumber)
+	if type(buildingList) == "table" then
+		for _, buildingID in ipairs(buildingList) do
+			BuildingLevelRequirement[buildingID] = levelNumber
+			orderSeed += 1
+			UnlockOrderIndex[buildingID] = orderSeed
+		end
 	end
 end
+
+local function shouldAnnounceUnlock(featureID: string): boolean
+	-- Treat anything missing from the config as level 0 (starter content)
+	return (BuildingLevelRequirement[featureID] or 0) > 0
+end
+
 -- UI References
 local UI_Exit = UI.main.exit
 
@@ -434,6 +521,8 @@ local FIRE = IND:WaitForChild("Fire")
 local POLI = IND:WaitForChild("Police")
 local HLTH = IND:WaitForChild("Health")
 local LAND = IND:WaitForChild("Landmark")
+local LEIS = IND:WaitForChild("Leisure")
+local SPRT = IND:WaitForChild("Sports")
 local POWR = IND:WaitForChild("Power")
 local WATR = IND:WaitForChild("Water")
 local TRAN = IND:FindFirstChild("Transport") -- only if you have it
@@ -452,6 +541,15 @@ local FeatureModels = {
 	FireStation   = FIRE["FireStation"],
 	FirePrecinct  = FIRE["FirePrecinct"],
 
+	-- Leisure
+	Church        = LEIS["Church"],
+	Mosque        = LEIS["Mosque"],
+	ShintoTemple  = LEIS["Shinto Temple"],
+	HinduTemple   = LEIS["Hindu Temple"],
+	BuddhaStatue  = LEIS["Buddha Statue"],
+	Hotel         = LEIS["Hotel"],
+	MovieTheater  = LEIS["Movie Theater"],
+
 	-- Police
 	PoliceDept     = POLI["Police Dept"],
 	PoliceStation  = POLI["Police Station"],
@@ -463,6 +561,17 @@ local FeatureModels = {
 	LocalHospital = HLTH["Local Hospital"],
 	CityHospital  = HLTH["City Hospital"],
 	MajorHospital = HLTH["Major Hospital"],
+
+	-- Sports
+	SkatePark         = SPRT["Skate Park"],
+	TennisCourt       = SPRT["Tennis Court"],
+	PublicPool        = SPRT["Public Pool"],
+	ArcheryRange      = SPRT["Archery Range"],
+	GolfCourse        = SPRT["Golf Course"],
+	BasketballCourt   = SPRT["Basketball Court"],
+	SoccerStadium     = SPRT["Soccer Stadium"],
+	FootballStadium   = SPRT["Football Stadium"],
+	BasketballStadium = SPRT["Basketball Stadium"],
 
 	-- Landmarks
 	FerrisWheel          = LAND["Ferris Wheel"],
@@ -1240,7 +1349,10 @@ end
 local function UpdateBusDepotButton()
 	local btn = FrameButtons["BusDepot"]
 	if btn and btn.info and btn.info.itemName then
-		btn.info.itemName.Text = HasBusDepot and "Bus Depot (Owned)" or "Bus Depot"
+		local langKey = HasBusDepot and "Bus Depot Owned" or "Bus Depot"
+		btn.info.itemName:SetAttribute("LangKey", langKey)
+		local fallback = HasBusDepot and "Bus Depot (Owned)" or "Bus Depot"
+		btn.info.itemName.Text = _resolveLang(langKey, fallback)
 	end
 	_setPriceVisible("BusDepot", not HasBusDepot)
 end
@@ -1248,7 +1360,10 @@ end
 local function UpdateAirportButton()
 	local btn = FrameButtons["Airport"]
 	if btn and btn.info and btn.info.itemName then
-		btn.info.itemName.Text = HasAirport and "Airport (Owned)" or "Airport"
+		local langKey = HasAirport and "Airport Owned" or "Airport"
+		btn.info.itemName:SetAttribute("LangKey", langKey)
+		local fallback = HasAirport and "Airport (Owned)" or "Airport"
+		btn.info.itemName.Text = _resolveLang(langKey, fallback)
 	end
 	_setPriceVisible("Airport", not HasAirport)
 end
@@ -1256,7 +1371,10 @@ end
 local function UpdateMetroButton()
 	local btn = FrameButtons["MetroEntrance"]
 	if btn and btn.info and btn.info.itemName then
-		btn.info.itemName.Text = HasMetro and "Metro (Owned)" or "Metro"
+		local langKey = HasMetro and "Metro Owned" or "Metro"
+		btn.info.itemName:SetAttribute("LangKey", langKey)
+		local fallback = HasMetro and "Metro (Owned)" or "Metro"
+		btn.info.itemName.Text = _resolveLang(langKey, fallback)
 	end
 	_setPriceVisible("MetroEntrance", not HasMetro)
 end
@@ -1268,19 +1386,19 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 
 	local ChoiceTemplate = UISection.Template
 	ChoiceTemplate.Visible = false
+	
+	local PrintedLangKeys = {}
 
 	for _, Data in Choices do
 		local Choice = ChoiceTemplate:Clone()
 		Choice.Name = Data.itemName
 		Choice.Visible = true
-		Choice.info.itemName.Text = tostring(Data.itemName)
-
-		local PrintedLangKeys = {}
-		Choice.info.itemName:SetAttribute("LangKey", tostring(Data.itemName))
 		local key = tostring(Data.itemName)
+		Choice.info.itemName:SetAttribute("LangKey", key)
+		Choice.info.itemName.Text = _resolveLang(key, key)
 		if not PrintedLangKeys[key] then
 			PrintedLangKeys[key] = true
-			print("[LangKey]", key)
+			--print("[LangKey]", key)
 		end
 
 		if Data.priceInRobux then
@@ -1635,7 +1753,7 @@ FUS.OnClientEvent:Connect(function(unlockStatus)
 	else
 		for feature, now in pairs(unlockStatus) do
 			local before = PrevUnlocks[feature] == true
-			if now and not before then
+			if now and not before and shouldAnnounceUnlock(feature) then
 				table.insert(gained, feature)
 			end
 		end
@@ -1643,6 +1761,22 @@ FUS.OnClientEvent:Connect(function(unlockStatus)
 	end
 
 	if #gained > 0 then
+		table.sort(gained, function(a: string, b: string)
+			local levelA = BuildingLevelRequirement[a] or math.huge
+			local levelB = BuildingLevelRequirement[b] or math.huge
+			if levelA ~= levelB then
+				return levelA < levelB
+			end
+
+			local orderA = UnlockOrderIndex[a] or levelA
+			local orderB = UnlockOrderIndex[b] or levelB
+			if orderA ~= orderB then
+				return orderA < orderB
+			end
+
+			return tostring(a) < tostring(b)
+		end)
+
 		for _, feature in ipairs(gained) do
 			PendingByItem[feature] = true
 			local btn = FrameButtons[feature]

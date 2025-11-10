@@ -15,14 +15,14 @@ local PlayerDataInterfaceService = nil
 
 -- Constants
 local DEBUG_PRINT_PLAYERDATA_LOAD = false
-local DEBUG_PRINT_PLAYERDATA_SAVE = true
+local DEBUG_PRINT_PLAYERDATA_SAVE = false
 
 local DEBUG_IGNORE_PLAYERDATA_DATASTORES = false
 local DEBUG_IGNORE_SESSION_LOCKING = false
 local DEBUG_IGNORE_PLAYERDATA_SAVE = false
 local DEBUG_IGNORE_PLAYERDATA_LOAD = false
 
-local PLAYERDATA_DATASTORE = RunService:IsStudio() and "PlayerData_Test2" or "PlayerData_Release"
+local PLAYERDATA_DATASTORE = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release1"
 
 -- Defines
 PlayerDataService.AllPlayerData = {} -- [Player] = PlayerData

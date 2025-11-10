@@ -1,3 +1,5 @@
+-- CivicRequestsAdvisor.lua
+
 local DEBUG                          = false   -- print why/where things fail
 local LOG_PREFIX                     = "[CivicReq]"
 local AREA_OFFSET_Y                  = 7      -- studs above ground
@@ -56,6 +58,15 @@ local Progression do
 		return require(ServerScriptService:FindFirstChild("Progression") or error("Progression not found"))
 	end)
 	Progression = ok and mod or nil
+end
+
+-- NEW: try to load DevProducts so we can identify devproduct features by name
+local DevProductsModule do
+	local ok, mod = pcall(function()
+		-- Adjust this require path if your DevProducts module lives elsewhere
+		return require(ServerScriptService:FindFirstChild("DevProducts") or error("DevProducts not found"))
+	end)
+	DevProductsModule = ok and mod or nil
 end
 
 local Events         = ReplicatedStorage:WaitForChild("Events")
@@ -273,6 +284,46 @@ local function getInfluenceWidth(mode: string): number
 end
 
 ----------------------------------------------------------------
+-- NEW HELPERS FOR DEVPRODUCT GATING
+----------------------------------------------------------------
+local function isDevProductFeature(featureName: string): boolean
+	return DevProductsModule ~= nil
+		and DevProductsModule.Has ~= nil
+		and DevProductsModule.Has(featureName) == true
+end
+
+local function playerHasBuiltFeature(player: Player, featureName: string): boolean
+	local zones = ZoneTracker.getAllZones(player)
+	if not zones then return false end
+	for zid, z in pairs(zones) do
+		if z.mode == featureName and isZonePopulated(player, zid) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Returns the highest tier **non-devproduct** feature in this category that the player has unlocked.
+-- Tier priority uses Balance.UxpConfig.Tier if present; otherwise falls back to required level.
+local function bestUnlockedProgressionFeature(player: Player, categoryName: string): string?
+	local bag = CATEGORY[categoryName]; if type(bag) ~= "table" then return nil end
+	local bestFeat, bestScore = nil, -math.huge
+	for featureName, _ in pairs(bag) do
+		if not isDevProductFeature(featureName) then
+			local unlocked = (Progression and (Progression :: any).playerHasUnlock and (Progression :: any).playerHasUnlock(player, featureName)) or false
+			if unlocked then
+				local score = ((UXP_TIER :: any)[featureName] or ((Progression and (Progression :: any).getRequiredLevel and (Progression :: any).getRequiredLevel(featureName)) or 0))
+				if score > bestScore then
+					bestScore = score
+					bestFeat  = featureName
+				end
+			end
+		end
+	end
+	return bestFeat
+end
+
+----------------------------------------------------------------
 -- PERF: PER-CATEGORY PROVIDER TILE INDEX
 --  [uid][category] = {
 --     modes = {
@@ -407,29 +458,46 @@ local function hasCategoryCoverage(player: Player, targetZone, categoryName: str
 end
 
 ----------------------------------------------------------------
--- CORRECT CATEGORY UNLOCK CHECK FOR YOUR DATA MODEL
+-- CORRECT CATEGORY UNLOCK CHECK (UPDATED)
 ----------------------------------------------------------------
 local function isCategoryUnlocked(player: Player, categoryName: string): boolean
 	-- No progression module? Keep legacy permissive behavior.
 	if not Progression then return true end
 
-	-- Category must exist in Balance.UxpConfig.Category and contain at least one provider feature.
 	local bag = CATEGORY[categoryName]
 	if type(bag) ~= "table" then
 		return false
 	end
 
-	-- A category is unlocked iff the player has unlocked **any** provider feature listed in that category.
-	for featureName, _ in pairs(bag) do
-		local ok, has = pcall(function()
-			return (Progression :: any).playerHasUnlock and (Progression :: any).playerHasUnlock(player, featureName)
-		end)
-		if ok and has == true then
-			return true
+	-- 1) Category unlock is driven by **non-devproduct** features unlocked by level.
+	--    If the player has ANY non-DP provider unlocked by progression, the category is considered unlocked.
+	local bestProg = bestUnlockedProgressionFeature(player, categoryName)
+	if bestProg then
+		return true
+	end
+
+	-- 2) Devproducts must NOT unlock categories by themselves.
+	--    We only allow a DP to make the category "advisable" if BOTH:
+	--       (a) the player has at least one devproduct instance in this category placed, AND
+	--       (b) the current max progression tier for this category is already PRESENT (built) in the city.
+	if DevProductsModule then
+		local hasAnyDPPlaced = false
+		for featureName, _ in pairs(bag) do
+			if isDevProductFeature(featureName) and playerHasBuiltFeature(player, featureName) then
+				hasAnyDPPlaced = true
+				break
+			end
+		end
+		if hasAnyDPPlaced then
+			-- Must also have the highest available progression tier already present (built).
+			-- If there is no progression tier unlocked yet, or it's not placed, we keep the category locked.
+			local highestPlacedProg = bestUnlockedProgressionFeature(player, categoryName)
+			if highestPlacedProg and playerHasBuiltFeature(player, highestPlacedProg) then
+				return true
+			end
 		end
 	end
 
-	-- None of the providers are unlocked yet -> category is locked for this player.
 	return false
 end
 
@@ -608,7 +676,7 @@ local function buildMissingTiles(player: Player, categoryName: string): ({ [stri
 	local bag = CATEGORY[categoryName]
 	if not bag then dprint("CATEGORY absent for", categoryName); return {}, nil end
 
-	-- Don’t compute/emit for locked category
+	-- Don’t compute/emit for locked category (updated semantics)
 	if not isCategoryUnlocked(player, categoryName) then
 		return {}, nil
 	end
@@ -635,7 +703,7 @@ local function buildMissingTiles(player: Player, categoryName: string): ({ [stri
 end
 
 local function placeCategoryClusters(player: Player, categoryName: string, tileSet: { [string]: boolean }): number
-	-- Don’t place icons for locked category
+	-- Don’t place icons for locked category (updated semantics)
 	if not isCategoryUnlocked(player, categoryName) then
 		return 0
 	end
