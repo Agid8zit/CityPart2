@@ -32,6 +32,23 @@ local function ensureBE(name: string): BindableEvent
 end
 local ForceDisableOnboardingBE: BindableEvent = ensureBE("ForceDisableOnboarding")
 
+local MoneyBadgeThresholds = {
+	{ amount = 1000000000, award = BadgeServiceModule.AwardMoney1B },
+	{ amount = 100000000,  award = BadgeServiceModule.AwardMoney100M },
+	{ amount = 1000000,    award = BadgeServiceModule.AwardMoney1M },
+	{ amount = 100000,     award = BadgeServiceModule.AwardMoney100K },
+	{ amount = 10000,      award = BadgeServiceModule.AwardMoney10K },
+}
+
+local function checkMoneyBadges(player, amount)
+	if not player or type(amount) ~= "number" then return end
+	for _, entry in ipairs(MoneyBadgeThresholds) do
+		if amount >= entry.amount then
+			entry.award(player)
+		end
+	end
+end
+
 -- ======================================================================
 -- Transit helpers (per-tier schema normalized to NUMERIC levels)
 -- ======================================================================
@@ -78,6 +95,9 @@ function PlayerDataInterfaceService.OnLoad(Player: Player, PlayerData)
 
 	PlayerData.OwnedBadges = PlayerData.OwnedBadges or {}
 	local SaveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
+	if SaveFile and SaveFile.economy then
+		checkMoneyBadges(Player, SaveFile.economy.money or 0)
+	end
 
 	_ensureTransitNode(SaveFile, "busDepot")
 	_ensureTransitNode(SaveFile, "airport")
@@ -209,6 +229,7 @@ function PlayerDataInterfaceService.IncrementCoinsInSaveData(Player: Player, Inc
 	PlayerDataService.ModifySaveData(Player, "economy/money", Coins)
 
 	RE_PlayerDataChanged_Money:FireClient(Player, Coins)
+	checkMoneyBadges(Player, Coins)
 end
 
 function PlayerDataInterfaceService.SetCoinsInSaveData(Player: Player, NewAmount: number)
@@ -221,6 +242,7 @@ function PlayerDataInterfaceService.SetCoinsInSaveData(Player: Player, NewAmount
 	local clamped = math.max(0, tonumber(NewAmount) or 0)
 	PlayerDataService.ModifySaveData(Player, "economy/money", clamped)
 	RE_PlayerDataChanged_Money:FireClient(Player, clamped)
+	checkMoneyBadges(Player, clamped)
 end
 
 -- Relative adjust (used by EconomyService.adjustBalance)

@@ -24,8 +24,8 @@ local DirtySources = {
 	GasPowerPlant = true,
 }
 
-local playerTotals = {}        -- [Player] = { clean = number, dirty = number }
-local zoneContributions = {}   -- [Player] = { [zoneId] = { bucket = "clean"/"dirty", amount = number } }
+local playerTotals = {}
+local zoneContributions = {}
 
 local function ensurePlayerTables(player)
 	if not playerTotals[player] then
@@ -75,7 +75,6 @@ local function updateContribution(player, zoneId, mode, isRemoval)
 			totals[prevBucket] = math.max(0, (totals[prevBucket] or 0) - existing.amount)
 			contribs[zoneId] = nil
 		else
-			-- best-effort: subtract from inferred bucket
 			totals[bucket] = math.max(0, (totals[bucket] or 0) - amount)
 		end
 	else

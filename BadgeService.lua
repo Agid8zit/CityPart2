@@ -17,6 +17,23 @@ local BADGE_KEYS = {
 	AllMapExpansions     = "TheCityMustGrow",
 	CleanEnergyOnly      = "GreenThumb",
 	DirtyEnergyOnly      = "TheOilMustFlow",
+	AthleticCity         = "AthleticCity",
+	Coexist              = "Coexist",
+	PoliceState          = "PoliceState",
+	Patriotism           = "Patriotism",
+	HitTheGriddy         = "HitTheGriddy",
+	PropagandaMachine    = "PropagandaMachine",
+	AmericanHealthcare   = "AmericanHealthcare",
+	Utopia               = "Utopia",
+	IndusValley          = "IndusValley",
+	Overpopulation       = "Overpopulation",
+	AmericanDream        = "AmericanDream",
+	PerfectlyBalanced    = "PerfectlyBalanced",
+	Money10K             = "Money10K",
+	Money100K            = "Money100K",
+	Money1M              = "Money1M",
+	Money100M            = "Money100M",
+	Money1B              = "Money1B",
 }
 
 -- All badge metadata lives here so every system asks the same source of truth.
@@ -79,6 +96,108 @@ local BADGE_DEFINITIONS = {
 		id = 2549639871056238,
 		name = "The Oil Must Flow",
 		description = "Produce 500k W using only dirty energy",
+	},
+
+	[ BADGE_KEYS.AthleticCity ] = {
+		id = 165399849653735,
+		name = "Athletic City",
+		description = "Have at least one of every sports building",
+	},
+
+	[ BADGE_KEYS.Coexist ] = {
+		id = 1366401095268910,
+		name = "Coexist",
+		description = "Have at least one of every religious building",
+	},
+
+	[ BADGE_KEYS.PoliceState ] = {
+		id = 3976308414335611,
+		name = "Police State",
+		description = "Own 10 or more police stations",
+	},
+
+	[ BADGE_KEYS.Patriotism ] = {
+		id = 3644205302097905,
+		name = "Patriotism",
+		description = "Place a flag in your city",
+	},
+
+	[ BADGE_KEYS.HitTheGriddy ] = {
+		id = 162658626447666,
+		name = "Hit The Griddy",
+		description = "Cover every tile of your map with builds",
+	},
+
+	[ BADGE_KEYS.PropagandaMachine ] = {
+		id = 3966348419588151,
+		name = "Propaganda Machine",
+		description = "Own at least 15 News Stations",
+	},
+
+	[ BADGE_KEYS.AmericanHealthcare ] = {
+		id = 3744214650378218,
+		name = "American Healthcare",
+		description = "Reach 100k population with no health buildings",
+	},
+
+	[ BADGE_KEYS.Utopia ] = {
+		id = 2550350680176380,
+		name = "Utopia",
+		description = "Meet every citizen need with 100k+ population",
+	},
+
+	[ BADGE_KEYS.IndusValley ] = {
+		id = 3729690528911253,
+		name = "Indus Valley",
+		description = "Cover 80% of the map with Industrial zones",
+	},
+
+	[ BADGE_KEYS.Overpopulation ] = {
+		id = 1781552303955516,
+		name = "Overpopulation",
+		description = "Cover 80% of the map with Residential zones",
+	},
+
+	[ BADGE_KEYS.AmericanDream ] = {
+		id = 1738353506989084,
+		name = "The American Dream",
+		description = "Cover 80% of the map with Commercial zones",
+	},
+
+	[ BADGE_KEYS.PerfectlyBalanced ] = {
+		id = 0,
+		name = "Perfectly Balanced",
+		description = "Have equal coverage across all six zone types",
+	},
+
+	[ BADGE_KEYS.Money10K ] = {
+		id = 3194536879767856,
+		name = "Making Some Cash",
+		description = "Hold at least $10,000",
+	},
+
+	[ BADGE_KEYS.Money100K ] = {
+		id = 3921526033360994,
+		name = "Money Maker",
+		description = "Hold at least $100,000",
+	},
+
+	[ BADGE_KEYS.Money1M ] = {
+		id = 4366510871200022,
+		name = "Millionaire",
+		description = "Hold at least $1,000,000",
+	},
+
+	[ BADGE_KEYS.Money100M ] = {
+		id = 3305238027901035,
+		name = "Part Of The 1%",
+		description = "Hold at least $100,000,000",
+	},
+
+	[ BADGE_KEYS.Money1B ] = {
+		id = 701963810946097,
+		name = "Billionaire",
+		description = "Hold at least $1,000,000,000",
 	},
 }
 
@@ -225,6 +344,74 @@ end
 
 function BadgeService.AwardDirtyEnergyBadge(player: Player)
 	return BadgeService.Award(player, BADGE_KEYS.DirtyEnergyOnly)
+end
+
+function BadgeService.AwardAthleticCity(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.AthleticCity)
+end
+
+function BadgeService.AwardCoexist(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Coexist)
+end
+
+function BadgeService.AwardPoliceState(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.PoliceState)
+end
+
+function BadgeService.AwardPatriotism(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Patriotism)
+end
+
+function BadgeService.AwardHitTheGriddy(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.HitTheGriddy)
+end
+
+function BadgeService.AwardPropagandaMachine(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.PropagandaMachine)
+end
+
+function BadgeService.AwardAmericanHealthcare(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.AmericanHealthcare)
+end
+
+function BadgeService.AwardUtopia(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Utopia)
+end
+
+function BadgeService.AwardIndusValley(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.IndusValley)
+end
+
+function BadgeService.AwardOverpopulation(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Overpopulation)
+end
+
+function BadgeService.AwardAmericanDream(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.AmericanDream)
+end
+
+function BadgeService.AwardPerfectlyBalanced(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.PerfectlyBalanced)
+end
+
+function BadgeService.AwardMoney10K(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Money10K)
+end
+
+function BadgeService.AwardMoney100K(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Money100K)
+end
+
+function BadgeService.AwardMoney1M(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Money1M)
+end
+
+function BadgeService.AwardMoney100M(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Money100M)
+end
+
+function BadgeService.AwardMoney1B(player: Player)
+	return BadgeService.Award(player, BADGE_KEYS.Money1B)
 end
 
 return BadgeService

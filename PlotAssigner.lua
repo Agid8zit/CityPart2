@@ -200,25 +200,29 @@ local function disableQueryingInPlot(plotModel)
 end
 
 local function setPlotOddEvenAttributes(plotModel: Model?)
-	if not plotModel then
-		return
-	end
-
+	if not plotModel then return end
 	local primaryPart = plotModel.PrimaryPart
-	if not primaryPart then
-		return
-	end
+	if not primaryPart then return end
 
+	-- Normalize 0..360
 	local orientationY = primaryPart.Orientation.Y % 360
 	if orientationY < 0 then
 		orientationY += 360
 	end
 
-	local tolerance = 1e-3
-	local isOddOrientation = (orientationY <= tolerance) or (orientationY >= (360 - tolerance))
-	local isEvenOrientation = math.abs(orientationY - 180) <= tolerance
+	-- Helper: shortest angular distance on a circle
+	local function isAngle(a: number, target: number, tol: number)
+		local d = (a - target) % 360
+		d = math.min(d, 360 - d)
+		return d <= tol
+	end
 
-	plotModel:SetAttribute("Odd", isOddOrientation)
+	local tolerance = 0.1 -- you had 1e-3; 0.1° is friendlier to float jitter
+
+	local isOddOrientation  = isAngle(orientationY, 180, tolerance) -- 180° ⇒ ODD
+	local isEvenOrientation = isAngle(orientationY,   0, tolerance) --   0° ⇒ EVEN (also 360°)
+
+	plotModel:SetAttribute("Odd",  isOddOrientation)
 	plotModel:SetAttribute("Even", isEvenOrientation)
 end
 
