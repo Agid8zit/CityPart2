@@ -7,6 +7,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Dependencies
 local Abrv = require(ReplicatedStorage.Scripts.UI.Abrv)
@@ -520,14 +521,14 @@ function PremiumShopGui.Init()
 		local h = nil
 		DevProductChoiceButton.MouseEnter:Connect(function()
 			if h == nil then
-				h = RunService.Heartbeat:Connect(function(Step)
+				h = RunServiceScheduler.onHeartbeat(function(Step)
 					DevProductChoiceButton.Frame.IconContainer.Glow.Rotation += Step * 60
 				end)
 			end
 		end)
 		DevProductChoiceButton.MouseLeave:Connect(function()
 			if h ~= nil then
-				h:Disconnect()
+				h()
 				h = nil
 			end
 		end)

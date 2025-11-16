@@ -12,6 +12,7 @@ local ServerStorage       = game:GetService("ServerStorage")
 local S3        = ServerScriptService
 local ZoneMgr   = S3.Build.Zones.ZoneManager
 local EconomyService = require(ZoneMgr:WaitForChild("EconomyService"))
+local BadgeServiceModule = require(ServerScriptService.Services.BadgeService)
 
 local Balancing = ReplicatedStorage:WaitForChild("Balancing")
 local Balance   = require(Balancing:WaitForChild("BalanceEconomy"))
@@ -64,6 +65,41 @@ local PlayerSavedBE = BindableFolder:FindFirstChild("PlayerSaved")
 ---------------------------------------------------------------------
 -- { [Player] = { [unlockName] = true } }
 local InMemoryUnlocks : { [Player] : { [string]: boolean } } = {}
+
+local MAP_EXPANSION_UNLOCKS = {
+	Unlock_1 = true,
+	Unlock_2 = true,
+	Unlock_3 = true,
+	Unlock_4 = true,
+	Unlock_5 = true,
+	Unlock_6 = true,
+}
+
+local TOTAL_MAP_EXPANSIONS = 0
+for _ in pairs(MAP_EXPANSION_UNLOCKS) do
+	TOTAL_MAP_EXPANSIONS += 1
+end
+
+local function _checkMapExpansionBadges(player: Player)
+	if not BadgeServiceModule then return end
+	local ownedTable = InMemoryUnlocks[player]
+	if not ownedTable then return end
+
+	local ownedCount = 0
+	for unlockName in pairs(MAP_EXPANSION_UNLOCKS) do
+		if ownedTable[unlockName] then
+			ownedCount += 1
+		end
+	end
+
+	if ownedCount > 0 then
+		BadgeServiceModule.AwardFirstMapExpansion(player)
+	end
+
+	if TOTAL_MAP_EXPANSIONS > 0 and ownedCount >= TOTAL_MAP_EXPANSIONS then
+		BadgeServiceModule.AwardAllMapExpansions(player)
+	end
+end
 
 local function _pushUnlocksToClient(player: Player)
 	UnlocksUpdated:FireClient(player, InMemoryUnlocks[player] or {})
@@ -415,6 +451,9 @@ local function grantUnlock(player: Player, unlockName: string)
 	applyUnlocksToPlot(player, tbl)
 	_pushUnlocksToClient(player)
 	UnlockChanged:Fire(player, unlockName, true)
+	if MAP_EXPANSION_UNLOCKS[unlockName] then
+		_checkMapExpansionBadges(player)
+	end
 end
 
 UnlockEvent.OnServerEvent:Connect(function(player: Player, unlockName: string)
@@ -474,5 +513,6 @@ SetUnlocksForPlayer.OnInvoke = function(player: Player, newTable: {[string]: boo
 	applyUnlocksToPlot(player, t)
 	ensurePromptsForPlot(player)
 	UnlocksUpdated:FireClient(player, t)
+	_checkMapExpansionBadges(player)
 	return true
 end

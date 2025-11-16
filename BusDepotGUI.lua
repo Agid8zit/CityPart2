@@ -25,6 +25,7 @@ local ICONS = {
 }
 local MAX_TIERS = #ICONS
 local MAX_TIER_LEVEL = 100
+local LEVELS_PER_TIER_UNLOCK = 3
 
 -- UI paths (unchanged)
 local UI = script.Parent
@@ -79,7 +80,7 @@ local function clamp(n: number, lo: number, hi: number): number
 end
 
 local function unlockedTiers(unlock: number): number
-	local t = math.floor(math.max(0, tonumber(unlock) or 0) / 10) + 1
+	local t = math.floor(math.max(0, tonumber(unlock) or 0) / LEVELS_PER_TIER_UNLOCK) + 1
 	if t < 1 then t = 1 end
 	if t > MAX_TIERS then t = MAX_TIERS end
 	return t

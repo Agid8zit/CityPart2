@@ -23,6 +23,9 @@ local ZoneRemovedEvt       = BindableEvents:WaitForChild("ZoneRemoved")
 local ZoneReCreatedEvt     = BindableEvents:WaitForChild("ZoneReCreated")
 local ZonePopulatedEvt     = BindableEvents:WaitForChild("ZonePopulated")
 local FireSupportEvt       = BindableEvents:WaitForChild("FireSupportUnlocked")
+local PoliceSupportEvt     = BindableEvents:WaitForChild("PoliceSupportUnlocked")
+local HealthSupportEvt     = BindableEvents:WaitForChild("HealthSupportUnlocked")
+local TrashSupportEvt      = BindableEvents:WaitForChild("TrashSupportUnlocked")
 local BusSupportUnlocked   = BindableEvents:WaitForChild("BusSupportUnlocked")
 local BusSupportRevoked    = BindableEvents:WaitForChild("BusSupportRevoked")
 local SpawnCarToFarthestEvt = RemoteEvents:FindFirstChild("SpawnCarToFarthest")
@@ -43,6 +46,7 @@ local Services = ServerScriptService:WaitForChild("Services")
 
 -- Bus tiers/levels read
 local PlayerDataInterfaceService = require(Services:WaitForChild("PlayerDataInterfaceService"))
+local SoundController = require(ReplicatedStorage.Scripts.Controllers.SoundController)
 
 --======================================================================
 --  CONFIG (tune to taste)
@@ -66,10 +70,46 @@ local RESCAN_PERIODIC_SEC       = 45      -- periodic safety net
 local MAX_BUS_SHARE        = 0.30  -- hard cap when all 10 tiers are level 100
 local LOG_RESPONSE_A       = 0.50  -- >0 means stronger early returns, diminishing later
 local MAX_BUS_TIERS        = 10    -- schema says 10
+local LEVELS_PER_TIER_UNLOCK = 3
+
+-- Vehicle audio (kept subtle)
+local VEHICLE_AUDIO = {
+	ambience = {
+		maxInstances   = 6,
+		defaultChance  = 0.22,
+		busChance      = 0.35,
+		volume         = 0.15,
+		rollOffMin     = 10,
+		rollOffMax     = 220,
+		pitchMin       = 0.94,
+		pitchMax       = 1.06,
+	},
+	horn = {
+		chance         = 0.04,
+		cooldownSec    = 7,
+		volume         = 0.18,
+		rollOffMin     = 12,
+		rollOffMax     = 240,
+		pitchMin       = 0.95,
+		pitchMax       = 1.05,
+	},
+	siren = {
+		maxInstances   = 3,
+		chance         = 0.22,
+		volume         = 0.16,
+		rollOffMin     = 12,
+		rollOffMax     = 260,
+		pitchMin       = 0.97,
+		pitchMax       = 1.03,
+	},
+}
 
 -- Two-way options (kept; ignored in zone-based modes below)
 local BUS_SPAWN_CHANCE          = 0.25
 local FIRE_SPAWN_CHANCE         = 0.15
+local POLICE_SPAWN_CHANCE       = FIRE_SPAWN_CHANCE
+local HEALTH_SPAWN_CHANCE       = FIRE_SPAWN_CHANCE
+local TRASH_SPAWN_CHANCE        = FIRE_SPAWN_CHANCE
 local TWO_WAY_ENABLED           = true
 local TWO_WAY_MODE              = "mirror"        -- "mirror" or "chance"
 local TWO_WAY_CHANCE            = 0.5
@@ -95,16 +135,36 @@ local DISPATCH_MODE = "ZoneToOriginAndBack"
 --======================================================================
 --  STATE
 --======================================================================
-local fireSupport = {}  -- [userId] = true when Fire unlocked
-local busSupport  = {}  -- [userId] = true when Bus unlocked
+local fireSupport   = {}  -- [userId] = true when Fire unlocked
+local policeSupport = {}  -- [userId] = true when Police unlocked
+local healthSupport = {}  -- [userId] = true when Health unlocked
+local trashSupport  = {}  -- [userId] = true when Trash unlocked
+local busSupport    = {}  -- [userId] = true when Bus unlocked
 local _busWarnedMissing = false
 
 local ctxByUserId = {}
+local ensureCtx -- forward declaration
+
+local variantsWithAmbience = { Default = true, Bus = true }
+local variantsWithSiren    = { Fire = true, Police = true, Health = true }
+local activeAmbienceCount  = 0
+local activeSirenCount     = 0
+local lastHornAt           = 0
 
 local templates = {
 	default = {},
 	fire    = {},
+	police  = {},
+	health  = {},
+	trash   = {},
 	bus     = {},
+}
+
+local uniqueVehicleVariants = {
+	{ templateKey = "police", folderName = "Police", label = "Police", supportTable = policeSupport, chance = POLICE_SPAWN_CHANCE },
+	{ templateKey = "fire",   folderName = "Fire",   label = "Fire",   supportTable = fireSupport,   chance = FIRE_SPAWN_CHANCE },
+	{ templateKey = "health", folderName = "Health", label = "Health", supportTable = healthSupport, chance = HEALTH_SPAWN_CHANCE },
+	{ templateKey = "trash",  folderName = "Trash",  label = "Trash",  supportTable = trashSupport,  chance = TRASH_SPAWN_CHANCE },
 }
 
 -- Keep a per-tier index for buses so tier unlock gates selection cleanly
@@ -134,6 +194,9 @@ local INCLUDE_TURNS_AS_STOPS = false
 local DRIVE_RESPAWN_DELAY   = 1.0     -- time between trips
 local DRIVE_MOVE_DIST_STOP  = 6.0     -- studs from start pos (2D)
 local DRIVE_MOVE_SPEED_STOP = 7.0     -- studs/sec (rough walking+)
+local DRIVE_TOGGLE_DEBOUNCE = 0.5     -- per-toggle server cooldown
+local DRIVE_MOVE_GRACE_SEC  = 0.75    -- grace window after toggling on
+local DRIVE_SPAWN_OVERRIDES = { skipTokens = true, skipCarLimit = true }
 
 --======================================================================
 --  UTILITIES
@@ -247,6 +310,141 @@ local function reversedGridPath(path)
 	return out
 end
 
+-- Vehicle audio helpers
+local function randomBetween(minValue, maxValue)
+	return minValue + (maxValue - minValue) * math.random()
+end
+
+local function attachSoundToCar(car, soundName, opts)
+	if not car then return nil end
+	local primary = car.PrimaryPart or car:FindFirstChildWhichIsA("BasePart")
+	if not primary then return nil end
+	local ok, sound = pcall(SoundController.CreateSound, "Misc", soundName)
+	if not ok or not sound then return nil end
+	if opts then
+		if opts.volume then sound.Volume = opts.volume end
+		if opts.rollOffMin then sound.RollOffMinDistance = opts.rollOffMin end
+		if opts.rollOffMax then sound.RollOffMaxDistance = opts.rollOffMax end
+		if opts.playbackSpeed then sound.PlaybackSpeed = opts.playbackSpeed end
+		if opts.loop ~= nil then sound.Looped = opts.loop end
+	end
+	sound.Parent = primary
+	task.spawn(function()
+		if not sound.IsLoaded then
+			pcall(function() sound.Loaded:Wait() end)
+		end
+		if sound.Parent then
+			sound:Play()
+		end
+	end)
+	return sound
+end
+
+local function bindSoundLifecycle(car, sound, opts)
+	if not (car and sound) then return end
+	local onCleanup = opts and opts.onCleanup
+	local stopOnEnded = true
+	if opts and opts.stopOnEnded ~= nil then
+		stopOnEnded = opts.stopOnEnded
+	end
+	local conn
+	local fired = false
+	local function finalize()
+		if fired then return end
+		fired = true
+		if conn then
+			conn:Disconnect()
+			conn = nil
+		end
+		if onCleanup then
+			local ok, err = pcall(onCleanup)
+			if not ok then
+				warn("[UnifiedTraffic] vehicle audio cleanup error:", err)
+			end
+		end
+		if sound and sound.Parent then
+			sound:Stop()
+			sound:Destroy()
+		end
+	end
+	conn = car.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			finalize()
+		end
+	end)
+	if stopOnEnded and sound then
+		sound.Ended:Connect(finalize)
+	end
+end
+
+local function attachVehicleAudio(car, variantLabel)
+	if not car then return end
+	variantLabel = variantLabel or "Default"
+
+	if variantsWithAmbience[variantLabel]
+		and activeAmbienceCount < VEHICLE_AUDIO.ambience.maxInstances
+	then
+		local chance = (variantLabel == "Bus") and VEHICLE_AUDIO.ambience.busChance or VEHICLE_AUDIO.ambience.defaultChance
+		if math.random() < chance then
+			local sound = attachSoundToCar(car, "CarAmbiance", {
+				loop = true,
+				volume = VEHICLE_AUDIO.ambience.volume,
+				rollOffMin = VEHICLE_AUDIO.ambience.rollOffMin,
+				rollOffMax = VEHICLE_AUDIO.ambience.rollOffMax,
+				playbackSpeed = randomBetween(VEHICLE_AUDIO.ambience.pitchMin, VEHICLE_AUDIO.ambience.pitchMax),
+			})
+			if sound then
+				activeAmbienceCount += 1
+				bindSoundLifecycle(car, sound, {
+					stopOnEnded = false,
+					onCleanup = function()
+						activeAmbienceCount = math.max(0, activeAmbienceCount - 1)
+					end,
+				})
+			end
+		end
+	end
+
+	local now = os.clock()
+	if (now - lastHornAt) >= VEHICLE_AUDIO.horn.cooldownSec
+		and math.random() < VEHICLE_AUDIO.horn.chance
+	then
+		local sound = attachSoundToCar(car, "CarHorn", {
+			volume = VEHICLE_AUDIO.horn.volume,
+			rollOffMin = VEHICLE_AUDIO.horn.rollOffMin,
+			rollOffMax = VEHICLE_AUDIO.horn.rollOffMax,
+			playbackSpeed = randomBetween(VEHICLE_AUDIO.horn.pitchMin, VEHICLE_AUDIO.horn.pitchMax),
+		})
+		if sound then
+			lastHornAt = now
+			bindSoundLifecycle(car, sound, {
+				stopOnEnded = true,
+			})
+		end
+	end
+
+	if variantsWithSiren[variantLabel]
+		and activeSirenCount < VEHICLE_AUDIO.siren.maxInstances
+		and math.random() < VEHICLE_AUDIO.siren.chance
+	then
+		local sound = attachSoundToCar(car, "Siren", {
+			volume = VEHICLE_AUDIO.siren.volume,
+			rollOffMin = VEHICLE_AUDIO.siren.rollOffMin,
+			rollOffMax = VEHICLE_AUDIO.siren.rollOffMax,
+			playbackSpeed = randomBetween(VEHICLE_AUDIO.siren.pitchMin, VEHICLE_AUDIO.siren.pitchMax),
+		})
+		if sound then
+			activeSirenCount += 1
+			bindSoundLifecycle(car, sound, {
+				stopOnEnded = true,
+				onCleanup = function()
+					activeSirenCount = math.max(0, activeSirenCount - 1)
+				end,
+			})
+		end
+	end
+end
+
 -- Templates
 local function clear(list) for i=#list,1,-1 do list[i]=nil end end
 local function repackChildren(folder, into)
@@ -264,12 +462,18 @@ end
 
 local function refreshTemplateCache()
 	clear(templates.default); repackChildren(DefaultCarsFolder, templates.default)
-	clear(templates.fire)
-	if UniqueCarsFolder then
-		local fireNode = UniqueCarsFolder:FindFirstChild("Fire")
-		if fireNode then
-			if fireNode:IsA("Model") then table.insert(templates.fire, fireNode)
-			else repackChildren(fireNode, templates.fire) end
+	for _, variant in ipairs(uniqueVehicleVariants) do
+		local pool = templates[variant.templateKey]
+		clear(pool)
+		if UniqueCarsFolder then
+			local node = UniqueCarsFolder:FindFirstChild(variant.folderName)
+			if node then
+				if node:IsA("Model") then
+					table.insert(pool, node)
+				else
+					repackChildren(node, pool)
+				end
+			end
 		end
 	end
 	clear(templates.bus)
@@ -304,8 +508,8 @@ end
 watchFolder(DefaultCarsFolder); watchFolder(UniqueCarsFolder); watchFolder(BusesFolder)
 
 local function unlockedTiersFromUnlockValue(unlockNum: number): number
-	-- same math as your Interface: floor(unlock/10)+1 clamped to 1..10
-	local t = math.floor(math.max(0, tonumber(unlockNum) or 0) / 10) + 1
+	-- same math as your Interface: floor(unlock / LEVELS_PER_TIER_UNLOCK)+1 clamped to 1..10
+	local t = math.floor(math.max(0, tonumber(unlockNum) or 0) / LEVELS_PER_TIER_UNLOCK) + 1
 	return math.clamp(t, 1, MAX_BUS_TIERS)
 end
 
@@ -373,9 +577,12 @@ local function pickTemplateForPlayer(player)
 		-- fallthrough to fire/default if something odd happened
 	end
 
-	-- Keep your fire/default logic unchanged
-	if fireSupport[uid] and #templates.fire > 0 and math.random() < FIRE_SPAWN_CHANCE then
-		return templates.fire[math.random(1, #templates.fire)], "Fire"
+	for _, variant in ipairs(uniqueVehicleVariants) do
+		local support = variant.supportTable
+		local pool = templates[variant.templateKey]
+		if support[uid] and #pool > 0 and math.random() < variant.chance then
+			return pool[math.random(1, #pool)], variant.label
+		end
 	end
 
 	if #templates.default == 0 then
@@ -398,41 +605,177 @@ local function refreshOwnRoadZones(player, ctx)
 	ctx.ownRoadZoneIds = set
 end
 
-local function nodeOwnedByPlayer(player, key)
+local function nodeOwnedByPlayer(player, key, ctx)
+	if not key then return false end
+	ctx = ctx or ensureCtx(player)
 	local meta = PathingModule.nodeMeta and PathingModule.nodeMeta[key]
 	if not meta then return false end
 	local zid = meta.groupId
 	if not zid then return false end
+	if ctx and ctx.ownRoadZoneIds then
+		return ctx.ownRoadZoneIds[zid] == true
+	end
 	return ZoneTrackerModule.getZoneById(player, zid) ~= nil
 end
 
-local function bfsPathOwned(player, startCoord, endCoord)
+local function coordFromKey(key, cache)
+	if cache and cache[key] then
+		return cache[key]
+	end
+	local sep = string.find(key, "_", 1, true)
+	if not sep then return nil end
+	local x = tonumber(string.sub(key, 1, sep - 1))
+	local z = tonumber(string.sub(key, sep + 1))
+	if not x or not z then return nil end
+	local coord = { x = x, z = z }
+	if cache then
+		cache[key] = coord
+	end
+	return coord
+end
+
+local function gridPathFromKeys(keys, cache)
+	if not keys then return nil end
+	local path = table.create(#keys)
+	for i = 1, #keys do
+		local coord = coordFromKey(keys[i], cache)
+		if not coord then return nil end
+		path[i] = { x = coord.x, z = coord.z }
+	end
+	return path
+end
+
+local function pathKeysFromOrigin(ctx, targetKey)
+	if not ctx or not ctx.bfsOriginKey then return nil end
+	local dist = ctx.bfsDist
+	local parent = ctx.bfsParent
+	if not (dist and parent) then return nil end
+	if not dist[targetKey] then return nil end
+	local keys, cur = {}, targetKey
+	while cur do
+		keys[#keys+1] = cur
+		if cur == ctx.bfsOriginKey then break end
+		cur = parent[cur]
+	end
+	if keys[#keys] ~= ctx.bfsOriginKey then return nil end
+	for i = 1, math.floor(#keys/2) do
+		keys[i], keys[#keys - i + 1] = keys[#keys - i + 1], keys[i]
+	end
+	return keys
+end
+
+local function pathFromOrigin(ctx, coord)
+	if not ctx then return nil end
+	local targetKey = PathingModule.nodeKey(coord)
+	local keys = pathKeysFromOrigin(ctx, targetKey)
+	if not keys then return nil end
+	ctx.coordCache = ctx.coordCache or {}
+	return gridPathFromKeys(keys, ctx.coordCache)
+end
+
+local function ensureBfsSnapshot(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	if not ctx then return nil end
+	local adj = PathingModule.globalAdjacency
+	if not adj then
+		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
+		return nil
+	end
+	local originKey = PathingModule.nodeKey(SOURCE_COORD)
+	if not (adj[originKey] and nodeOwnedByPlayer(player, originKey, ctx)) then
+		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
+		return nil
+	end
+	local dist, parent = { [originKey] = 0 }, {}
+	local queue = table.create(256)
+	local head, tail = 1, 1
+	queue[tail] = originKey
+	tail += 1
+	while head < tail do
+		local cur = queue[head]
+		head += 1
+		local curDist = dist[cur]
+		local nbrs = adj[cur]
+		if nbrs then
+			for i = 1, #nbrs do
+				local nb = nbrs[i]
+				if not dist[nb] and nodeOwnedByPlayer(player, nb, ctx) then
+					dist[nb] = curDist + 1
+					parent[nb] = cur
+					queue[tail] = nb
+					tail += 1
+				end
+			end
+		end
+	end
+	ctx.bfsOriginKey = originKey
+	ctx.bfsDist = dist
+	ctx.bfsParent = parent
+	ctx.coordCache = ctx.coordCache or {}
+	return dist
+end
+
+local function bfsPathOwned(player, ctx, startCoord, endCoord)
+	ctx = ctx or ensureCtx(player)
+	local originKey = PathingModule.nodeKey(SOURCE_COORD)
 	local startKey = PathingModule.nodeKey(startCoord)
 	local endKey   = PathingModule.nodeKey(endCoord)
 	local adj = PathingModule.globalAdjacency
+	if ctx and ctx.bfsOriginKey == originKey and ctx.bfsDist then
+		if startKey == originKey then
+			local path = pathFromOrigin(ctx, endCoord)
+			if path then return path end
+		elseif endKey == originKey then
+			local path = pathFromOrigin(ctx, startCoord)
+			if path then return reversedGridPath(path) end
+		end
+	end
 	if not (adj and adj[startKey] and adj[endKey]) then return nil end
-	if not nodeOwnedByPlayer(player, startKey) then return nil end
-	if not nodeOwnedByPlayer(player, endKey)   then return nil end
+	if not nodeOwnedByPlayer(player, startKey, ctx) then return nil end
+	if not nodeOwnedByPlayer(player, endKey, ctx)   then return nil end
 
-	local q, seen, parent = { startKey }, { [startKey]=true }, {}
-	while #q > 0 do
-		local cur = table.remove(q, 1)
+	local queue = table.create(128)
+	local head, tail = 1, 1
+	queue[tail] = startKey
+	tail += 1
+
+	local seen = { [startKey] = true }
+	local parent = {}
+	local coordCache = {
+		[startKey] = { x = startCoord.x, z = startCoord.z },
+		[endKey] = { x = endCoord.x, z = endCoord.z },
+	}
+
+	while head < tail do
+		local cur = queue[head]
+		head += 1
 		if cur == endKey then
 			local keys, k = {}, cur
-			while k do keys[#keys+1] = k; k = parent[k] end
-			for i=1, math.floor(#keys/2) do keys[i], keys[#keys-i+1] = keys[#keys-i+1], keys[i] end
-			local path = {}
-			for i=1,#keys do local xz = string.split(keys[i], "_"); path[i] = { x=tonumber(xz[1]), z=tonumber(xz[2]) } end
+			while k do
+				keys[#keys + 1] = k
+				k = parent[k]
+			end
+			for i = 1, math.floor(#keys / 2) do
+				keys[i], keys[#keys - i + 1] = keys[#keys - i + 1], keys[i]
+			end
+			local path = table.create(#keys)
+			for i = 1, #keys do
+				local coord = coordFromKey(keys[i], coordCache)
+				if not coord then return nil end
+				path[i] = { x = coord.x, z = coord.z }
+			end
 			return path
 		end
+
 		local nbrs = adj[cur]
 		if nbrs then
-			for i=1,#nbrs do
+			for i = 1, #nbrs do
 				local nb = nbrs[i]
-				if not seen[nb] and nodeOwnedByPlayer(player, nb) then
+				if not seen[nb] and nodeOwnedByPlayer(player, nb, ctx) then
 					seen[nb] = true
 					parent[nb] = cur
-					table.insert(q, nb)
+					queue[tail] = nb
+					tail += 1
 				end
 			end
 		end
@@ -443,10 +786,11 @@ end
 local function pathIsValid(player, path)
 	if not path or #path < 2 then return false end
 	local adj = PathingModule.globalAdjacency
+	local ctx = ensureCtx(player)
 	if not adj then return false end
 	for i = 1, #path do
 		local k = PathingModule.nodeKey(path[i])
-		if not (adj[k] and nodeOwnedByPlayer(player, k)) then
+		if not (adj[k] and nodeOwnedByPlayer(player, k, ctx)) then
 			return false
 		end
 	end
@@ -456,13 +800,15 @@ end
 -- BFS to a specific target (re-derive a path when shortcuts were added)
 local function bfsToTarget(player, targetCoord)
 	if not targetCoord then return nil end
-	return bfsPathOwned(player, SOURCE_COORD, targetCoord)
+	local ctx = ensureCtx(player)
+	return bfsPathOwned(player, ctx, SOURCE_COORD, targetCoord)
 end
 
-local function originLiveForPlayer(player)
+local function originLiveForPlayer(player, ctx)
+	ctx = ctx or ensureCtx(player)
 	local key = PathingModule.nodeKey(SOURCE_COORD)
 	local adj = PathingModule.globalAdjacency
-	return adj and adj[key] ~= nil and nodeOwnedByPlayer(player, key)
+	return adj and adj[key] ~= nil and nodeOwnedByPlayer(player, key, ctx)
 end
 
 local function zoneCenterCoord(z)
@@ -478,14 +824,15 @@ local function zoneCenterCoord(z)
 	return { x = math.floor(sx/#cells + 0.5), z = math.floor(sz/#cells + 0.5) }
 end
 
-local function collectNearZoneSinks(player)
+local function collectNearZoneSinks(player, ctx)
+	ctx = ctx or ensureCtx(player)
 	local sinks, count = {}, 0
 	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
 		if z.mode ~= "DirtRoad" and z.mode ~= "Pavement" and z.mode ~= "Highway" then
 			local center = zoneCenterCoord(z)
 			if center then
 				local near = PathingModule.findNearestRoadNode(center, NEAR_ZONE_MAX_DIST_CELLS)
-				if near and nodeOwnedByPlayer(player, near.key) then
+				if near and nodeOwnedByPlayer(player, near.key, ctx) then
 					sinks[#sinks+1] = { x = near.x, z = near.z }
 					count += 1
 					if count >= MAX_NEAR_ZONE_SINKS then break end
@@ -496,13 +843,17 @@ local function collectNearZoneSinks(player)
 	return sinks
 end
 
-local function computeSinksForPlayer(player)
+local function computeSinksForPlayer(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	local dist = ctx and ctx.bfsDist
+	if not dist then return {} end
 	local ranked = {}
 	local function tryRank(coord)
 		if coord and type(coord.x)=="number" and type(coord.z)=="number" then
-			local p = bfsPathOwned(player, SOURCE_COORD, coord)
-			if p and #p >= MIN_PATH_CELLS then
-				table.insert(ranked, { coord = coord, len = #p })
+			local key = PathingModule.nodeKey(coord)
+			local steps = dist[key]
+			if steps and (steps + 1) >= MIN_PATH_CELLS then
+				table.insert(ranked, { coord = coord, len = steps + 1 })
 			end
 		end
 	end
@@ -512,16 +863,14 @@ local function computeSinksForPlayer(player)
 		end
 	end
 	if #ranked == 0 then
-		for _, coord in ipairs(collectNearZoneSinks(player)) do tryRank(coord) end
+		for _, coord in ipairs(collectNearZoneSinks(player, ctx)) do tryRank(coord) end
 	end
 	if #ranked == 0 then
-		local adj = PathingModule.globalAdjacency or {}
 		local sampled = 0
-		for key,_ in pairs(adj) do
-			if nodeOwnedByPlayer(player, key) then
-				local xz = string.split(key, "_")
-				local c = { x = tonumber(xz[1]), z = tonumber(xz[2]) }
-				tryRank(c)
+		for key,_ in pairs(dist) do
+			local coord = coordFromKey(key, ctx and ctx.coordCache or nil)
+			if coord then
+				tryRank(coord)
 				sampled += 1
 				if sampled >= 128 then break end
 			end
@@ -537,12 +886,16 @@ local function computeSinksForPlayer(player)
 	return sinks
 end
 
-local function computeZoneSourcesForPlayer(player)
+local function computeZoneSourcesForPlayer(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	local dist = ctx and ctx.bfsDist
+	if not dist then return {} end
 	local ranked = {}
-	for _, sourceCoord in ipairs(collectNearZoneSinks(player)) do
-		local p = bfsPathOwned(player, sourceCoord, SOURCE_COORD)
-		if p and #p >= MIN_PATH_CELLS then
-			table.insert(ranked, { coord = sourceCoord, len = #p })
+	for _, sourceCoord in ipairs(collectNearZoneSinks(player, ctx)) do
+		local key = PathingModule.nodeKey(sourceCoord)
+		local steps = dist[key]
+		if steps and (steps + 1) >= MIN_PATH_CELLS then
+			table.insert(ranked, { coord = sourceCoord, len = steps + 1 })
 		end
 	end
 	table.sort(ranked, function(a,b) return a.len > b.len end)
@@ -583,13 +936,17 @@ local function worldPathFor(plot, gridPath)
 	return out
 end
 
-local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel)
+local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel, spawnConfig)
 	if ctx.suspended then return end
 	if not worldPath or #worldPath < 2 then return end
-	if not trySpend(ctx, 1.0) then return end
+	local skipTokens    = spawnConfig and spawnConfig.skipTokens
+	local skipCarLimit  = spawnConfig and spawnConfig.skipCarLimit
+	if not skipTokens and not trySpend(ctx, 1.0) then return end
 
-	local live = 0 for _ in pairs(ctx.cars) do live += 1 end
-	if live >= MAX_CONCURRENT_PER_PLAYER then return end
+	if not skipCarLimit then
+		local live = ctx.carCount or 0
+		if live >= MAX_CONCURRENT_PER_PLAYER then return end
+	end
 
 	local template, chosenVariant = pickTemplateForPlayer(player)
 	if not template then return end
@@ -604,7 +961,10 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel)
 	car.Parent = ctx.plot
 	car:SetPrimaryPartCFrame(CFrame.new(worldPath[1]))
 
+	attachVehicleAudio(car, variantLabel)
+
 	ctx.cars[car] = true
+	ctx.carCount = (ctx.carCount or 0) + 1
 	Debris:AddItem(car, CAR_LIFETIME_SEC)
 
 	local preStopIndices, preStopKeys = computePreIntersectionStops(gridPath)
@@ -620,7 +980,10 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel)
 
 	local pathId = newPathId(player.UserId)
 	CarMovement.moveCarAlongPath(car, worldPath, opts, function(arrived)
-		ctx.cars[car] = nil
+		if ctx.cars[car] then
+			ctx.cars[car] = nil
+			ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
+		end
 		fadeOutAndDestroy(arrived, FADE_OUT_TIME)
 	end, pathId)
 	return car
@@ -628,14 +991,15 @@ end
 
 local function spawnOnceOriginToSinksMode(player, ctx)
 	if ctx.suspended then return end
-	if not originLiveForPlayer(player) then return end
+	if not originLiveForPlayer(player, ctx) then return end
 	if not ctx.sinks or #ctx.sinks == 0 then return end
+	ensureBfsSnapshot(player, ctx)
 
 	local sink = ctx.sinks[math.random(1, #ctx.sinks)]
-	local gridPath = bfsPathOwned(player, SOURCE_COORD, sink)
+	local gridPath = bfsPathOwned(player, ctx, SOURCE_COORD, sink)
 	if (not gridPath or #gridPath < MIN_PATH_CELLS) and #ctx.sinks > 1 then
 		sink = ctx.sinks[math.random(1, #ctx.sinks)]
-		gridPath = bfsPathOwned(player, SOURCE_COORD, sink)
+		gridPath = bfsPathOwned(player, ctx, SOURCE_COORD, sink)
 	end
 	if not gridPath or #gridPath < MIN_PATH_CELLS then return end
 
@@ -654,14 +1018,15 @@ end
 
 local function spawnOnceZoneToOriginMode(player, ctx)
 	if ctx.suspended then return end
-	if not originLiveForPlayer(player) then return end
+	if not originLiveForPlayer(player, ctx) then return end
 	if not ctx.zoneSources or #ctx.zoneSources == 0 then return end
+	ensureBfsSnapshot(player, ctx)
 
 	local sourceCoord = ctx.zoneSources[math.random(1, #ctx.zoneSources)]
-	local gridPath = bfsPathOwned(player, sourceCoord, SOURCE_COORD)
+	local gridPath = bfsPathOwned(player, ctx, sourceCoord, SOURCE_COORD)
 	if (not gridPath or #gridPath < MIN_PATH_CELLS) and #ctx.zoneSources > 1 then
 		sourceCoord = ctx.zoneSources[math.random(1, #ctx.zoneSources)]
-		gridPath = bfsPathOwned(player, sourceCoord, SOURCE_COORD)
+		gridPath = bfsPathOwned(player, ctx, sourceCoord, SOURCE_COORD)
 	end
 	if not gridPath or #gridPath < MIN_PATH_CELLS then return end
 
@@ -689,6 +1054,7 @@ local function killAllTraffic(ctx)
 		if car and car.Parent then fadeOutAndDestroy(car, 0.5) end
 	end
 	ctx.cars = {}
+	ctx.carCount = 0
 end
 
 local function hardKillTrafficInPlot(plot)
@@ -701,34 +1067,43 @@ local function hardKillTrafficInPlot(plot)
 end
 
 --=== FARTEST-POINT FROM ORIGIN HELPERS =================================
-local function computeFarthestOwnedPathFromOrigin(player)
-	if not originLiveForPlayer(player) then return nil end
-	local candidates = PathingModule.getOwnedDeadEnds(player)
-	if #candidates == 0 then
-		candidates = {}
-		for _, node in ipairs(PathingModule.iterAllRoadCoords()) do
-			if nodeOwnedByPlayer(player, node.key) then
-				table.insert(candidates, { x = node.x, z = node.z })
+local function computeFarthestOwnedPathFromOrigin(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	if not originLiveForPlayer(player, ctx) then return nil end
+	ensureBfsSnapshot(player, ctx)
+	if not ctx.bfsDist then return nil end
+	local bestKey, bestLen = nil, -1
+	local function considerCoord(coord)
+		if not coord then return end
+		local key = PathingModule.nodeKey(coord)
+		local steps = ctx.bfsDist and ctx.bfsDist[key]
+		if steps and (steps + 1) >= MIN_PATH_CELLS and steps > bestLen then
+			bestKey = key
+			bestLen = steps
+		end
+	end
+	local deadEnds = PathingModule.getOwnedDeadEnds(player)
+	if deadEnds and #deadEnds > 0 then
+		for _, coord in ipairs(deadEnds) do considerCoord(coord) end
+	end
+	if not bestKey then
+		for key,_ in pairs(ctx.bfsDist) do
+			if ctx.bfsDist[key] then
+				local coord = coordFromKey(key, ctx.coordCache or nil)
+				considerCoord(coord)
 			end
 		end
 	end
-	local bestPath, bestLen = nil, -1
-	for _, coord in ipairs(candidates) do
-		local p = bfsPathOwned(player, SOURCE_COORD, coord)
-		if p and #p > bestLen then
-			bestPath, bestLen = p, #p
-		end
-	end
-	if bestPath and #bestPath >= MIN_PATH_CELLS then
-		return bestPath
-	end
-	return nil
+	if not bestKey then return nil end
+	local coord = coordFromKey(bestKey, ctx.coordCache or nil)
+	return coord and pathFromOrigin(ctx, coord) or nil
 end
 
 local function spawnOnce_OriginToFarthest(player, ctx)
 	if ctx.suspended then return end
-	if not originLiveForPlayer(player) then return end
-	local gridPath = computeFarthestOwnedPathFromOrigin(player)
+	if not originLiveForPlayer(player, ctx) then return end
+	ensureBfsSnapshot(player, ctx)
+	local gridPath = computeFarthestOwnedPathFromOrigin(player, ctx)
 	if not gridPath then return end
 	local worldPath = worldPathFor(ctx.plot, gridPath)
 	local car = spawnCarAlongPath(player, ctx, gridPath, worldPath, "Farthest")
@@ -750,7 +1125,7 @@ end
 --======================================================================
 local recomputeQueued = {} -- [uid] = true
 
-local function ensureCtx(player)
+function ensureCtx(player)
 	local uid = player.UserId
 	local ctx = ctxByUserId[uid]
 	if not ctx then
@@ -760,12 +1135,14 @@ local function ensureCtx(player)
 			tokens = TOKEN_BUCKET_MAX * 0.5,
 			last = os.clock(),
 			cars = {},
+			carCount = 0,
 			sinks = {},
 			zoneSources = {},
 			nextSpawnAt = os.clock() + math.random() * RANDOM_JITTER_SEC,
 
 			-- [DRIVE MODE] per-player session
-			drive = nil, -- { active=bool, loopTask=thread, startPos=Vector3, firstAttach=bool }
+			drive = nil, -- { active=bool, loopTask=thread, startPos=Vector3 }
+			nextDriveToggleAt = 0,
 		}
 		ctxByUserId[uid] = ctx
 	end
@@ -782,19 +1159,24 @@ local function recomputeForPlayer(player)
 	if ctx.suspended then return end
 	refreshOwnRoadZones(player, ctx)
 
-	if originLiveForPlayer(player) then
+	if originLiveForPlayer(player, ctx) then
+		ensureBfsSnapshot(player, ctx)
 		if DISPATCH_MODE == "OriginToSinks" then
-			ctx.sinks = computeSinksForPlayer(player)
+			ctx.sinks = computeSinksForPlayer(player, ctx)
 			ctx.zoneSources = {}
 			dprint(("Player %s sinks=%d (origin->sinks mode)"):format(player.Name, #ctx.sinks))
 		else
-			ctx.zoneSources = computeZoneSourcesForPlayer(player)
+			ctx.zoneSources = computeZoneSourcesForPlayer(player, ctx)
 			ctx.sinks = {}
 			dprint(("Player %s zoneSources=%d (zone->origin mode)"):format(player.Name, #ctx.zoneSources))
 		end
 	else
 		ctx.sinks = {}
 		ctx.zoneSources = {}
+		ctx.bfsOriginKey = nil
+		ctx.bfsDist = nil
+		ctx.bfsParent = nil
+		ctx.coordCache = nil
 	end
 end
 
@@ -814,11 +1196,18 @@ local function ensureSpawnLoop(player)
 	if ctx.spawnLoop then return end
 	ctx.spawnLoop = task.spawn(function()
 		while Players:GetPlayerByUserId(uid) do
-			if not ctx.suspended and os.clock() >= (ctx.nextSpawnAt or 0) then
-				pcall(function() spawnOnce(player, ctx) end)
-				ctx.nextSpawnAt = os.clock() + SPAWN_INTERVAL_SEC + math.random() * RANDOM_JITTER_SEC
+			if ctx.suspended then
+				task.wait(0.5)
+			else
+				local now = os.clock()
+				local nextAt = ctx.nextSpawnAt or now
+				if now >= nextAt then
+					pcall(function() spawnOnce(player, ctx) end)
+					ctx.nextSpawnAt = os.clock() + SPAWN_INTERVAL_SEC + math.random() * RANDOM_JITTER_SEC
+				else
+					task.wait(math.min(nextAt - now, 0.5))
+				end
 			end
-			task.wait(0.2)
 		end
 	end)
 end
@@ -832,27 +1221,61 @@ local function getHRP(player)
 	return char:FindFirstChild("HumanoidRootPart")
 end
 
-local function movedTooMuch(player, ctx)
-	if not ctx.drive or not ctx.drive.startPos then return false end
+local function movedTooMuch(player, driveState)
+	if not driveState or not driveState.startPos then return false end
+	if driveState.moveGraceUntil and os.clock() < driveState.moveGraceUntil then
+		return false
+	end
 	local hrp = getHRP(player)
 	if not hrp then return false end
 	-- 2D distance (XZ) + linear speed check
 	local a = Vector2.new(hrp.Position.X, hrp.Position.Z)
-	local b = Vector2.new(ctx.drive.startPos.X, ctx.drive.startPos.Z)
+	local b = Vector2.new(driveState.startPos.X, driveState.startPos.Z)
 	local dist = (a - b).Magnitude
 	local speed = hrp.AssemblyLinearVelocity.Magnitude
 	return (dist >= DRIVE_MOVE_DIST_STOP) or (speed >= DRIVE_MOVE_SPEED_STOP)
 end
 
-local function stopDriveMode(ctx)
-	if not ctx or not ctx.drive then return end
-	ctx.drive.active = false
-	if ctx.drive.loopTask then
-		task.cancel(ctx.drive.loopTask)
-	end
-	ctx.drive.loopTask = nil
+local function trackDriveCar(driveState, car)
+	if not driveState or not car then return end
+	driveState.cars = driveState.cars or {}
+	driveState.cars[car] = true
+	car:GetPropertyChangedSignal("Parent"):Connect(function()
+		if not car.Parent and driveState.cars then
+			driveState.cars[car] = nil
+		end
+	end)
+end
 
-	-- destroy cars spawned by drive mode
+local function destroyTrackedDriveCars(ctx, driveState, fadeTime)
+	if not driveState or not driveState.cars then return end
+	for car,_ in pairs(driveState.cars) do
+		if ctx and ctx.cars then
+			if ctx.cars[car] then
+				ctx.cars[car] = nil
+				ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
+			end
+		end
+		if car and car.Parent then
+			fadeOutAndDestroy(car, fadeTime or 0.4)
+		end
+		driveState.cars[car] = nil
+	end
+	driveState.cars = {}
+end
+
+local function interruptDriveSession(ctx, driveState)
+	if not driveState then return end
+	driveState.active = false
+	destroyTrackedDriveCars(ctx, driveState, 0.35)
+	if CameraAttachEvt and ctx and ctx.player then
+		CameraAttachEvt:FireClient(ctx.player, nil)
+	end
+end
+
+local function cleanupDriveSession(ctx, driveState)
+	if not ctx then return end
+	destroyTrackedDriveCars(ctx, driveState)
 	if ctx.plot then
 		for _, inst in ipairs(ctx.plot:GetDescendants()) do
 			if inst:IsA("Model")
@@ -863,111 +1286,94 @@ local function stopDriveMode(ctx)
 			end
 		end
 	end
-
-	-- reset client camera immediately using existing event (send nil)
 	if CameraAttachEvt and ctx.player then
 		CameraAttachEvt:FireClient(ctx.player, nil)
 	end
+	if ctx.drive == driveState then
+		ctx.drive = nil
+	end
+end
 
-	-- >>> ADD THESE THREE LINES RIGHT HERE <<<
-	ctx.drive.lockForward = nil
-	ctx.drive.lockReverse = nil
-	ctx.drive.lockTarget  = nil
+local function stopDriveMode(ctx)
+	if not ctx or not ctx.drive then return end
+	local driveState = ctx.drive
+	driveState.active = false
+	if driveState.loopTask then
+		task.cancel(driveState.loopTask)
+	end
+	driveState.loopTask = nil
+	cleanupDriveSession(ctx, driveState)
 end
 
 local function startDriveMode(player, ctx)
-	ctx.drive = ctx.drive or {}
-	ctx.drive.active = true
-	local hrp = getHRP(player)
-	ctx.drive.startPos = hrp and hrp.Position or nil
-	ctx.drive.firstAttach = true
-
-	if ctx.drive.loopTask then
-		task.cancel(ctx.drive.loopTask)
+	if ctx.drive then
+		local prev = ctx.drive
+		if prev.loopTask then
+			task.cancel(prev.loopTask)
+		end
+		cleanupDriveSession(ctx, prev)
 	end
 
-	ctx.drive.loopTask = task.spawn(function()
-		while ctx.drive.active and Players:GetPlayerByUserId(player.UserId) do
+	local hrp = getHRP(player)
+	local driveState = {
+		active = true,
+		startPos = hrp and hrp.Position or nil,
+		loopTask = nil,
+		cars = {},
+		moveGraceUntil = os.clock() + DRIVE_MOVE_GRACE_SEC,
+	}
+	ctx.drive = driveState
+
+	driveState.loopTask = task.spawn(function()
+		while driveState.active and Players:GetPlayerByUserId(player.UserId) do
 			pcall(function() recomputeForPlayer(player) end)
 
-			if not originLiveForPlayer(player) then
+			if not originLiveForPlayer(player, ctx) then
 				task.wait(1.0)
 			else
-				-- Decide which forward path to use this trip
-				local forwardPath, reversePath
+				local forwardPath = computeFarthestOwnedPathFromOrigin(player, ctx)
 
-				-- 1) Reuse previously locked route if still valid
-				if ctx.drive.lockForward and pathIsValid(player, ctx.drive.lockForward) then
-					forwardPath = ctx.drive.lockForward
-					reversePath = ctx.drive.lockReverse  -- reverse we cached earlier
-				else
-					-- 2) Try to rebuild to the same endpoint if we had one
-					if ctx.drive.lockTarget then
-						local rebuilt = bfsToTarget(player, ctx.drive.lockTarget)
-						if rebuilt and #rebuilt >= MIN_PATH_CELLS then
-							forwardPath = rebuilt
-						end
-					end
-					-- 3) Otherwise (or rebuild failed), pick a fresh farthest and lock it
-					if not forwardPath then
-						forwardPath = computeFarthestOwnedPathFromOrigin(player)
-						if forwardPath and #forwardPath >= MIN_PATH_CELLS then
-							-- Lock this target for the rest of the session
-							ctx.drive.lockTarget = forwardPath[#forwardPath]  -- last coord
-						end
-					end
-
-					-- Cache forward & reverse for future trips (if found)
-					if forwardPath then
-						ctx.drive.lockForward = forwardPath
-						local rev = reversedGridPath(forwardPath)
-						ctx.drive.lockReverse = (rev and #rev >= MIN_PATH_CELLS) and rev or nil
-					end
-				end
-
-				-- If we still failed to get a path, wait & retry
 				if not forwardPath or #forwardPath < MIN_PATH_CELLS then
 					task.wait(1.0)
 				else
 					local worldPath = worldPathFor(ctx.plot, forwardPath)
-					local car = spawnCarAlongPath(player, ctx, forwardPath, worldPath, "Farthest")
-					if car then car:SetAttribute("DriveSession", true) end
+					local car = spawnCarAlongPath(player, ctx, forwardPath, worldPath, "Farthest", DRIVE_SPAWN_OVERRIDES)
+					if car then
+						car:SetAttribute("DriveSession", true)
+						trackDriveCar(driveState, car)
+					end
 
-					-- Always attach on forward legs while active
-					if ctx.drive.active and car and car.Parent and CameraAttachEvt then
+					if driveState.active and car and car.Parent and CameraAttachEvt then
 						CameraAttachEvt:FireClient(player, car)
 					end
 
-					-- Mirror leg uses the locked reverse (when we have it)
-					if TWO_WAY_ENABLED and ctx.drive.lockReverse then
+					if TWO_WAY_ENABLED then
 						if TWO_WAY_MODE == "mirror" or (TWO_WAY_MODE == "chance" and math.random() < TWO_WAY_CHANCE) then
-							local revWorld = worldPathFor(ctx.plot, ctx.drive.lockReverse)
-							local revCar = spawnCarAlongPath(player, ctx, ctx.drive.lockReverse, revWorld, "Farthest")
-							if revCar then revCar:SetAttribute("DriveSession", true) end
+							local reversePath = reversedGridPath(forwardPath)
+							if reversePath and #reversePath >= MIN_PATH_CELLS then
+								local revWorld = worldPathFor(ctx.plot, reversePath)
+								local revCar = spawnCarAlongPath(player, ctx, reversePath, revWorld, "Farthest", DRIVE_SPAWN_OVERRIDES)
+								if revCar then
+									revCar:SetAttribute("DriveSession", true)
+									trackDriveCar(driveState, revCar)
+								end
+							end
 						end
 					end
 
-					-- Wait for forward car to finish / cancel conditions
 					local t0 = os.clock()
-					while ctx.drive.active and car and car.Parent and (os.clock() - t0) < CAR_LIFETIME_SEC do
-						if movedTooMuch(player, ctx) then
-							ctx.drive.active = false
-							if CameraAttachEvt and ctx.player then
-								CameraAttachEvt:FireClient(ctx.player, nil)
-							end
+					while driveState.active and car and car.Parent and (os.clock() - t0) < CAR_LIFETIME_SEC do
+						if movedTooMuch(player, driveState) then
+							interruptDriveSession(ctx, driveState)
 							break
 						end
 						task.wait(0.2)
 					end
 
-					-- Small pacing
 					local untilT = os.clock() + DRIVE_RESPAWN_DELAY
-					while ctx.drive.active and os.clock() < untilT do
-						if movedTooMuch(player, ctx) then
-							ctx.drive.active = false
-							if CameraAttachEvt and ctx.player then
-								CameraAttachEvt:FireClient(ctx.player, nil)
-							end
+					while driveState.active and os.clock() < untilT do
+						if movedTooMuch(player, driveState) then
+							interruptDriveSession(ctx, driveState)
 							break
 						end
 						task.wait(0.05)
@@ -975,6 +1381,7 @@ local function startDriveMode(player, ctx)
 				end
 			end
 		end
+		cleanupDriveSession(ctx, driveState)
 	end)
 end
 
@@ -1001,6 +1408,18 @@ FireSupportEvt.Event:Connect(function(player)
 	fireSupport[player.UserId] = true
 	print(("[UnifiedTraffic] Fire support ENABLED for %s."):format(player.Name))
 end)
+PoliceSupportEvt.Event:Connect(function(player)
+	policeSupport[player.UserId] = true
+	print(("[UnifiedTraffic] Police support ENABLED for %s."):format(player.Name))
+end)
+HealthSupportEvt.Event:Connect(function(player)
+	healthSupport[player.UserId] = true
+	print(("[UnifiedTraffic] Health support ENABLED for %s."):format(player.Name))
+end)
+TrashSupportEvt.Event:Connect(function(player)
+	trashSupport[player.UserId] = true
+	print(("[UnifiedTraffic] Trash support ENABLED for %s."):format(player.Name))
+end)
 BusSupportUnlocked.Event:Connect(function(player)
 	busSupport[player.UserId] = true
 	print(("[UnifiedTraffic] Bus support ENABLED for %s."):format(player.Name))
@@ -1019,15 +1438,21 @@ end)
 --   2nd click -> disable loop (kill drive cars + reset camera)
 SpawnCarToFarthestEvt.OnServerEvent:Connect(function(player)
 	local ctx = ensureCtx(player)
+	local now = os.clock()
+	if ctx.nextDriveToggleAt and now < ctx.nextDriveToggleAt then
+		return
+	end
 
 	-- If not active, turn ON and start loop, attach camera on first leg
 	if not ctx.drive or not ctx.drive.active then
+		ctx.nextDriveToggleAt = now + DRIVE_TOGGLE_DEBOUNCE
 		startDriveMode(player, ctx)
 		print(("[UnifiedTraffic] DriveMode ENABLED for %s"):format(player.Name))
 		return
 	end
 
 	-- If already active, turn OFF (hard stop)
+	ctx.nextDriveToggleAt = now + DRIVE_TOGGLE_DEBOUNCE
 	stopDriveMode(ctx)
 	print(("[UnifiedTraffic] DriveMode DISABLED for %s"):format(player.Name))
 end)
@@ -1075,6 +1500,9 @@ Players.PlayerRemoving:Connect(function(plr)
 		ctxByUserId[uid] = nil
 	end
 	fireSupport[uid] = nil
+	policeSupport[uid] = nil
+	healthSupport[uid] = nil
+	trashSupport[uid] = nil
 	busSupport[uid]  = nil
 end)
 
@@ -1093,5 +1521,5 @@ task.spawn(function()
 	end
 end)
 
-print(("[UnifiedTraffic] online – DispatchMode=%s; origin=(%d,%d) – Bus/Fire variants where supported")
+print(("[UnifiedTraffic] online - DispatchMode=%s; origin=(%d,%d) - Bus/Service variants (Fire/Police/Health/Trash) where supported")
 	:format(DISPATCH_MODE, SOURCE_COORD.x, SOURCE_COORD.z))

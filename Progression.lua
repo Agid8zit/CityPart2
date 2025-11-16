@@ -80,6 +80,24 @@ for lvl, list in pairs(Config.unlocksByLevel) do
 end
 setmetatable(minLevel, { __index = function() return 0 end })
 
+local function normalizeFeatureName(featureName)
+	if type(featureName) == "string" and string.sub(featureName, 1, 5) == "Flag:" then
+		return "Flags"
+	end
+	return featureName
+end
+
+local function sanitizeRequiredLevel(level)
+	level = tonumber(level)
+	if not level or level ~= level or level == math.huge or level == -math.huge then
+		return 0
+	end
+	if level < 0 then
+		return 0
+	end
+	return math.floor(level)
+end
+
 ----------------------------------------------------------------
 -- 4) LEVEL CALCS (0-based)
 ----------------------------------------------------------------
@@ -108,13 +126,16 @@ end
 -- 5) QUERIES
 ----------------------------------------------------------------
 function Progression.getRequiredLevel(featureName)
-	return minLevel[featureName]
+	local normalized = normalizeFeatureName(featureName)
+	return sanitizeRequiredLevel(minLevel[normalized])
 end
 
 function Progression.playerHasUnlock(player, featureName)
+	local requiredLevel = Progression.getRequiredLevel(featureName)
 	local SaveData = PlayerDataService.GetSaveFileData(player)
 	if not SaveData then return false end
-	return (SaveData.cityLevel or 0) >= minLevel[featureName]
+	local cityLevel = tonumber(SaveData.cityLevel) or 0
+	return cityLevel >= requiredLevel
 end
 
 function Progression.getAllUnlockStatus(player)

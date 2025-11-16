@@ -1,10 +1,11 @@
-print("[Income] Module loaded (incremental)")
+print("[Income] Module loaded (sharded + scheduled)")
 
 --// Services
 local Players        = game:GetService("Players")
 local RunService     = game:GetService("RunService")
 local S3             = game:GetService("ServerScriptService")
 local RS             = game:GetService("ReplicatedStorage")
+local RunServiceScheduler = require(RS.Scripts.RunServiceScheduler)
 
 --// Server modules
 local Build          = S3:WaitForChild("Build")
@@ -22,7 +23,7 @@ local ZoneRequirementsChecker = require(ZoneMgr:WaitForChild("ZoneRequirementsCh
 local Events          = RS:WaitForChild("Events")
 local BindableEvents  = Events:WaitForChild("BindableEvents")
 local StatsChanged    = BindableEvents:WaitForChild("StatsChanged")
-local Balancing 	  = RS:WaitForChild("Balancing")
+local Balancing       = RS:WaitForChild("Balancing")
 
 local Balance = require(Balancing:WaitForChild("BalanceEconomy"))
 local PlayerDataInterfaceService = require(game.ServerScriptService.Services.PlayerDataInterfaceService)
@@ -30,20 +31,39 @@ local PlayerDataInterfaceService = require(game.ServerScriptService.Services.Pla
 --// =========================
 --// Configuration
 --// =========================
-local TICK_INTERVAL = 5                -- seconds between income payouts
-local CACHE_SWEEP_TARGET = 3.0         -- seconds to cover a player's whole tile queue once
-local WORKLIST_REFRESH_INTERVAL = 30   -- seconds between passive worklist refresh (if no events)
-local MIN_ITEMS_PER_STEP = 10          -- per-player minimum tile computations per Heartbeat
-local MAX_ITEMS_PER_STEP = 1000        -- guardrail per-player maximum per Heartbeat (avoid spikes)
 
---// =========================
---// Internal state
---// =========================
-local lastPayoutTick = 0
-local lastWorklistRefresh = 0
+-- How often the authoritative payout applies (seconds)
+local TICK_INTERVAL = 5
 
+-- Aim to sweep each player's entire tile queue in this time (seconds)
+local CACHE_SWEEP_TARGET = 3.0
+
+-- Passive fallback worklist refresh if no events are fired (seconds)
+local WORKLIST_REFRESH_INTERVAL = 30
+
+-- Per-player min/max tiles computed when that player is processed
+local MIN_ITEMS_PER_STEP = 10
+local MAX_ITEMS_PER_STEP = 1000
+
+-- -------------------------
+-- Scheduler / budgeting
+-- -------------------------
+-- Target: visit each player roughly this often (seconds).
+-- The tile processor uses actual per-player dt, so this is a soft target.
+local PLAYER_VISIT_TARGET_SEC = 1.0
+
+-- Hard cap on CPU time spent inside Heartbeat’s per-frame work (ms)
+local HEARTBEAT_BUDGET_MS = 2.5
+
+-- When doing long, low-frequency loops (payout / rebuild),
+-- yield every this many ms to avoid long stalls
+local LONG_TASK_CHUNK_MS = 4.0
+
+-- =========================
+-- Internal state
+-- =========================
 -- Per-player rolling state
--- playerWork[playerId] = { queue = { {zoneId, mode, x, z, key}... }, idx = 1, keySet = { [key]=true } }
+-- playerWork[playerId] = { queue = {...}, idx = 1, keySet = { [key]=true }, lastProcessedAt = time() }
 local playerWork = {}
 
 -- Caches
@@ -53,10 +73,18 @@ local tileIncomeCache = {}
 local tileZoneIndex = {}
 -- zoneSums[playerId][zoneId] = sum of tile incomes in that zone (integer)
 local zoneSums = {}
--- playerBaseIncome[playerId] = sum of all zoneSums (integer), *before* coverage/rate and *before* x2 Money?  (we apply x2 later to match your semantics)
+-- playerBaseIncome[playerId] = sum of all zoneSums (integer) before coverage/rate and pre x2 Money
 local playerBaseIncome = {}
--- what you already had; exposed via getIncomePerSecond
-local playerIncomeCache = {} -- [userId] = pay awarded per tick (integer)
+-- per-tick payout cache (authoritative pay last applied)
+local playerIncomeCache = {} -- [userId] = pay per tick (integer)
+
+-- Active player roster for round-robin scheduling
+local activePlayers = {}       -- array of Player
+local activeIndexByUserId = {} -- [userId] = index in activePlayers
+local rrIndex = 1              -- round-robin cursor (1-based)
+
+-- Debounced rebuild flags (optional coalescing when many events fire)
+local pendingRebuild = {}      -- [userId] = true
 
 -- =========================
 -- Helpers
@@ -89,11 +117,15 @@ local function computeSingleTileIncome(player, mode, zoneId, gx, gz)
 end
 
 local function ensurePlayerTables(playerId)
-	tileIncomeCache[playerId] = tileIncomeCache[playerId] or {}
-	zoneSums[playerId]        = zoneSums[playerId] or {}
+	tileIncomeCache[playerId]  = tileIncomeCache[playerId] or {}
+	zoneSums[playerId]         = zoneSums[playerId] or {}
 	playerBaseIncome[playerId] = playerBaseIncome[playerId] or 0
-	tileZoneIndex[playerId]   = tileZoneIndex[playerId] or {}
-	playerWork[playerId]      = playerWork[playerId] or { queue = {}, idx = 1, keySet = {} }
+	tileZoneIndex[playerId]    = tileZoneIndex[playerId] or {}
+	if not playerWork[playerId] then
+		playerWork[playerId] = { queue = {}, idx = 1, keySet = {}, lastProcessedAt = time() }
+	else
+		playerWork[playerId].lastProcessedAt = playerWork[playerId].lastProcessedAt or time()
+	end
 end
 
 local function clearPlayerState(playerId)
@@ -103,6 +135,46 @@ local function clearPlayerState(playerId)
 	playerBaseIncome[playerId] = nil
 	tileZoneIndex[playerId] = nil
 	playerIncomeCache[playerId] = nil
+	pendingRebuild[playerId] = nil
+end
+
+-- Active roster helpers
+local function addActivePlayer(player)
+	local pid = player.UserId
+	if activeIndexByUserId[pid] then return end
+	table.insert(activePlayers, player)
+	activeIndexByUserId[pid] = #activePlayers
+	ensurePlayerTables(pid)
+	-- Build initial worklist a tiny bit later to allow upstream systems to initialize
+	task.defer(function()
+		if player.Parent then
+			-- Queue a rebuild to coalesce with other joins/changes
+			pendingRebuild[pid] = true
+		end
+	end)
+end
+
+local function removeActivePlayer(player)
+	local pid = player.UserId
+	local idx = activeIndexByUserId[pid]
+	if not idx then return end
+
+	-- compact remove
+	local lastIndex = #activePlayers
+	local lastPlayer = activePlayers[lastIndex]
+	activePlayers[idx] = lastPlayer
+	activePlayers[lastIndex] = nil
+	activeIndexByUserId[pid] = nil
+	if lastPlayer then
+		activeIndexByUserId[lastPlayer.UserId] = idx
+	end
+
+	-- keep rrIndex in range
+	if rrIndex > #activePlayers then
+		rrIndex = 1
+	end
+
+	clearPlayerState(pid)
 end
 
 -- Build / refresh the tile worklist (cheap compared to computing income)
@@ -114,7 +186,7 @@ local function rebuildWorklistForPlayer(player)
 	local newQueue  = {}
 	local newKeySet = {}
 
-	-- We iterate zones using your stats table keys because it's already per-player scoped
+	-- per-player stats table holds the zones we care about
 	local statsByZone = DistrictStatsModule.getStatsForPlayer(playerId)
 	for zoneId, _ in pairs(statsByZone) do
 		local zone = ZoneTracker.getZoneById(player, zoneId)
@@ -122,13 +194,13 @@ local function rebuildWorklistForPlayer(player)
 			for _, coord in ipairs(zone.gridList) do
 				local key = tileKey(zoneId, coord.x, coord.z)
 				newKeySet[key] = true
-				table.insert(newQueue, {
+				newQueue[#newQueue + 1] = {
 					zoneId = zoneId,
 					mode = zone.mode,
 					x = coord.x,
 					z = coord.z,
 					key = key,
-				})
+				}
 			end
 		end
 	end
@@ -141,7 +213,6 @@ local function rebuildWorklistForPlayer(player)
 
 	for key, oldVal in pairs(tCache) do
 		if not newKeySet[key] then
-			-- This tile vanished; subtract from sums
 			local oldIncome = oldVal or 0
 			local zId = zIndex[key]
 			if zId ~= nil then
@@ -164,16 +235,17 @@ local function rebuildWorklistForPlayer(player)
 end
 
 -- Process a bounded number of tiles for a given player
-local function processTilesForPlayer(player, dt)
+local function processTilesForPlayer(player, dtForPlayer)
 	local playerId = player.UserId
 	local work = playerWork[playerId]
 	if not work or #work.queue == 0 then
+		work.lastProcessedAt = time()
 		return
 	end
 
 	-- target to sweep the whole queue in CACHE_SWEEP_TARGET seconds
 	local targetPerSecond = math.max(#work.queue / CACHE_SWEEP_TARGET, MIN_ITEMS_PER_STEP)
-	local itemsThisStep = math.floor(targetPerSecond * math.max(dt, 1/60))
+	local itemsThisStep = math.floor(targetPerSecond * math.max(dtForPlayer, 1/60))
 	itemsThisStep = math.max(itemsThisStep, MIN_ITEMS_PER_STEP)
 	itemsThisStep = math.min(itemsThisStep, MAX_ITEMS_PER_STEP, #work.queue)
 
@@ -184,10 +256,9 @@ local function processTilesForPlayer(player, dt)
 	local baseSum = playerBaseIncome[playerId] or 0
 	local idx = work.idx
 
-	for i = 1, itemsThisStep do
+	for _ = 1, itemsThisStep do
 		local item = work.queue[idx]
 		if not item then
-			-- Should not happen, but guard
 			idx = 1
 			item = work.queue[idx]
 			if not item then break end
@@ -197,7 +268,6 @@ local function processTilesForPlayer(player, dt)
 
 		local oldIncome = tCache[item.key]
 		if oldIncome ~= newIncome then
-			-- update zone and player sums
 			local delta = (newIncome or 0) - (oldIncome or 0)
 			zSums[item.zoneId] = (zSums[item.zoneId] or 0) + delta
 			baseSum = baseSum + delta
@@ -211,9 +281,10 @@ local function processTilesForPlayer(player, dt)
 
 	work.idx = idx
 	playerBaseIncome[playerId] = baseSum
+	work.lastProcessedAt = time()
 end
 
--- Coverage computation preserved from your original logic
+-- Coverage computation preserved
 local function computeCoverage(player)
 	local totalsReq  = DistrictStatsModule.getTotalsForPlayer(player)
 	local produced   = ZoneRequirementsChecker.getEffectiveProduction(player)
@@ -252,10 +323,16 @@ local function calculateZoneIncome_exact(player, zoneData)
 end
 
 -- =========================
--- Income payout (authoritative)
+-- Income payout (authoritative, chunked)
 -- =========================
-local function doPayout()
-	for _, player in ipairs(Players:GetPlayers()) do
+local function doPayoutChunked()
+	local startCpu = os.clock()
+	for i = 1, #activePlayers do
+		local player = activePlayers[i]
+		if not player or not player.Parent then
+			continue
+		end
+
 		local SaveData = PlayerDataService.GetSaveFileData(player)
 		if not SaveData then
 			continue
@@ -264,7 +341,7 @@ local function doPayout()
 		local playerId = player.UserId
 		ensurePlayerTables(playerId)
 
-		-- 1) Get base income from cache (sum of per-tile rounded incomes)
+		-- 1) Base income from cache (sum of per-tile rounded incomes)
 		local baseTotal = playerBaseIncome[playerId] or 0
 
 		-- 2) Gamepass
@@ -284,24 +361,29 @@ local function doPayout()
 		-- 4) Apply and 5) notify
 		EconomyService.adjustBalance(player, pay)
 		StatsChanged:Fire(player)
+
+		-- Yield cooperatively under long-task budget
+		if (os.clock() - startCpu) * 1000.0 >= LONG_TASK_CHUNK_MS then
+			startCpu = os.clock()
+			task.wait() -- yield to the scheduler
+		end
 	end
 end
 
 -- =========================
 -- Event hooks (optional but recommended)
 -- =========================
--- If your game broadcasts build/zone changes, hook here so the worklist updates immediately
 local function tryConnectBuildEvents()
-	local BuildChanged = BindableEvents:FindFirstChild("BuildChanged")  -- e.g., payload: {player, zoneId, action, coords}
+	local BuildChanged = BindableEvents:FindFirstChild("BuildChanged")  -- payload: {player, ...}
 	if BuildChanged and BuildChanged.Event then
 		BuildChanged.Event:Connect(function(player)
 			if player and player.UserId then
-				rebuildWorklistForPlayer(player)
+				pendingRebuild[player.UserId] = true
 			end
 		end)
 	end
 
-	local ZoneWealthChanged = BindableEvents:FindFirstChild("ZoneWealthChanged") -- e.g., {player, zoneId, x, z}
+	local ZoneWealthChanged = BindableEvents:FindFirstChild("ZoneWealthChanged") -- {player, zoneId, x, z}
 	if ZoneWealthChanged and ZoneWealthChanged.Event then
 		ZoneWealthChanged.Event:Connect(function(player, zoneId, gx, gz)
 			-- Fast-path: push that one tile to the front to update ASAP
@@ -315,8 +397,8 @@ local function tryConnectBuildEvents()
 						-- Put it next in line by moving idx back one step (cheap heuristic)
 						work.idx = math.max(1, work.idx - 1)
 					else
-						-- If unknown, trigger a refresh (layout changed)
-						rebuildWorklistForPlayer(player)
+						-- If unknown, trigger a refresh (layout likely changed)
+						pendingRebuild[pId] = true
 					end
 				end
 			end
@@ -325,52 +407,125 @@ local function tryConnectBuildEvents()
 end
 
 -- =========================
--- Heartbeat loop
+-- Heartbeat: round-robin per-player sharded processing
 -- =========================
-RunService.Heartbeat:Connect(function(dt)
-	-- 1) Continuous incremental processing
-	for _, player in ipairs(Players:GetPlayers()) do
-		local SaveData = PlayerDataService.GetSaveFileData(player)
-		if SaveData then
-			ensurePlayerTables(player.UserId)
-			processTilesForPlayer(player, dt)
-		end
-	end
+RunServiceScheduler.onHeartbeat(function(dt)
+	-- Nothing to do if no active players
+	local n = #activePlayers
+	if n == 0 then return end
 
-	-- 2) Periodic payout
-	lastPayoutTick += dt
-	if lastPayoutTick >= TICK_INTERVAL then
-		doPayout()
-		lastPayoutTick = 0
-	end
+	local frameStart = os.clock()
 
-	-- 3) Low-frequency passive worklist refresh (only if you don't have events)
-	lastWorklistRefresh += dt
-	if lastWorklistRefresh >= WORKLIST_REFRESH_INTERVAL then
-		for _, player in ipairs(Players:GetPlayers()) do
+	-- Derive how many players to visit this frame from the target period
+	local framesToSweepAll = math.max(1, math.floor(PLAYER_VISIT_TARGET_SEC / math.max(dt, 1/120)))
+	local playersThisFrame = math.max(1, math.ceil(n / framesToSweepAll))
+
+	-- Round-robin over the activePlayers ring
+	for _ = 1, playersThisFrame do
+		if n == 0 then break end
+		if rrIndex > n then rrIndex = 1 end
+
+		local player = activePlayers[rrIndex]
+		rrIndex = rrIndex + 1
+
+		if player and player.Parent then
 			local SaveData = PlayerDataService.GetSaveFileData(player)
 			if SaveData then
-				rebuildWorklistForPlayer(player)
+				local pid = player.UserId
+				ensurePlayerTables(pid)
+				local work = playerWork[pid]
+				local now = time()
+				local dtForPlayer = now - (work.lastProcessedAt or now)
+				-- Bound dtForPlayer to avoid massive bursts if a player was idle long
+				if dtForPlayer > 2.0 then dtForPlayer = 2.0 end
+				processTilesForPlayer(player, dtForPlayer)
 			end
 		end
-		lastWorklistRefresh = 0
+
+		-- Respect per-frame CPU budget
+		if (os.clock() - frameStart) * 1000.0 >= HEARTBEAT_BUDGET_MS then
+			break
+		end
 	end
 end)
+
+-- =========================
+-- Scheduled loops (off-Heartbeat)
+-- =========================
+local function startPayoutLoop()
+	task.spawn(function()
+		while true do
+			task.wait(TICK_INTERVAL)
+			doPayoutChunked()
+		end
+	end)
+end
+
+local function startPassiveWorklistRefreshLoop()
+	task.spawn(function()
+		while true do
+			task.wait(WORKLIST_REFRESH_INTERVAL)
+			-- Chunked rebuild across players to avoid stalls
+			local startCpu = os.clock()
+			for i = 1, #activePlayers do
+				local player = activePlayers[i]
+				if player and player.Parent then
+					local SaveData = PlayerDataService.GetSaveFileData(player)
+					if SaveData then
+						rebuildWorklistForPlayer(player)
+					end
+				end
+				if (os.clock() - startCpu) * 1000.0 >= LONG_TASK_CHUNK_MS then
+					startCpu = os.clock()
+					task.wait()
+				end
+			end
+		end
+	end)
+end
+
+-- Coalesced flush for pending rebuild requests from events
+local function startRebuildFlushLoop()
+	task.spawn(function()
+		while true do
+			task.wait(0.2) -- small debounce window to batch bursts
+			local startCpu = os.clock()
+			for pid, flagged in pairs(pendingRebuild) do
+				if flagged then
+					pendingRebuild[pid] = nil
+					-- Only rebuild if the player is still around
+					local idx = activeIndexByUserId[pid]
+					if idx then
+						local player = activePlayers[idx]
+						if player and player.Parent then
+							rebuildWorklistForPlayer(player)
+						end
+					end
+				end
+				if (os.clock() - startCpu) * 1000.0 >= LONG_TASK_CHUNK_MS then
+					startCpu = os.clock()
+					task.wait()
+				end
+			end
+		end
+	end)
+end
 
 -- =========================
 -- Player lifecycle
 -- =========================
 Players.PlayerAdded:Connect(function(player)
-	ensurePlayerTables(player.UserId)
-	-- Build initial worklist a tiny bit later to allow upstream systems to initialize, if needed
-	task.defer(function()
-		rebuildWorklistForPlayer(player)
-	end)
+	addActivePlayer(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	clearPlayerState(player.UserId)
+	removeActivePlayer(player)
 end)
+
+-- Seed current players (in case the module loads after some have joined)
+for _, p in ipairs(Players:GetPlayers()) do
+	addActivePlayer(p)
+end
 
 -- =========================
 -- Public API
@@ -409,7 +564,9 @@ end
 
 -- ===== Optional ops/debug helpers =====
 function Income.forceRebuildQueue(player)
-	rebuildWorklistForPlayer(player)
+	if player and player.UserId then
+		pendingRebuild[player.UserId] = true
+	end
 end
 
 function Income.forceFullRecalcForPlayer(player)
@@ -423,9 +580,8 @@ function Income.forceFullRecalcForPlayer(player)
 	local tCache = tileIncomeCache[playerId]
 	local zSums  = zoneSums[playerId]
 	local zIndex = tileZoneIndex[playerId]
-	local baseSum = 0
 
-	-- Clear existing caches
+	-- Clear existing caches (mutate in place)
 	for k in pairs(tCache) do tCache[k] = nil end
 	for z in pairs(zSums) do zSums[z] = 0 end
 	for k in pairs(zIndex) do zIndex[k] = nil end
@@ -448,7 +604,7 @@ function Income.forceFullRecalcForPlayer(player)
 	end
 
 	playerBaseIncome[playerId] = total
-	rebuildWorklistForPlayer(player)
+	pendingRebuild[playerId] = true
 end
 
 function Income.debugGetPlayerCacheStats(player)
@@ -456,15 +612,20 @@ function Income.debugGetPlayerCacheStats(player)
 	local work  = playerWork[pid]
 	local tiles = tileIncomeCache[pid]
 	local zones = zoneSums[pid]
+	local function count(t) local c=0; for _ in pairs(t or {}) do c+=1 end; return c end
 	return {
 		queueSize = work and #work.queue or 0,
-		tileCacheSize = tiles and (function(t) local c=0; for _ in pairs(t) do c+=1 end; return c end)(tiles) or 0,
-		zoneCount = zones and (function(t) local c=0; for _ in pairs(t) do c+=1 end; return c end)(zones) or 0,
+		tileCacheSize = count(tiles),
+		zoneCount = count(zones),
 		baseIncome = playerBaseIncome[pid] or 0,
+		lastProcessedAgo = work and (time() - (work.lastProcessedAt or time())) or nil,
 	}
 end
 
--- Initialize optional event hooks
+-- Initialize optional event hooks and scheduled loops
 tryConnectBuildEvents()
+startRebuildFlushLoop()
+startPassiveWorklistRefreshLoop()
+startPayoutLoop()
 
 return Income

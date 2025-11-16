@@ -3,10 +3,12 @@ local Events = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents = Events:WaitForChild("BindableEvents")
 local linesPlacedEvent   = BindableEvents:WaitForChild("LinesPlaced")
 local linesRemovedEvent  = BindableEvents:WaitForChild("LinesRemoved")
+local Wigw8mPlacedEvent  = BindableEvents:WaitForChild("Wigw8mPlaced")
 
 local BuildingGeneratorModule = require(script.Parent:WaitForChild("BuildingGenerator"))
 local ZoneTrackerModule = require(script.Parent.Parent.Parent.Parent.ZoneManager:WaitForChild("ZoneTracker"))
 local S3 = game:GetService("ServerScriptService")
+local LayerManagerModule = require(S3.Build:WaitForChild("LayerManager"))
 local CC = S3.Build.Zones.CoreConcepts.PowerGen
 local PowerLinePath = require(CC.PowerLinePath)
 local PowerGeneratorModule = require(CC.PowerGenerator)
@@ -114,6 +116,169 @@ local function _chooseBestBuildingForPowerZone(player, zoneId, powerZoneId)
 		end
 	end
 	return (best.building and best) or nil
+end
+
+-- Pad-pole linking requests may arrive while a building zone is still populating.
+-- Track them per-player/zone so we can process them once the zone finishes.
+local pendingPadPoleRequests = {} -- [userId] = { [zoneId] = { [powerZoneId] = true } }
+
+local function _queuePadPoleRequest(player, zoneId, powerZoneId)
+	if not (player and zoneId and powerZoneId) then return end
+	local uid = player.UserId
+	local perPlayer = pendingPadPoleRequests[uid]
+	if not perPlayer then
+		perPlayer = {}
+		pendingPadPoleRequests[uid] = perPlayer
+	end
+	local perZone = perPlayer[zoneId]
+	if not perZone then
+		perZone = {}
+		perPlayer[zoneId] = perZone
+	end
+	perZone[powerZoneId] = true
+end
+
+local function _takePadPoleRequests(player, zoneId)
+	if not (player and zoneId) then return nil end
+	local uid = player.UserId
+	local perPlayer = pendingPadPoleRequests[uid]
+	if not perPlayer then return nil end
+	local perZone = perPlayer[zoneId]
+	if not perZone then return nil end
+	perPlayer[zoneId] = nil
+	if not next(perPlayer) then
+		pendingPadPoleRequests[uid] = nil
+	end
+	return perZone
+end
+
+local function _spawnPadPoleForPowerZone(player, zoneId, powerZoneId)
+	local pick = _chooseBestBuildingForPowerZone(player, zoneId, powerZoneId)
+	if not (pick and pick.building) then return false end
+	BuildingGeneratorModule.spawnPadPowerPoles(pick.building, nil, {
+		ZoneId          = zoneId,
+		GridX           = pick.building:GetAttribute("GridX"),
+		GridZ           = pick.building:GetAttribute("GridZ"),
+		PowerLineZoneId = powerZoneId,
+		ForceSpawn      = true,
+		TargetWorldPos  = pick.targetWorld,
+	})
+	return true
+end
+
+local function _processPadPoleRequestSet(player, zoneId, requestSet)
+	if not requestSet then return end
+	for powerZoneId in pairs(requestSet) do
+		_spawnPadPoleForPowerZone(player, zoneId, powerZoneId)
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	if not player then return end
+	pendingPadPoleRequests[player.UserId] = nil
+end)
+
+-- Road billboard suppression helpers
+local BILLBOARD_NAMES = {
+	Billboard = true,
+	BillboardStanding = true,
+}
+local REMOVED_BILLBOARD_TYPE = "RoadBillboard"
+
+local function _getInstanceBoundingBox(inst)
+	if not inst then return nil, nil end
+	if inst:IsA("Model") then
+		local cf, size = inst:GetBoundingBox()
+		return cf, size
+	elseif inst:IsA("BasePart") then
+		return inst.CFrame, inst.Size
+	end
+	return nil, nil
+end
+
+local function _overlapXZ(cfA, sizeA, cfB, sizeB)
+	if not (cfA and sizeA and cfB and sizeB) then return false end
+	local halfA = sizeA * 0.5
+	local halfB = sizeB * 0.5
+	local posA, posB = cfA.Position, cfB.Position
+	if math.abs(posA.X - posB.X) > (halfA.X + halfB.X) then return false end
+	if math.abs(posA.Z - posB.Z) > (halfA.Z + halfB.Z) then return false end
+	return true
+end
+
+local function _forEachRoadBillboard(player, callback)
+	if type(callback) ~= "function" or not player then return end
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+	if not plot then return end
+	local roads = plot:FindFirstChild("Roads")
+	if not roads then return end
+	for _, zoneFolder in ipairs(roads:GetChildren()) do
+		if zoneFolder:IsA("Folder") then
+			for _, inst in ipairs(zoneFolder:GetChildren()) do
+				if BILLBOARD_NAMES[inst.Name] and inst:GetAttribute("IsRoadDecoration") == true then
+					callback(inst, zoneFolder)
+				end
+			end
+		end
+	end
+end
+
+local function _recordAndRemoveBillboard(ownerZoneId, inst)
+	if not (ownerZoneId and inst) then return end
+	local cf = select(1, _getInstanceBoundingBox(inst))
+	local record = {
+		instanceClone  = inst:Clone(),
+		parentName     = inst.Parent and inst.Parent.Name or nil,
+		originalParent = inst.Parent,
+		cframe         = cf,
+		gridX          = inst:GetAttribute("GridX"),
+		gridZ          = inst:GetAttribute("GridZ"),
+		zoneId         = inst:GetAttribute("ZoneId") or (inst.Parent and inst.Parent.Name),
+	}
+	LayerManagerModule.storeRemovedObject(REMOVED_BILLBOARD_TYPE, ownerZoneId, record)
+	inst:Destroy()
+end
+
+local function _stripBillboardsInBox(player, ownerZoneId, boxCF, boxSize)
+	if not (boxCF and boxSize) then return end
+	_forEachRoadBillboard(player, function(inst)
+		local cf, size = _getInstanceBoundingBox(inst)
+		if _overlapXZ(boxCF, boxSize, cf, size) then
+			_recordAndRemoveBillboard(ownerZoneId, inst)
+		end
+	end)
+end
+
+local function _zoneBoundsToBox(player, gridList)
+	if not (player and type(gridList) == "table" and #gridList > 0) then return nil, nil end
+	local plot = workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+	if not plot then return nil, nil end
+	local gb, terrains = _getGlobalBoundsForPlot(plot)
+	local minX, maxX, minZ, maxZ
+	for _, coord in ipairs(gridList) do
+		local gx, gz = coord.x, coord.z
+		if typeof(gx) == "number" and typeof(gz) == "number" then
+			local wx, _, wz = GridUtils.globalGridToWorldPosition(gx, gz, gb, terrains)
+			minX = minX and math.min(minX, wx) or wx
+			maxX = maxX and math.max(maxX, wx) or wx
+			minZ = minZ and math.min(minZ, wz) or wz
+			maxZ = maxZ and math.max(maxZ, wz) or wz
+		end
+	end
+	if not minX then return nil, nil end
+	local cellSize = (GridConfig.GRID_SIZE or 1)
+	local sizeX = math.max(cellSize, (maxX - minX) + cellSize)
+	local sizeZ = math.max(cellSize, (maxZ - minZ) + cellSize)
+	local centreX = (minX + maxX) * 0.5
+	local centreZ = (minZ + maxZ) * 0.5
+	return CFrame.new(centreX, 0, centreZ), Vector3.new(sizeX, 50, sizeZ)
+end
+
+local function _stripBillboardsForZone(player, zoneId, gridList)
+	local cf, size = _zoneBoundsToBox(player, gridList)
+	if cf and size then
+		_stripBillboardsInBox(player, zoneId, cf, size)
+	end
 end
 
 -- List of Building Zones (to avoid crossover with roads, utilities, etc.)
@@ -302,6 +467,8 @@ end
 local zonePopulatedEvent = BindableEvents:WaitForChild("ZonePopulated")
 
 zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
+	-- Drain any deferred pad-pole work now; we'll process it once the zone is ready.
+	local deferredRequests = _takePadPoleRequests(player, zoneId)
 	-- Look up the zone to know its mode and gridList
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
 	if not z then return end
@@ -336,7 +503,10 @@ zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
 		end
 	end
 
-	if not bestChoice then return end
+	if not bestChoice then
+		_processPadPoleRequestSet(player, zoneId, deferredRequests)
+		return
+	end
 
 	-- Force a guaranteed, directed spawn on that building
 	BuildingGeneratorModule.spawnPadPowerPoles(bestChoice.building, nil, {
@@ -347,6 +517,8 @@ zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
 		ForceSpawn      = true,                   -- << guarantee 100%
 		TargetWorldPos  = bestChoice.targetWorld, -- << choose corner nearest to the line
 	})
+
+	_processPadPoleRequestSet(player, zoneId, deferredRequests)
 end)
 
 local function _hasZoneOfModeAt(player, coord, wantMode)
@@ -380,6 +552,7 @@ zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predefin
 	end
 
 	if isBuildingMode(mode) then
+		_stripBillboardsForZone(player, zoneId, gridList or {})
 		PowerGeneratorModule.suppressPolesOnGridList(player, zoneId, gridList)
 		local zoneData = ZoneTrackerModule.getZoneById(player, zoneId)
 		if not zoneData then
@@ -435,23 +608,31 @@ linesPlacedEvent.Event:Connect(function(player, powerZoneId)
 
 	-- 2) For each building zone touched by this power line, spawn exactly one pad‑pole on its nearest building
 	for bldZoneId, _ in pairs(touchedBldZoneIds) do
-		local pick = _chooseBestBuildingForPowerZone(player, bldZoneId, powerZoneId)
-		if pick and pick.building then
-			BuildingGeneratorModule.spawnPadPowerPoles(pick.building, nil, {
-				ZoneId          = bldZoneId,
-				GridX           = pick.building:GetAttribute("GridX"),
-				GridZ           = pick.building:GetAttribute("GridZ"),
-				PowerLineZoneId = powerZoneId,     -- ownership
-				ForceSpawn      = true,            -- << guarantee 100%
-				TargetWorldPos  = pick.targetWorld -- << choose corner nearest to this power line
-			})
+		if ZoneTrackerModule.isZonePopulating(player, bldZoneId) then
+			_queuePadPoleRequest(player, bldZoneId, powerZoneId)
+		else
+			_spawnPadPoleForPowerZone(player, bldZoneId, powerZoneId)
 		end
+	end
+end)
+
+Wigw8mPlacedEvent.Event:Connect(function(player, zoneId, payload)
+	if not (player and type(zoneId) == "string") then return end
+	if type(payload) ~= "table" then return end
+	local mode = payload.mode
+	if not (mode and isBuildingMode(mode)) then return end
+	local building = payload.building
+	if not building then return end
+	local cf, size = _getInstanceBoundingBox(building)
+	if cf and size then
+		_stripBillboardsInBox(player, zoneId, cf, size)
 	end
 end)
 
 -- When a zone is removed, only remove buildings if it's truly a building zone.
 zoneRemovedEvent.Event:Connect(function(player, zoneId, mode, gridList)
 	if isBuildingMode(mode) then
+		_takePadPoleRequests(player, zoneId)
 		-- Use the snapshot provided by ZoneTracker (this is the ONLY reliable mask)
 		local removedGrid = gridList or {}
 
@@ -462,6 +643,8 @@ zoneRemovedEvent.Event:Connect(function(player, zoneId, mode, gridList)
 
 		-- Recreate power poles on just-freed cells that lie on recorded power paths
 		PowerGeneratorModule.ensurePolesNearGridList(player, removedGrid)
+
+		LayerManagerModule.restoreRemovedObjects(player, zoneId, REMOVED_BILLBOARD_TYPE, "Roads")
 	end
 end)
 

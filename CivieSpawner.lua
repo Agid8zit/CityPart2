@@ -5,6 +5,7 @@ local Workspace         = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Debris            = game:GetService("Debris")
 local RunService        = game:GetService("RunService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 local GridConfig        = require(ReplicatedStorage.Scripts.Grid.GridConfig)
 local GridUtil          = require(ReplicatedStorage.Scripts.Grid.GridUtil)
@@ -18,7 +19,10 @@ local ZoneAddedEvent       = BindableEvents:WaitForChild("ZoneAdded")
 local ZoneRemovedEvent     = BindableEvents:WaitForChild("ZoneRemoved")
 local ZonePopulatedEvent   = BindableEvents:FindFirstChild("ZonePopulated") or Instance.new("BindableEvent", BindableEvents)
 ZonePopulatedEvent.Name    = "ZonePopulated"
-local ZoneRecreatedEvent   = BindableEvents:FindFirstChild("ZoneRecreated")
+local ZoneRecreatedEvent    = BindableEvents:FindFirstChild("ZoneRecreated")
+local NetworksPostLoadEvent = BindableEvents:FindFirstChild("NetworksPostLoad")
+local WorldReloadBeginEvent = BindableEvents:FindFirstChild("WorldReloadBegin")
+local WorldReloadEndEvent   = BindableEvents:FindFirstChild("WorldReloadEnd")
 
 local stopEvt = BindableEvents:FindFirstChild("StopCivilianRoutes") or Instance.new("BindableEvent", BindableEvents)
 stopEvt.Name = "StopCivilianRoutes"
@@ -32,6 +36,7 @@ local CiviliansFolder   = ReplicatedStorage:WaitForChild("FuncTestGroundRS"):Wai
 
 local zoneCellsCache   = {}
 local zoneCellsVersion = {}
+local zoneSnapshotCache = {}
 
 local civTemplates = {}
 local function refreshCivTemplates()
@@ -51,6 +56,7 @@ end)
 local CFG = {
 	-- populations
 	MaxAlivePerZone      = 1,
+	GlobalMaxAlive       = 40,    -- hard ceiling across the entire city
 	TargetMin            = 1,
 	TargetMax            = 1,
 	ZoneTypesEligible    = { Residential=true, ResDense=true, Commercial=true, CommDense=true, Industrial=true, IndusDense=true },
@@ -60,15 +66,17 @@ local CFG = {
 	TTLJitterSeconds     = 60,     -- +/- this amount to smear expiries
 	InitialYLift         = 1.5,
 	Debug                = false,
+	CivilianWalkSpeed    = 3.5,    -- studs/sec (Humanoid WalkSpeed)
 
 	-- pathing
 	MinZonePathCells     = 6,      -- require at least this many grid steps for inter-zone route
 	GridStrideCells      = 3,      -- only used in Manhattan fallback
 	DestinationStrategy  = "nearest",
+	FallbackMaxNodes     = 20000,  -- cap for emergency edge→edge fallback search
 
 	-- despawn queue budget (tune to your server perf)
-	MaxUnparentPerStep   = 40,     -- how many instances to Parent=nil per Heartbeat
-	MaxDestroyPerStep    = 20,     -- how many to Destroy() per Stepped
+	MaxUnparentPerStep   = 16,     -- how many instances to Parent=nil per Heartbeat
+	MaxDestroyPerStep    = 8,      -- how many to Destroy() per Stepped
 	DebugFreezeAll       = false,
 
 	-- spawn placement (origin)
@@ -77,7 +85,7 @@ local CFG = {
 	EdgePushMaxSteps     = 128,    -- how far we’ll keep pushing outward through disallowed zones (spawn & despawn use this)
 	-- Whitelist of zone modes we are allowed to spawn/despawn on (do NOT push past these).
 	-- If you want the inverse behavior (never land on these), set this table to {}.
-	EdgeAllowedZoneModes = { DirtRoad=true, WaterPipe=true, PowerLines=true, MetroTunnel=true },
+	EdgeAllowedZoneModes = CivPathing.RoadModes,
 
 	-- despawn placement (destination)
 	DespawnAtTargetEdge      = true,  -- NEW: clip final waypoint to the border outside the destination zone
@@ -208,10 +216,33 @@ local function buildCellSet(list)
 end
 
 -- Map every non-origin zone cell -> { id=zoneId, mode=zoneMode }
+local function invalidateZoneSnapshot(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then return end
+	zoneSnapshotCache[player.UserId] = nil
+end
+
 local function bumpZoneCellsVersion(player)
 	if typeof(player) ~= "Instance" or not player:IsA("Player") then return end
 	local uid = player.UserId
 	zoneCellsVersion[uid] = (zoneCellsVersion[uid] or 0) + 1
+	invalidateZoneSnapshot(player)
+	if CivPathing.bumpPlayerVersion then
+		pcall(CivPathing.bumpPlayerVersion, player)
+	end
+end
+
+local function getZonesSnapshot(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then return nil end
+	local uid = player.UserId
+	local cached = zoneSnapshotCache[uid]
+	local version = zoneCellsVersion[uid] or 0
+	if cached and cached.version == version and cached.zones then
+		return cached.zones
+	end
+	local zones = ZoneTrackerModule.getAllZones(player)
+	if not zones then return nil end
+	zoneSnapshotCache[uid] = { version = version, zones = zones }
+	return zones
 end
 
 local function buildAllZonesCellMapExcept(player)
@@ -324,7 +355,7 @@ local function pickEdgeSpawnOutside(plot, player, zone, zoneId, wpath)
 		if dv.Magnitude > 1e-6 then segDir = dv.Unit end
 	end
 
-	local bestWorld, bestSteps, bestAlign = nil, -1, -1e9
+	local bestWorld, bestCell, bestSteps, bestAlign = nil, nil, -1, -1e9
 	for _, c in ipairs(cands) do
 		local endCell, steps = pushOutwardToAllowedOrEmpty(
 			c.start.x, c.start.z,
@@ -338,11 +369,11 @@ local function pickEdgeSpawnOutside(plot, player, zone, zoneId, wpath)
 				align = segDir:Dot(c.dirWorld) -- higher (closer to 1) is better
 			end
 			if (steps > bestSteps) or (steps == bestSteps and align > bestAlign) then
-				bestWorld, bestSteps, bestAlign = w, steps, align
+				bestWorld, bestCell, bestSteps, bestAlign = w, endCell, steps, align
 			end
 		end
 	end
-	return bestWorld
+	return bestWorld, bestCell
 end
 
 -- Destination-side pick: clip final waypoint to the border outside the destination zone.
@@ -360,7 +391,7 @@ local function pickEdgeDespawnOutside(plot, player, destZone, destZoneId, wpath)
 	if approachDir.Magnitude <= 1e-6 then return nil end
 	approachDir = approachDir.Unit
 
-	local bestWorld, bestAlign, bestDist = nil, -1e9, 1e12
+	local bestWorld, bestCell, bestAlign, bestDist = nil, nil, -1e9, 1e12
 	for _, c in ipairs(cands) do
 		-- outward from dest zone (away from its interior)
 		local endCell, _ = pushOutwardToAllowedOrEmpty(
@@ -380,11 +411,75 @@ local function pickEdgeDespawnOutside(plot, player, destZone, destZoneId, wpath)
 			local better = (CFG.DespawnEdgePreferAlign and (align > bestAlign + 1e-6))
 				or (math.abs(align - bestAlign) <= 1e-6 and dist < bestDist)
 			if better then
-				bestWorld, bestAlign, bestDist = w, align, dist
+				bestWorld, bestCell, bestAlign, bestDist = w, endCell, align, dist
 			end
 		end
 	end
-	return bestWorld
+	return bestWorld, bestCell
+end
+
+-- Attempt an emergency edge→edge walk if the road graph fails.
+local function buildFallbackEdgePath(plot, player, srcZone, srcZoneId, dstZone, dstZoneId)
+	if not (plot and player and srcZone and dstZone) then return nil end
+	if not (srcZone.gridList and dstZone.gridList and #srcZone.gridList > 0 and #dstZone.gridList > 0) then
+		return nil
+	end
+
+	local function firstCell(zone)
+		local c = zone.gridList and zone.gridList[1]
+		if not c then return nil end
+		return { x = c.x, z = c.z }
+	end
+
+	local srcCell = firstCell(srcZone)
+	local dstCell = firstCell(dstZone)
+	if not (srcCell and dstCell) then return nil end
+
+	local approxPath = {
+		gridToWorld(srcCell, plot),
+		gridToWorld(dstCell, plot),
+	}
+
+	local spawnWorld, spawnCell = pickEdgeSpawnOutside(plot, player, srcZone, srcZoneId, approxPath)
+	local destWorld, destCell   = pickEdgeDespawnOutside(plot, player, dstZone, dstZoneId, approxPath)
+
+	if (not spawnCell) then
+		spawnCell = firstCell(srcZone)
+		spawnWorld = spawnCell and gridToWorld(spawnCell, plot) or spawnWorld
+	end
+	if (not destCell) then
+		destCell = firstCell(dstZone)
+		destWorld = destCell and gridToWorld(destCell, plot) or destWorld
+	end
+
+	if not (spawnCell and destCell) then
+		return nil
+	end
+
+	local exclude = {}
+	exclude[srcZone.zoneId or srcZone.id or srcZoneId or ""] = true
+	exclude[dstZone.zoneId or dstZone.id or dstZoneId or ""] = true
+
+	local blocked = CivPathing.buildBlockedCellsFromZones(player, {
+		excludeZoneIds     = exclude,
+		blockAllOtherZones = true,
+		roadModes          = CivPathing.RoadModes,
+		blockRoads         = false, -- allow walking along unfinished roads if needed
+	})
+
+	blocked[CivPathing.nodeKey(spawnCell)] = nil
+	blocked[CivPathing.nodeKey(destCell)]  = nil
+
+	local gpath = CivPathing.findGridPathAvoiding(spawnCell, destCell, {
+		blocked        = blocked,
+		allowDiagonals = true,
+		noCornerCut    = true,
+		maxNodes       = CFG.FallbackMaxNodes,
+	})
+	if not gpath or #gpath < 2 then
+		return nil
+	end
+	return gridPathToWorld(gpath, plot)
 end
 
 -- =========================================================
@@ -397,6 +492,12 @@ local zoneOwner        = {}   -- zoneId -> Player (for deferred maintain)
 local civByZone        = {}   -- zoneId -> { [Model]=true }
 local civFolderByZone  = {}   -- zoneId -> Folder
 local folderWatcher    = {}   -- zoneId -> RBXScriptConnection
+local globalAlive      = 0    -- total alive across the entire city
+local seededPlayers    = {}   -- userId -> true once seeded
+
+local function globalCapEnabled()
+	return (CFG.GlobalMaxAlive and CFG.GlobalMaxAlive > 0)
+end
 
 local function getTargetFor(zoneId)
 	local t = targetPerZone[zoneId]
@@ -408,9 +509,26 @@ local function getTargetFor(zoneId)
 end
 
 local function setActive(zoneId, v) zoneActive[zoneId] = v and true or nil end
-local function incAlive(zoneId, n) alivePerZone[zoneId] = (alivePerZone[zoneId] or 0) + (n or 1) end
-local function decAlive(zoneId, n) alivePerZone[zoneId] = math.max(0, (alivePerZone[zoneId] or 0) - (n or 1)) end
-local function canSpawn(zoneId)     return (alivePerZone[zoneId] or 0) < CFG.MaxAlivePerZone end
+local function incAlive(zoneId, n)
+	local delta = n or 1
+	if delta <= 0 then return end
+	alivePerZone[zoneId] = (alivePerZone[zoneId] or 0) + delta
+	globalAlive += delta
+end
+local function decAlive(zoneId, n)
+	local delta = n or 1
+	if delta <= 0 then return end
+	local current = alivePerZone[zoneId] or 0
+	local applied = math.min(delta, current)
+	alivePerZone[zoneId] = math.max(0, current - delta)
+	globalAlive = math.max(0, globalAlive - applied)
+end
+local function canSpawn(zoneId)
+	if globalCapEnabled() and globalAlive >= CFG.GlobalMaxAlive then
+		return false
+	end
+	return (alivePerZone[zoneId] or 0) < CFG.MaxAlivePerZone
+end
 
 local function registerCiv(zoneId, model)
 	civByZone[zoneId] = civByZone[zoneId] or {}
@@ -459,11 +577,15 @@ end
 local maintainZoneSteadyState  -- FIX: explicit local forward declaration
 
 -- folder-level watcher (replaces per-model AncestryChanged)
-local function ensureZoneFolderWatcher(zoneId, folder)
+local function clearZoneFolderWatcher(zoneId)
 	if folderWatcher[zoneId] then
 		folderWatcher[zoneId]:Disconnect()
 		folderWatcher[zoneId] = nil
 	end
+end
+
+local function ensureZoneFolderWatcher(zoneId, folder)
+	clearZoneFolderWatcher(zoneId)
 	if not folder then return end
 
 	folderWatcher[zoneId] = folder.ChildRemoved:Connect(function(child)
@@ -502,7 +624,7 @@ local function enqueueDelete(inst)
 	unparentQueue[#unparentQueue+1] = inst
 end
 
-RunService.Heartbeat:Connect(function()
+RunServiceScheduler.onHeartbeat(function()
 	local budget = CFG.MaxUnparentPerStep
 	while budget > 0 and #unparentQueue > 0 do
 		local inst = table.remove(unparentQueue) -- pop end
@@ -516,7 +638,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
-RunService.Stepped:Connect(function()
+RunServiceScheduler.onStepped(function()
 	local budget = CFG.MaxDestroyPerStep
 	while budget > 0 and #destroyQueue > 0 do
 		local inst = table.remove(destroyQueue)
@@ -530,30 +652,70 @@ end)
 -- =========================================================
 -- Ready-await helper
 -- =========================================================
-local readyAwaiters = {}  -- zoneId -> true while a waiter is running
+local readyAwaiters = {}  -- zoneId -> true while queued
+local readyQueueByPlayer = {} -- [uid] = { player=Player, list={}, meta={}, running=false }
+
+local function computeReadyPollInterval(player, zoneId)
+	local zones = getZonesSnapshot(player)
+	local zone = zones and zones[zoneId]
+	local cells = (zone and zone.gridList and #zone.gridList) or 1
+	return math.clamp(0.2 + (cells * 0.03), 0.35, 2.5)
+end
+
+local function runReadyQueue(uid)
+	local bucket = readyQueueByPlayer[uid]
+	if not bucket or bucket.running then return end
+	bucket.running = true
+	task.spawn(function()
+		while bucket.player.Parent and #bucket.list > 0 do
+			local zoneId = table.remove(bucket.list, 1)
+			local meta = bucket.meta[zoneId]
+			bucket.meta[zoneId] = nil
+			if meta and zoneActive[zoneId] then
+				local tries = 0
+				local sleep = meta.sleep
+				while zoneActive[zoneId] and not isZoneReady(meta.player, zoneId) and tries < meta.maxTries do
+					tries += 1
+					task.wait(sleep)
+				end
+				if zoneActive[zoneId] and isZoneReady(meta.player, zoneId) then
+					dprint(("[Ready] zone %s became ready after %d checks; topping up"):format(zoneId, tries))
+					maintainZoneSteadyState(meta.player, zoneId)
+				else
+					dprint(("[Ready] zone %s waiter exit (active=%s, tries=%d)"):format(zoneId, tostring(zoneActive[zoneId]), tries))
+				end
+			end
+			readyAwaiters[zoneId] = nil
+		end
+		bucket.running = false
+		if #bucket.list > 0 then
+			for _, pendingZone in ipairs(bucket.list) do
+				readyAwaiters[pendingZone] = nil
+			end
+		end
+		readyQueueByPlayer[uid] = nil
+	end)
+end
 
 local function scheduleReadyTopUp(player, zoneId, opts)
-	-- FIX: schedule a gentle retry loop until the zone reports ready, then call maintain once.
 	if readyAwaiters[zoneId] then return end
 	readyAwaiters[zoneId] = true
 
-	local sleep    = (opts and opts.sleep) or 0.5
-	local maxTries = (opts and opts.maxTries) or 300  -- ~150s by default
+	local uid = player.UserId
+	local bucket = readyQueueByPlayer[uid]
+	if not bucket then
+		bucket = { player = player, list = {}, meta = {}, running = false }
+		readyQueueByPlayer[uid] = bucket
+	end
 
-	task.spawn(function()
-		local tries = 0
-		while zoneActive[zoneId] and not isZoneReady(player, zoneId) and tries < maxTries do
-			tries += 1
-			task.wait(sleep)
-		end
-		if zoneActive[zoneId] and isZoneReady(player, zoneId) then
-			dprint(("[Ready] zone %s became ready after %d tries; topping up"):format(zoneId, tries))
-			maintainZoneSteadyState(player, zoneId)
-		else
-			dprint(("[Ready] zone %s waiter exit (active=%s, tries=%d)"):format(zoneId, tostring(zoneActive[zoneId]), tries))
-		end
-		readyAwaiters[zoneId] = nil
-	end)
+	if bucket.meta[zoneId] then return end
+
+	local sleep = (opts and opts.sleep) or computeReadyPollInterval(player, zoneId)
+	local maxTries = (opts and opts.maxTries) or math.ceil(180 / sleep)
+
+	bucket.meta[zoneId] = { player = player, sleep = sleep, maxTries = maxTries }
+	table.insert(bucket.list, zoneId)
+	runReadyQueue(uid)
 end
 
 -- =========================================================
@@ -567,6 +729,11 @@ maintainZoneSteadyState = function(player, zoneId)
 	local alive   = alivePerZone[zoneId] or 0
 	local deficit = math.max(0, math.min(target, CFG.MaxAlivePerZone) - alive)
 	if deficit <= 0 then return end
+	if globalCapEnabled() and globalAlive >= CFG.GlobalMaxAlive then
+		dprint(("[Maintain] global cap reached (%d/%d); deferring spawn for zone %s"):format(
+			globalAlive, CFG.GlobalMaxAlive, tostring(zoneId)))
+		return
+	end
 	dprint(("[Maintain] zone=%s target=%d alive=%d deficit=%d"):format(zoneId, target, alive, deficit))
 	local ok, err = pcall(spawnOneCivilianFlexible, player, zoneId)
 	if not ok then dwarn("maintain spawn error:", err) end
@@ -586,7 +753,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if not isZoneReady(player, zoneId) then return end
 	if not canSpawn(zoneId) then return end
 
-	local zones = ZoneTrackerModule.getAllZones(player)
+	local zones = getZonesSnapshot(player)
 	local zone  = zones and zones[zoneId]
 	if not zone then return end
 
@@ -603,12 +770,14 @@ spawnOneCivilianFlexible = function(player, zoneId)
 
 	local wpath
 	local destIdForAttr = nil
+	local destZoneRecord = nil
 
 	-- Pick destination via CivPathing (nearest with jitter)
 	local dest = CivPathing.pickDestinationZone(player, zone, CFG.DestinationStrategy)
 	if dest and dest.dist >= CFG.MinZonePathCells then
 		destIdForAttr = dest.id
-		wpath = CivPathing.hybridZoneToZonePath(plot, player, zone, dest.data, {
+		destZoneRecord = dest.data
+		wpath = CivPathing.hybridZoneToZonePath(plot, player, zone, destZoneRecord, {
 			allowDiagonals = true,
 			noCornerCut    = true,
 			SearchRadius   = 128,
@@ -616,27 +785,20 @@ spawnOneCivilianFlexible = function(player, zoneId)
 		})
 	end
 
-	-- fallbacks
-	if (not wpath) or #wpath < 2 then
-		local blocked = CivPathing.buildBlockedCellsFromZones(player, {
-			excludeZoneIds     = { [zoneId]=true, [dest and dest.id or ""]=true },
-			blockAllOtherZones = true,
-		})
-		local gpath = CivPathing.findGridPathAvoiding(
-			dest and dest.a or zone.gridList[1],
-			dest and dest.b or zone.gridList[1],
-			{ blocked=blocked, allowDiagonals=true, noCornerCut=true }
-		)
-		if gpath and #gpath >= 2 then
-			wpath = gridPathToWorld(gpath, plot)
-		else
-			wpath = buildZoneWanderWorldPath(plot, zone, 4)
-			destIdForAttr = nil
+	-- Guard: must have a valid road path (no fallback wander inside zones)
+	if (not wpath) or (#wpath < 2) then
+		if destZoneRecord and destIdForAttr then
+			wpath = buildFallbackEdgePath(plot, player, zone, zoneId, destZoneRecord, destIdForAttr)
+			if CFG.Debug and wpath then
+				dprint(("[CivilianSpawner] using fallback edge walk for %s -> %s (#%d pts)")
+					:format(tostring(zoneId), tostring(destIdForAttr), #wpath))
+			end
+		end
+		if (not wpath) or (#wpath < 2) then
+			dwarn("[CivilianSpawner] No road path found; skipping spawn for zone", zoneId)
+			return
 		end
 	end
-
-	-- Guard: must have a path
-	if (not wpath) or (#wpath < 2) then return end
 
 	-- ===== ORIGIN: shift spawn to the *furthest-most* edge outside the origin zone, pushing past adjacent disallowed zones =====
 	local spawnPos = wpath[1]
@@ -701,9 +863,10 @@ spawnOneCivilianFlexible = function(player, zoneId)
 		return -- no movement; Debris will clean up
 	end
 
-	local speed = 5.0 + math.random() * 2.0  -- 5–7 studs/s
-	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s"):format(
-		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(CFG.SpawnOnEdgeOutside), tostring(CFG.DespawnAtTargetEdge)))
+	local speed = math.max(0.5, CFG.CivilianWalkSpeed or 3.5)
+	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s (global=%d/%s)"):format(
+		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(CFG.SpawnOnEdgeOutside), tostring(CFG.DespawnAtTargetEdge),
+		globalAlive, tostring(CFG.GlobalMaxAlive or "∞")))
 	CivilianMovement.moveAlongPath(model, wpath, zoneId, {
 		WalkSpeed    = speed,
 		DestroyAtEnd = false,   -- we will enqueue despawn ourselves
@@ -719,17 +882,13 @@ local function seedTargetAndFill(player, zoneId)
 	getTargetFor(zoneId)
 	alivePerZone[zoneId] = alivePerZone[zoneId] or 0
 	maintainZoneSteadyState(player, zoneId)
-	task.defer(maintainZoneSteadyState, player, zoneId)
 end
 
 -- =========================================================
 -- Zone lifecycle wiring + hard cleanup
 -- =========================================================
-local function onZoneCreateOrRecreate(player, zoneId)
-	-- Do NOT gate this on isZoneReady(); attach watchers and activate immediately.
+local function activateZone(player, zoneId)
 	zoneOwner[zoneId] = player
-	bumpZoneCellsVersion(player)
-
 	local plot = getPlayerPlot(player)
 	if plot then
 		local folder = getOrCreateZoneCivFolder(plot, zoneId)
@@ -739,6 +898,12 @@ local function onZoneCreateOrRecreate(player, zoneId)
 
 	seedTargetAndFill(player, zoneId)          -- best-effort immediate try
 	scheduleReadyTopUp(player, zoneId)         -- retry until ready, then top-up
+end
+
+local function onZoneCreateOrRecreate(player, zoneId)
+	-- Do NOT gate this on isZoneReady(); attach watchers and activate immediately.
+	bumpZoneCellsVersion(player)
+	activateZone(player, zoneId)
 end
 
 ZoneAddedEvent.Event:Connect(function(player, zoneId)
@@ -783,6 +948,13 @@ local function destroyAllCivsForZone(zoneId)
 		end
 	end
 	civFolderByZone[zoneId] = nil
+	clearZoneFolderWatcher(zoneId)
+
+	local alive = alivePerZone[zoneId] or 0
+	if alive > 0 then
+		decAlive(zoneId, alive)
+	end
+	alivePerZone[zoneId] = 0
 
 	-- clear registry (defensive)
 	civByZone[zoneId] = nil
@@ -836,11 +1008,111 @@ ForceCivTest.Event:Connect(function(player, zoneId)
 	end
 end)
 
+local function seedExistingZonesForPlayer(player)
+	if not (player and player.Parent) then return false end
+	local uid = player.UserId
+	if seededPlayers[uid] then return true end
+	local zones = getZonesSnapshot(player)
+	if not zones or not next(zones) then
+		return false
+	end
+	local seededAny = false
+	for zoneId, zone in pairs(zones) do
+		if zone and CFG.ZoneTypesEligible[zone.mode] and not zoneActive[zoneId] then
+			activateZone(player, zoneId)
+			seededAny = true
+		end
+	end
+	if seededAny then
+		seededPlayers[uid] = true
+	end
+	return seededAny
+end
+
+local function bootstrapPlayerZones(player)
+	task.defer(function()
+		if seedExistingZonesForPlayer(player) then return end
+		task.delay(3, function()
+			if player.Parent and not seededPlayers[player.UserId] then
+				seedExistingZonesForPlayer(player)
+			end
+		end)
+	end)
+end
+
+Players.PlayerAdded:Connect(bootstrapPlayerZones)
+for _, plr in ipairs(Players:GetPlayers()) do
+	bootstrapPlayerZones(plr)
+end
+
+local function attachNetworksPostLoad(ev)
+	if not ev or not ev.IsA or not ev:IsA("BindableEvent") then return end
+	ev.Event:Connect(function(player)
+		if player and player:IsA("Player") then
+			seedExistingZonesForPlayer(player)
+		end
+	end)
+end
+
+-- Keep the seeding gate in sync with world reloads so reloads re-activate civ spawners.
+local worldReloadBeginConn
+local worldReloadEndConn
+
+local function attachWorldReloadBegin(ev)
+	if not ev or not ev.IsA or not ev:IsA("BindableEvent") or worldReloadBeginConn then return end
+	worldReloadBeginConn = ev.Event:Connect(function(player)
+		if player and player:IsA("Player") then
+			local uid = player.UserId
+			seededPlayers[uid] = nil
+		end
+	end)
+end
+
+local function attachWorldReloadEnd(ev)
+	if not ev or not ev.IsA or not ev:IsA("BindableEvent") or worldReloadEndConn then return end
+	worldReloadEndConn = ev.Event:Connect(function(player)
+		if player and player:IsA("Player") then
+			seededPlayers[player.UserId] = nil
+			task.delay(0.1, function()
+				if player.Parent then
+					seedExistingZonesForPlayer(player)
+				end
+			end)
+		end
+	end)
+end
+
+attachNetworksPostLoad(NetworksPostLoadEvent)
+attachWorldReloadBegin(WorldReloadBeginEvent)
+attachWorldReloadEnd(WorldReloadEndEvent)
+BindableEvents.ChildAdded:Connect(function(ch)
+	if ch.Name == "NetworksPostLoad" and ch:IsA("BindableEvent") then
+		attachNetworksPostLoad(ch)
+	elseif ch.Name == "WorldReloadBegin" and ch:IsA("BindableEvent") then
+		attachWorldReloadBegin(ch)
+	elseif ch.Name == "WorldReloadEnd" and ch:IsA("BindableEvent") then
+		attachWorldReloadEnd(ch)
+	end
+end)
+
 Players.PlayerRemoving:Connect(function(player)
 	local uid = player and player.UserId
 	if not uid then return end
 	zoneCellsCache[uid] = nil
 	zoneCellsVersion[uid] = nil
+	zoneSnapshotCache[uid] = nil
+	seededPlayers[uid] = nil
+	local bucket = readyQueueByPlayer[uid]
+	if bucket then
+		bucket.list = {}
+		bucket.meta = {}
+		readyQueueByPlayer[uid] = nil
+	end
+	for zoneId, owner in pairs(zoneOwner) do
+		if owner == player then
+			readyAwaiters[zoneId] = nil
+		end
+	end
 end)
 
 print("CivilianSpawner: Iteration 3.0 online (origin-edge spawn + destination-edge despawn; furthest-edge outward push + zone-type exceptions; always-activate; ready-await topups; folder watchers; queued despawn; TTL jitter; 1 per zone; hybrid roads)")

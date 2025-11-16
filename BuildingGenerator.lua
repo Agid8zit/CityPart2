@@ -1,75 +1,279 @@
-	-- BuildingGeneratorModule.lua line 1
-	local BuildingGeneratorModule = {}
-	BuildingGeneratorModule.__index = BuildingGeneratorModule
+-- BuildingGeneratorModule.lua line 1
+local BuildingGeneratorModule = {}
+BuildingGeneratorModule.__index = BuildingGeneratorModule
 
-	-- References
-	local ReplicatedStorage = game:GetService("ReplicatedStorage")
-	local Workspace = game:GetService("Workspace")
-	local BuildingManager = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("BuildingManager")
-	local ServerScriptService = game:GetService("ServerScriptService")
-	local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
-	local zoneRemovedEvent = BE:WaitForChild("ZoneRemoved")
-	local PadPoleSpawned = BE:WaitForChild("PadPoleSpawned")
-	-- Added for enhancements:
-	local zonePopulatedEvent = BE:WaitForChild("ZonePopulated")
+-- References
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local SoundService = game:GetService("SoundService")
+local BuildingManager = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("BuildingManager")
+local SoundEmitter = require(ReplicatedStorage.Scripts.SoundEmitter)
+local EventsFolder = ReplicatedStorage:WaitForChild("Events")
+local RemoteEvents = EventsFolder:WaitForChild("RemoteEvents")
+local PlayUISoundRE = RemoteEvents:FindFirstChild("PlayUISound")
+local ServerScriptService = game:GetService("ServerScriptService")
+local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
+local zoneRemovedEvent = BE:WaitForChild("ZoneRemoved")
+local PadPoleSpawned = BE:WaitForChild("PadPoleSpawned")
+-- Added for enhancements:
+local zonePopulatedEvent = BE:WaitForChild("ZonePopulated")
 
-	-- BuildingsPlaced Event
-	local buildingsPlacedEvent = BE:WaitForChild("BuildingsPlaced")
-	local worldDirtyEvent = BE:FindFirstChild("WorldDirty")
-	local Wigw8mPlacedEvent = BE:WaitForChild("Wigw8mPlaced")
+-- BuildingsPlaced Event
+local buildingsPlacedEvent = BE:WaitForChild("BuildingsPlaced")
+local worldDirtyEvent = BE:FindFirstChild("WorldDirty")
+local Wigw8mPlacedEvent = BE:WaitForChild("Wigw8mPlaced")
 
-	-- Grid Utilities
-	local Scripts = ReplicatedStorage:WaitForChild("Scripts")
-	local GridConf = Scripts:WaitForChild("Grid")
-	local GridUtils = require(GridConf:WaitForChild("GridUtil"))
-	local GridConfig = require(GridConf:WaitForChild("GridConfig"))
+-- Grid Utilities
+local Scripts = ReplicatedStorage:WaitForChild("Scripts")
+local Sounds = require(Scripts:WaitForChild("Sounds"))
+local GridConf = Scripts:WaitForChild("Grid")
+local GridUtils = require(GridConf:WaitForChild("GridUtil"))
+local GridConfig = require(GridConf:WaitForChild("GridConfig"))
 
-	-- Central Services
-	local QuadtreeService = require(ReplicatedStorage.Scripts.Optimize.Quadtree.QuadTreeSvc)
+-- Central Services
+local QuadtreeService = require(ReplicatedStorage.Scripts.Optimize.Quadtree.QuadTreeSvc)
 
-	-- Building Master List
-	local BuildingMasterList = require(BuildingManager:WaitForChild("BuildingMasterList"))
+-- Building Master List
+local BuildingMasterList = require(BuildingManager:WaitForChild("BuildingMasterList"))
 
-	-- Zone Tracker
-	local Build = script.Parent.Parent.Parent.Parent
-	local ZoneManager = Build:WaitForChild("ZoneManager")
-	local ZoneTrackerModule = require(ZoneManager:WaitForChild("ZoneTracker"))
-	local ZoneValidation 	= require(ZoneManager:WaitForChild("ZoneValidation"))
-	local ZoneDisplay		=require(ZoneManager:WaitForChild("ZoneDisplay"))
-	local Bld = ServerScriptService.Build
-	local LayerManagerModule = require(Bld.LayerManager)
-	local OverlayZoneTypes   = ZoneValidation.OverlayZoneTypes
+-- Zone Tracker
+local Build = script.Parent.Parent.Parent.Parent
+local ZoneManager = Build:WaitForChild("ZoneManager")
+local ZoneTrackerModule = require(ZoneManager:WaitForChild("ZoneTracker"))
+local ZoneValidation 	= require(ZoneManager:WaitForChild("ZoneValidation"))
+local ZoneDisplay		=require(ZoneManager:WaitForChild("ZoneDisplay"))
+local Bld = ServerScriptService.Build
+local LayerManagerModule = require(Bld.LayerManager)
+local OverlayZoneTypes   = ZoneValidation.OverlayZoneTypes
 
-	-- Configuration
-	local BUILDING_INTERVAL = 0.25  -- seconds between stages (0.25)
-	local function getBuildingInterval()
-		-- Use waitScaled where we actually sleep; this gives us a single source of truth.
-		return BUILDING_INTERVAL
+-- Configuration
+local BUILDING_INTERVAL = 0.25  -- seconds between stages (0.25)
+local function getBuildingInterval()
+	-- Use waitScaled where we actually sleep; this gives us a single source of truth.
+	return BUILDING_INTERVAL
+end
+local GRID_SIZE = GridConfig.GRID_SIZE -- Ensure this matches your grid size in GridVisualizer
+local Y_OFFSET = 0.4 -- Adjust as needed
+local STAGE1_Y_OFFSET = -0.38
+
+-- Configuration for Concrete Pad
+local CONCRETE_PAD_HEIGHT = 0.2
+local CONCRETE_PAD_MATERIAL = Enum.Material.Concrete
+local CONCRETE_PAD_COLOR = Color3.fromRGB(128, 128, 128) -- Grey color
+local OverlapExclusions = {
+	WaterPipe       = true,
+	Pipe            = true,
+	PipeZone        = true,   -- some trackers store the literal zone type
+	PowerLines      = true,
+	MetroTunnel     = true,   -- << ADD`
+	MetroTunnelZone = true,   -- << ADD (some systems prefix/alias the zoneType)
+}
+
+
+-- Debug Configuration
+local DEBUG = false
+local function debugPrint(...)
+	if DEBUG then
+		print("[BuildingGenerator]", ...)
 	end
-	local GRID_SIZE = GridConfig.GRID_SIZE -- Ensure this matches your grid size in GridVisualizer
-	local Y_OFFSET = 0.4 -- Adjust as needed
-	local STAGE1_Y_OFFSET = -0.38
+end
 
-	-- Configuration for Concrete Pad
-	local CONCRETE_PAD_HEIGHT = 0.2
-	local CONCRETE_PAD_MATERIAL = Enum.Material.Concrete
-	local CONCRETE_PAD_COLOR = Color3.fromRGB(128, 128, 128) -- Grey color
-	local OverlapExclusions = {
-		WaterPipe       = true,
-		Pipe            = true,
-		PipeZone        = true,   -- some trackers store the literal zone type
-		PowerLines      = true,
-		MetroTunnel     = true,   -- << ADD`
-		MetroTunnelZone = true,   -- << ADD (some systems prefix/alias the zoneType)
-	}
+local AmbientZoneSoundConfig = {
+	WindTurbine = {
+		name = "Windmill",
+		category = "Misc",
+		volume = 0.2,
+		RollOffMaxDistance = 350,
+		RollOffMinDistance = 35,
+		pitchRange = {0.95, 1.05},
+		tag = "Ambient_Windmill",
+	},
+	GeothermalPowerPlant = {
+		name = "Windmill",
+		category = "Misc",
+		volume = 0.12,
+		RollOffMaxDistance = 275,
+		RollOffMinDistance = 30,
+		pitchRange = {0.9, 1.02},
+		tag = "Ambient_Geo",
+	},
+	CoalPowerPlant = {
+		name = "Factory",
+		category = "Misc",
+		volume = 0.25,
+		RollOffMaxDistance = 400,
+		RollOffMinDistance = 45,
+		pitchRange = {0.95, 1.0},
+		tag = "Ambient_Coal",
+	},
+}
 
+local function addAmbientLoopForZone(zoneType: string, model: Instance?)
+	local soundConfig = AmbientZoneSoundConfig[zoneType]
+	if not soundConfig then
+		return
+	end
+	if not model then
+		return
+	end
 
-	-- Debug Configuration
-	local DEBUG = false
-	local function debugPrint(...)
-		if DEBUG then
-			print("[BuildingGenerator]", ...)
+	local target = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not target then
+		return
+	end
+
+	SoundEmitter.attachLoop({
+		category = soundConfig.category,
+		name = soundConfig.name,
+		targetInstance = target,
+		tag = soundConfig.tag,
+		volume = soundConfig.volume,
+		RollOffMaxDistance = soundConfig.RollOffMaxDistance,
+		RollOffMinDistance = soundConfig.RollOffMinDistance,
+		pitchRange = soundConfig.pitchRange,
+	})
+end
+
+local function playBuildUISound(player: Player?)
+	if PlayUISoundRE and player then
+		PlayUISoundRE:FireClient(player, "Misc", "Build")
+	end
+end
+
+local rng = Random.new()
+local CONSTRUCTION_SFX_VARIANCE = {
+	pitchMin = 0.92,
+	pitchMax = 1.08,
+	volumeMin = 0.9,
+	volumeMax = 1.1,
+}
+local CONSTRUCTION_SFX_VOLUME_MULT = 0.6
+
+local function assignToSFXGroup(sound: Sound)
+	local masterGroup = SoundService:FindFirstChild("Master")
+	if not masterGroup then
+		return
+	end
+	local sfxGroup = masterGroup:FindFirstChild("SFX")
+	if sfxGroup and sfxGroup:IsA("SoundGroup") then
+		sound.SoundGroup = sfxGroup
+	end
+end
+
+local function averageStagePosition(instances: { Instance }): Vector3?
+	local total = Vector3.new()
+	local count = 0
+	for _, inst in ipairs(instances) do
+		local cf
+		if inst:IsA("Model") then
+			local primary = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+			if primary then
+				cf = primary.CFrame
+			end
+		elseif inst:IsA("BasePart") then
+			cf = inst.CFrame
 		end
+		if cf then
+			total += cf.Position
+			count += 1
+		end
+	end
+	if count == 0 then
+		return nil
+	end
+	return total / count
+end
+
+local function startConstructionSound(stageClones: { Instance }, parentFolder: Instance?): { sound: Sound, anchor: BasePart }?
+	local soundData = Sounds.Misc and Sounds.Misc.Construction
+	if not soundData then
+		return nil
+	end
+
+	local center = averageStagePosition(stageClones)
+	if not center then
+		return nil
+	end
+
+	local anchor = Instance.new("Part")
+	anchor.Name = "_ConstructionSoundAnchor"
+	anchor.Transparency = 1
+	anchor.CanCollide = false
+	anchor.Anchored = true
+	anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+	anchor.CFrame = CFrame.new(center)
+	anchor.Parent = parentFolder or Workspace
+
+	local sound = Instance.new("Sound")
+	sound.Name = "_ConstructionSound"
+	sound.SoundId = soundData.SoundId
+	sound.RollOffMaxDistance = soundData.RollOffMaxDistance or sound.RollOffMaxDistance
+	sound.RollOffMinDistance = soundData.RollOffMinDistance or sound.RollOffMinDistance
+	local volumeScale = rng:NextNumber(CONSTRUCTION_SFX_VARIANCE.volumeMin, CONSTRUCTION_SFX_VARIANCE.volumeMax)
+	sound.Volume = (soundData.Volume or sound.Volume) * volumeScale * CONSTRUCTION_SFX_VOLUME_MULT
+	sound.Looped = true
+	sound.PlaybackSpeed = rng:NextNumber(CONSTRUCTION_SFX_VARIANCE.pitchMin, CONSTRUCTION_SFX_VARIANCE.pitchMax)
+	assignToSFXGroup(sound)
+	sound.Parent = anchor
+	sound:Play()
+
+	return {
+		sound = sound,
+		anchor = anchor,
+	}
+end
+
+local function stopConstructionSound(handle: { sound: Sound?, anchor: BasePart? }?)
+	if not handle then
+		return
+	end
+	local sound = handle.sound
+	if sound then
+		pcall(function()
+			sound:Stop()
+		end)
+		sound:Destroy()
+	end
+	local anchor = handle.anchor
+	if anchor then
+		anchor:Destroy()
+	end
+end
+
+-- Infrastructure-only zones do not need the 3D construction SFX.
+local SILENT_BUILD_MODES = {
+	DirtRoad    = true,
+	Pavement    = true,
+	Highway     = true,
+	Road        = true,
+	RoadZone    = true,
+	PowerLines  = true,
+	WaterPipe   = true,
+	Utilities   = true,
+	MetroTunnel = true,
+}
+
+local function shouldPlayConstructionAudio(mode: string?): boolean
+	if not mode then
+		return true
+	end
+	return not SILENT_BUILD_MODES[mode]
+end
+
+local BUILD_UI_MUTED_MODES = {
+	Residential = true,
+	Commercial  = true,
+	Industrial  = true,
+	ResDense    = true,
+	CommDense   = true,
+	IndusDense  = true,
+}
+
+local function shouldPlayBuildUISound(mode: string?): boolean
+	if not mode then
+		return true
+	end
+	return not BUILD_UI_MUTED_MODES[mode]
 end
 
 local BuildSpeed = {
@@ -221,113 +425,113 @@ if okBE and EventsFolder and EventsFolder:FindFirstChild("BindableEvents") then
 	end
 end
 
-	local STRICT_ABORT_ON_MISSING_ZONE = false
+local STRICT_ABORT_ON_MISSING_ZONE = false
 
-	local Abort = {}  -- Abort[userId][zoneId] = true
+local Abort = {}  -- Abort[userId][zoneId] = true
 
-	local function _uid(p) return p and p.UserId end
+local function _uid(p) return p and p.UserId end
 
-	local function markAbort(player, zoneId)
-		local uid = _uid(player); if not uid or type(zoneId) ~= "string" then return end
-		Abort[uid] = Abort[uid] or {}
-		Abort[uid][zoneId] = true
-	end
+local function markAbort(player, zoneId)
+	local uid = _uid(player); if not uid or type(zoneId) ~= "string" then return end
+	Abort[uid] = Abort[uid] or {}
+	Abort[uid][zoneId] = true
+end
 
-	local function clearAbort(player, zoneId)
-		local uid = _uid(player); if not uid or type(zoneId) ~= "string" then return end
-		if Abort[uid] then Abort[uid][zoneId] = nil end
-	end
+local function clearAbort(player, zoneId)
+	local uid = _uid(player); if not uid or type(zoneId) ~= "string" then return end
+	if Abort[uid] then Abort[uid][zoneId] = nil end
+end
 
-	local function shouldAbort(player, zoneId)
-		-- explicit tombstone (ZoneRemoved) always wins
-		local uid = _uid(player)
-		if uid and Abort[uid] and Abort[uid][zoneId] then
-			if DEBUG then
-				print(("[BuildingGenerator][Abort] explicit tombstone for %s (user=%s)"):format(zoneId, tostring(uid)))
-			end
-			return true
+local function shouldAbort(player, zoneId)
+	-- explicit tombstone (ZoneRemoved) always wins
+	local uid = _uid(player)
+	if uid and Abort[uid] and Abort[uid][zoneId] then
+		if DEBUG then
+			print(("[BuildingGenerator][Abort] explicit tombstone for %s (user=%s)"):format(zoneId, tostring(uid)))
 		end
+		return true
+	end
 
-		-- tracker missing: only abort if policy says to do so
-		local exists = ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
-		if not exists then
-			if DEBUG then
-				print(("[BuildingGenerator][Abort?] ZoneTracker missing entry for %s (STRICT=%s)"):format(
-					zoneId, tostring(STRICT_ABORT_ON_MISSING_ZONE)))
-			end
-			return STRICT_ABORT_ON_MISSING_ZONE
+	-- tracker missing: only abort if policy says to do so
+	local exists = ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
+	if not exists then
+		if DEBUG then
+			print(("[BuildingGenerator][Abort?] ZoneTracker missing entry for %s (STRICT=%s)"):format(
+				zoneId, tostring(STRICT_ABORT_ON_MISSING_ZONE)))
 		end
-
-		return false
+		return STRICT_ABORT_ON_MISSING_ZONE
 	end
 
-	local function BuildingOccId(zoneId: string, gx: number, gz: number): string
-		return ("building/%s_%d_%d"):format(zoneId, gx, gz)
-	end
+	return false
+end
 
-	-- Table to hold removed NatureZones (for undo)
-	local DECORATION_WEIGHT = 0.05   -- 5 % chance relative to normal; set to 0 to ban
-	local DEFAULT_WEIGHT    = 1
-	local boundsCache = {}
+local function BuildingOccId(zoneId: string, gx: number, gz: number): string
+	return ("building/%s_%d_%d"):format(zoneId, gx, gz)
+end
 
-	zoneRemovedEvent.Event:Connect(function(player, zoneId)
-		-- Any in-flight populate for this zone should stop ASAP
-		markAbort(player, zoneId)
-	end)
+-- Table to hold removed NatureZones (for undo)
+local DECORATION_WEIGHT = 0.05   -- 5 % chance relative to normal; set to 0 to ban
+local DEFAULT_WEIGHT    = 1
+local boundsCache = {}
 
-	local function getGlobalBoundsForPlot(plot)
-		local cached = boundsCache[plot]
-		if cached then return cached.bounds, cached.terrains end
+zoneRemovedEvent.Event:Connect(function(player, zoneId)
+	-- Any in-flight populate for this zone should stop ASAP
+	markAbort(player, zoneId)
+end)
 
-		local terrains = {}
-		local unlocks  = plot:FindFirstChild("Unlocks")
-		if unlocks then
-			for _, zone in ipairs(unlocks:GetChildren()) do
-				for _, seg in ipairs(zone:GetChildren()) do
-					if seg:IsA("BasePart") and seg.Name:match("^Segment%d+$") then
-						table.insert(terrains, seg)
-					end
+local function getGlobalBoundsForPlot(plot)
+	local cached = boundsCache[plot]
+	if cached then return cached.bounds, cached.terrains end
+
+	local terrains = {}
+	local unlocks  = plot:FindFirstChild("Unlocks")
+	if unlocks then
+		for _, zone in ipairs(unlocks:GetChildren()) do
+			for _, seg in ipairs(zone:GetChildren()) do
+				if seg:IsA("BasePart") and seg.Name:match("^Segment%d+$") then
+					table.insert(terrains, seg)
 				end
 			end
 		end
-		local testTerrain = plot:FindFirstChild("TestTerrain")
-		if #terrains == 0 and testTerrain then
-			table.insert(terrains, testTerrain)
-		end
-
-		local gb = GridConfig.calculateGlobalBounds(terrains)
-		boundsCache[plot] = { bounds = gb, terrains = terrains }
-		return gb, terrains
+	end
+	local testTerrain = plot:FindFirstChild("TestTerrain")
+	if #terrains == 0 and testTerrain then
+		table.insert(terrains, testTerrain)
 	end
 
-	local function weightFor(building)
-		-- Detect decorations by explicit flag, WealthState or folder name
-		if building.isDecoration
-			or (building.wealthState and building.wealthState == "Decorations")
-			or (building.zoneType and building.zoneType == "Decorations")
-		then
-			return DECORATION_WEIGHT
-		end
-		return building.weight or DEFAULT_WEIGHT
-	end
+	local gb = GridConfig.calculateGlobalBounds(terrains)
+	boundsCache[plot] = { bounds = gb, terrains = terrains }
+	return gb, terrains
+end
 
-	local function chooseWeightedBuilding(list)
-		local total = 0
-		for _, b in ipairs(list) do
-			local w = weightFor(b)
-			if w > 0 then total += w end
-		end
-		if total == 0 then return nil end
-		local r = math.random() * total
-		for _, b in ipairs(list) do
-			local w = weightFor(b)
-			if w > 0 then
-				r -= w
-				if r <= 0 then return b end
-			end
-		end
-		return list[#list]  
+local function weightFor(building)
+	-- Detect decorations by explicit flag, WealthState or folder name
+	if building.isDecoration
+		or (building.wealthState and building.wealthState == "Decorations")
+		or (building.zoneType and building.zoneType == "Decorations")
+	then
+		return DECORATION_WEIGHT
 	end
+	return building.weight or DEFAULT_WEIGHT
+end
+
+local function chooseWeightedBuilding(list)
+	local total = 0
+	for _, b in ipairs(list) do
+		local w = weightFor(b)
+		if w > 0 then total += w end
+	end
+	if total == 0 then return nil end
+	local r = math.random() * total
+	for _, b in ipairs(list) do
+		local w = weightFor(b)
+		if w > 0 then
+			r -= w
+			if r <= 0 then return b end
+		end
+	end
+	return list[#list]  
+end
 
 ---------------------------------------------------------------------------
 -- QUOTA SYSTEM (caps)
@@ -409,7 +613,7 @@ local function wouldViolateQuota(ctx, mode, wealth, buildingName)
 	if ctx and ctx.strictRestore then
 		return false  -- never block saved blueprints
 	end
-	
+
 	if not ctx then return false end
 	local totalAfter = (ctx.total or 0) + 1
 
@@ -420,8 +624,8 @@ local function wouldViolateQuota(ctx, mode, wealth, buildingName)
 			return true
 		end
 	end
-	
-		-- Commercial: limit ComM1 (any wealth) to 20%
+
+	-- Commercial: limit ComM1 (any wealth) to 20%
 	if mode == "Commercial" and wealth == "Medium" and buildingName == "ComM1" then
 		local curr = ctx.byName["ComM1"] or 0
 		if ((curr + 1) / totalAfter) > QUOTA_CAP then
@@ -483,76 +687,76 @@ end
 -- /QUOTA SYSTEM
 ---------------------------------------------------------------------------
 
-	local function _getInstanceCFrame(inst : Instance) : CFrame?
-		if inst:IsA("Model") then
-			local ok, cf = pcall(function() return inst:GetPivot() end)
-			if ok and typeof(cf) == "CFrame" then
-				return cf
-			end
-			if inst.PrimaryPart then
-				return inst.PrimaryPart.CFrame
-			end
-			return nil
-		elseif inst:IsA("BasePart") then
-			return inst.CFrame
+local function _getInstanceCFrame(inst : Instance) : CFrame?
+	if inst:IsA("Model") then
+		local ok, cf = pcall(function() return inst:GetPivot() end)
+		if ok and typeof(cf) == "CFrame" then
+			return cf
+		end
+		if inst.PrimaryPart then
+			return inst.PrimaryPart.CFrame
 		end
 		return nil
+	elseif inst:IsA("BasePart") then
+		return inst.CFrame
+	end
+	return nil
+end
+
+-- Helper function to wait for a specified duration
+local function waitFor(seconds)
+	task.wait(seconds)
+end
+
+--Rotation Helper
+local RANDOM_ROTATION_ZONES = {
+	Residential   = true, Commercial = true, Industrial = true,
+	ResDense      = true, CommDense   = true, IndusDense = true,
+}
+
+local CARDINALS = { 0, 90, 180, 270 }
+
+local function pickRotation(zoneMode : string, requested : number?)
+	-- zoneMode     : "Residential", "Road", ...
+	-- requested    : what the caller supplied, may be nil
+
+	if RANDOM_ROTATION_ZONES[zoneMode] then
+		-- Engine decides ⇒ ignore anything the caller sent.
+		return CARDINALS[math.random(#CARDINALS)]
 	end
 
-	-- Helper function to wait for a specified duration
-	local function waitFor(seconds)
-		task.wait(seconds)
+	-- Player‑driven zone: insist on a caller‑supplied heading
+	if requested == nil then
+		warn(("[BuildingGenerator] No rotation supplied for zone type ‘%s’; defaulting to 0°")
+			:format(zoneMode))
+		return 0
 	end
 
-	--Rotation Helper
-	local RANDOM_ROTATION_ZONES = {
-		Residential   = true, Commercial = true, Industrial = true,
-		ResDense      = true, CommDense   = true, IndusDense = true,
-	}
-
-	local CARDINALS = { 0, 90, 180, 270 }
-
-	local function pickRotation(zoneMode : string, requested : number?)
-		-- zoneMode     : "Residential", "Road", ...
-		-- requested    : what the caller supplied, may be nil
-
-		if RANDOM_ROTATION_ZONES[zoneMode] then
-			-- Engine decides ⇒ ignore anything the caller sent.
-			return CARDINALS[math.random(#CARDINALS)]
-		end
-
-		-- Player‑driven zone: insist on a caller‑supplied heading
-		if requested == nil then
-			warn(("[BuildingGenerator] No rotation supplied for zone type ‘%s’; defaulting to 0°")
-				:format(zoneMode))
-			return 0
-		end
-
-		-- Normalise to [0,360)
-		local rot = requested % 360
-		if rot % 90 ~= 0 then
-			warn(("[BuildingGenerator] Rotation %d for zone ‘%s’ is not a multiple of 90; rounding")
-				:format(rot, zoneMode))
-			rot = CARDINALS[math.floor((rot+45)/90) % 4 + 1]        -- 28°→0, 134°→90 …
-		end
-		return rot
+	-- Normalise to [0,360)
+	local rot = requested % 360
+	if rot % 90 ~= 0 then
+		warn(("[BuildingGenerator] Rotation %d for zone ‘%s’ is not a multiple of 90; rounding")
+			:format(rot, zoneMode))
+		rot = CARDINALS[math.floor((rot+45)/90) % 4 + 1]        -- 28°→0, 134°→90 …
 	end
+	return rot
+end
 
-	--Helpers 09262025
-	local function _stage3FootprintCells(buildingName : string, rotY : number)
-		rotY = (rotY or 0) % 360
-		local data = BuildingMasterList.getBuildingByName(buildingName)
-		if not data or not data.stages or not data.stages.Stage3 then
-			return 1, 1 -- safe fallback
-		end
-		local stg3 = data.stages.Stage3
-		local size = (stg3:IsA("Model") and stg3.PrimaryPart and stg3.PrimaryPart.Size) or stg3.Size
-		if not size then return 1, 1 end
+--Helpers 09262025
+local function _stage3FootprintCells(buildingName : string, rotY : number)
+	rotY = (rotY or 0) % 360
+	local data = BuildingMasterList.getBuildingByName(buildingName)
+	if not data or not data.stages or not data.stages.Stage3 then
+		return 1, 1 -- safe fallback
+	end
+	local stg3 = data.stages.Stage3
+	local size = (stg3:IsA("Model") and stg3.PrimaryPart and stg3.PrimaryPart.Size) or stg3.Size
+	if not size then return 1, 1 end
 
-		local w = math.ceil(size.X / GRID_SIZE)
-		local d = math.ceil(size.Z / GRID_SIZE)
-		if rotY == 90 or rotY == 270 then w, d = d, w end
-		return w, d
+	local w = math.ceil(size.X / GRID_SIZE)
+	local d = math.ceil(size.Z / GRID_SIZE)
+	if rotY == 90 or rotY == 270 then w, d = d, w end
+	return w, d
 end
 
 local function isIndividualMode(mode : string?)
@@ -583,169 +787,169 @@ local function snapTo0or180(deg : number) : number
 	return (dist180 <= dist0) and 180 or 0
 end
 
-	BuildingGeneratorModule._stage3FootprintCells = _stage3FootprintCells
+BuildingGeneratorModule._stage3FootprintCells = _stage3FootprintCells
 
-	-- Helper: remove ZoneTracker occupancy & quadtree for a single placed instance
-	local function _clearOccupancyForInstance(player, zoneId, inst : Instance)
-		if not inst then return end
-		local gx = inst:GetAttribute("GridX")
-		local gz = inst:GetAttribute("GridZ")
-		local rotY = inst:GetAttribute("RotationY") or 0
-		local bname = inst:GetAttribute("BuildingName")
-		if not (gx and gz and bname) then return end
+-- Helper: remove ZoneTracker occupancy & quadtree for a single placed instance
+local function _clearOccupancyForInstance(player, zoneId, inst : Instance)
+	if not inst then return end
+	local gx = inst:GetAttribute("GridX")
+	local gz = inst:GetAttribute("GridZ")
+	local rotY = inst:GetAttribute("RotationY") or 0
+	local bname = inst:GetAttribute("BuildingName")
+	if not (gx and gz and bname) then return end
 
-		local w, d = _stage3FootprintCells(bname, rotY)
-		local buildingId = ("%s_%d_%d"):format(zoneId, gx, gz)
+	local w, d = _stage3FootprintCells(bname, rotY)
+	local buildingId = ("%s_%d_%d"):format(zoneId, gx, gz)
 
-		for x = gx, gx + w - 1 do
-			for z = gz, gz + d - 1 do
-				ZoneTrackerModule.unmarkGridOccupied(player, x, z, 'building', buildingId)
-			end
-		end
-
-		-- Best-effort: remove from quadtree if a remover exists
-		if QuadtreeService and typeof(QuadtreeService.removeById) == "function" then
-			pcall(function() QuadtreeService:removeById(buildingId) end)
+	for x = gx, gx + w - 1 do
+		for z = gz, gz + d - 1 do
+			ZoneTrackerModule.unmarkGridOccupied(player, x, z, 'building', buildingId)
 		end
 	end
 
+	-- Best-effort: remove from quadtree if a remover exists
+	if QuadtreeService and typeof(QuadtreeService.removeById) == "function" then
+		pcall(function() QuadtreeService:removeById(buildingId) end)
+	end
+end
 
-	local function removeAndArchiveUnderlyingBuildings(player, zoneId, gridX, gridZ, width, depth)
-		-- overlay rectangle
-		local ax1, az1 = gridX, gridZ
-		local ax2, az2 = gridX + width  - 1, gridZ + depth - 1
 
-		local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
-		if not plot then return {} end
+local function removeAndArchiveUnderlyingBuildings(player, zoneId, gridX, gridZ, width, depth)
+	-- overlay rectangle
+	local ax1, az1 = gridX, gridZ
+	local ax2, az2 = gridX + width  - 1, gridZ + depth - 1
 
-		local populated = plot:FindFirstChild("Buildings")
-			and plot.Buildings:FindFirstChild("Populated")
-		if not populated then return {} end
+	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId)
+	if not plot then return {} end
 
-		local impactedZones = {}
+	local populated = plot:FindFirstChild("Buildings")
+		and plot.Buildings:FindFirstChild("Populated")
+	if not populated then return {} end
 
-		-- axis-aligned rectangle overlap (grid space)
-		local function rectsOverlap(bx1, bz1, bw, bd)
-			local bx2, bz2 = bx1 + bw - 1, bz1 + bd - 1
-			return not (bx2 < ax1 or bx1 > ax2 or bz2 < az1 or bz1 > az2)
-		end
+	local impactedZones = {}
 
-		for _, folder in ipairs(populated:GetChildren()) do
-			for _, inst in ipairs(folder:GetChildren()) do
-				if (inst:IsA("Model") or inst:IsA("BasePart")) then
-					local gx   = inst:GetAttribute("GridX")
-					local gz   = inst:GetAttribute("GridZ")
-					local rotY = inst:GetAttribute("RotationY") or 0
-					local bnm  = inst:GetAttribute("BuildingName")
+	-- axis-aligned rectangle overlap (grid space)
+	local function rectsOverlap(bx1, bz1, bw, bd)
+		local bx2, bz2 = bx1 + bw - 1, bz1 + bd - 1
+		return not (bx2 < ax1 or bx1 > ax2 or bz2 < az1 or bz1 > az2)
+	end
 
-					if gx and gz and bnm then
-						-- compute this instance’s footprint in grid cells
-						local w, d = _stage3FootprintCells(bnm, rotY)
-						if rectsOverlap(gx, gz, w, d) then
-							-- remember which original zone we’re about to affect
-							local originalZoneId = inst:GetAttribute("ZoneId")
-							if originalZoneId and originalZoneId ~= zoneId then
-								impactedZones[originalZoneId] = true
-							end
+	for _, folder in ipairs(populated:GetChildren()) do
+		for _, inst in ipairs(folder:GetChildren()) do
+			if (inst:IsA("Model") or inst:IsA("BasePart")) then
+				local gx   = inst:GetAttribute("GridX")
+				local gz   = inst:GetAttribute("GridZ")
+				local rotY = inst:GetAttribute("RotationY") or 0
+				local bnm  = inst:GetAttribute("BuildingName")
 
-							-- capture transform before destroying
-							local cf = _getInstanceCFrame(inst)
-
-							-- build an occupancy id consistent with generateBuilding()
-							local occId = (originalZoneId or "Unknown") .. "_" .. tostring(gx) .. "_" .. tostring(gz)
-
-							-- archive the full record so an undo can faithfully restore
-							LayerManagerModule.storeRemovedObject("Buildings", zoneId, {
-								instanceClone  = inst:Clone(),
-								parentName     = folder.Name, -- e.g. "Zone_..."/"Utilities"
-								cframe         = cf,
-								gridX          = gx,
-								gridZ          = gz,
-								rotation       = rotY,
-								wealthState    = inst:GetAttribute("WealthState"),
-								isUtility      = inst:GetAttribute("IsUtility") or false,
-								occupantType   = "building",
-								occupantId     = occId,
-								mode           = (function()
-									if originalZoneId then
-										local z = ZoneTrackerModule.getZoneById(player, originalZoneId)
-										return z and z.mode or nil
-									end
-								end)(),
-								zoneId         = originalZoneId,
-							})
-
-							-- clear occupancy & quadtree for the whole footprint
-							_clearOccupancyForInstance(player, originalZoneId or zoneId, inst)
-
-							-- remove the instance
-							inst:Destroy()
+				if gx and gz and bnm then
+					-- compute this instance’s footprint in grid cells
+					local w, d = _stage3FootprintCells(bnm, rotY)
+					if rectsOverlap(gx, gz, w, d) then
+						-- remember which original zone we’re about to affect
+						local originalZoneId = inst:GetAttribute("ZoneId")
+						if originalZoneId and originalZoneId ~= zoneId then
+							impactedZones[originalZoneId] = true
 						end
+
+						-- capture transform before destroying
+						local cf = _getInstanceCFrame(inst)
+
+						-- build an occupancy id consistent with generateBuilding()
+						local occId = (originalZoneId or "Unknown") .. "_" .. tostring(gx) .. "_" .. tostring(gz)
+
+						-- archive the full record so an undo can faithfully restore
+						LayerManagerModule.storeRemovedObject("Buildings", zoneId, {
+							instanceClone  = inst:Clone(),
+							parentName     = folder.Name, -- e.g. "Zone_..."/"Utilities"
+							cframe         = cf,
+							gridX          = gx,
+							gridZ          = gz,
+							rotation       = rotY,
+							wealthState    = inst:GetAttribute("WealthState"),
+							isUtility      = inst:GetAttribute("IsUtility") or false,
+							occupantType   = "building",
+							occupantId     = occId,
+							mode           = (function()
+								if originalZoneId then
+									local z = ZoneTrackerModule.getZoneById(player, originalZoneId)
+									return z and z.mode or nil
+								end
+							end)(),
+							zoneId         = originalZoneId,
+						})
+
+						-- clear occupancy & quadtree for the whole footprint
+						_clearOccupancyForInstance(player, originalZoneId or zoneId, inst)
+
+						-- remove the instance
+						inst:Destroy()
 					end
 				end
 			end
 		end
-
-		return impactedZones
 	end
 
-	-- Helper: Check 2D AABB u (only X and Z axes)
-	local function aabbOverlap2D(pos1, size1, pos2, size2)
-		local half1 = size1 * 0.5
-		local half2 = size2 * 0.5
-		if math.abs(pos1.X - pos2.X) <= (half1.X + half2.X) and math.abs(pos1.Z - pos2.Z) <= (half1.Z + half2.Z) then
-			return true
-		end
-		return false
+	return impactedZones
+end
+
+-- Helper: Check 2D AABB u (only X and Z axes)
+local function aabbOverlap2D(pos1, size1, pos2, size2)
+	local half1 = size1 * 0.5
+	local half2 = size2 * 0.5
+	if math.abs(pos1.X - pos2.X) <= (half1.X + half2.X) and math.abs(pos1.Z - pos2.Z) <= (half1.Z + half2.Z) then
+		return true
+	end
+	return false
+end
+
+-- Helper function to create a concrete pad beneath the building (accounting for rotation)
+local function createConcretePad(buildingModel)
+	local primaryPart = buildingModel.PrimaryPart
+	if not primaryPart then
+		warn("createConcretePad: Building model does not have a PrimaryPart.")
+		return
 	end
 
-	-- Helper function to create a concrete pad beneath the building (accounting for rotation)
-	local function createConcretePad(buildingModel)
-		local primaryPart = buildingModel.PrimaryPart
-		if not primaryPart then
-			warn("createConcretePad: Building model does not have a PrimaryPart.")
-			return
-		end
+	-- Calculate the size of the pad based on the PrimaryPart's size
+	local padSize = Vector3.new(primaryPart.Size.X, CONCRETE_PAD_HEIGHT, primaryPart.Size.Z)
 
-		-- Calculate the size of the pad based on the PrimaryPart's size
-		local padSize = Vector3.new(primaryPart.Size.X, CONCRETE_PAD_HEIGHT, primaryPart.Size.Z)
+	-- Create the pad
+	local concretePad = Instance.new("Part")
+	concretePad.Name = "ConcretePad"
+	concretePad.Size = padSize
+	concretePad.Anchored = true
+	concretePad.Material = CONCRETE_PAD_MATERIAL
+	concretePad.Color = CONCRETE_PAD_COLOR
+	concretePad.CanCollide = false
+	concretePad.CanQuery = false
 
-		-- Create the pad
-		local concretePad = Instance.new("Part")
-		concretePad.Name = "ConcretePad"
-		concretePad.Size = padSize
-		concretePad.Anchored = true
-		concretePad.Material = CONCRETE_PAD_MATERIAL
-		concretePad.Color = CONCRETE_PAD_COLOR
-		concretePad.CanCollide = false
-		concretePad.CanQuery = false
+	-- Compute how far down the pad should go, in local space
+	local yOffset = (primaryPart.Size.Y / 2) - 0.01 + (CONCRETE_PAD_HEIGHT / 2)
 
-		-- Compute how far down the pad should go, in local space
-		local yOffset = (primaryPart.Size.Y / 2) - 0.01 + (CONCRETE_PAD_HEIGHT / 2)
+	-- Create an offset CFrame that just moves us down in local space
+	local offsetCFrame = CFrame.new(0, -yOffset, 0)
 
-		-- Create an offset CFrame that just moves us down in local space
-		local offsetCFrame = CFrame.new(0, -yOffset, 0)
+	-- Position the pad relative to the building's PrimaryPart, preserving rotation
+	concretePad.CFrame = primaryPart.CFrame * offsetCFrame
 
-		-- Position the pad relative to the building's PrimaryPart, preserving rotation
-		concretePad.CFrame = primaryPart.CFrame * offsetCFrame
+	-- Parent the pad to the building model
+	concretePad.Parent = buildingModel
+end
 
-		-- Parent the pad to the building model
-		concretePad.Parent = buildingModel
-	end
+--Powerline integration start---------------------------------------------------------------------------------------------------
 
-	--Powerline integration start---------------------------------------------------------------------------------------------------
+local MAX_DROPS_PER_POLE = 1        -- how many buildings per pad-pole
+local MAX_DROP_DISTANCE  = 45       -- studs from pole to building centre
+local ROOF_CLEARANCE     = 1.2      -- studs above roof for nicer sag
+local IGNORE_FOR_SERVICE_DROP = { ConcretePad = true }
 
-	local MAX_DROPS_PER_POLE = 1        -- how many buildings per pad-pole
-	local MAX_DROP_DISTANCE  = 45       -- studs from pole to building centre
-	local ROOF_CLEARANCE     = 1.2      -- studs above roof for nicer sag
-	local IGNORE_FOR_SERVICE_DROP = { ConcretePad = true }
+local DECOR_PADPOLE_CHANCE = 0.10
 
-	local DECOR_PADPOLE_CHANCE = 0.10
+local prefab  = BuildingMasterList.getPowerLinesByStyle("Default")[1]and BuildingMasterList.getPowerLinesByStyle("Default")[1].stages.Stage3
+local electricBoxPrefab = BuildingMasterList.getIndividualBuildingByName("Power", "Default", "ElectricBox") and BuildingMasterList.getIndividualBuildingByName("Power", "Default", "ElectricBox")[1]
 
-	local prefab  = BuildingMasterList.getPowerLinesByStyle("Default")[1]and BuildingMasterList.getPowerLinesByStyle("Default")[1].stages.Stage3
-	local electricBoxPrefab = BuildingMasterList.getIndividualBuildingByName("Power", "Default", "ElectricBox") and BuildingMasterList.getIndividualBuildingByName("Power", "Default", "ElectricBox")[1]
-
-	-- Spawns extra, unconnected "ambient" pad-poles in a single building zone
+-- Spawns extra, unconnected "ambient" pad-poles in a single building zone
 -- chance: 0.0–1.0 (default 0.10)
 function BuildingGeneratorModule.spawnAmbientPadPolesInZone(player, bldZoneId, chance)
 	chance = tonumber(chance) or 0.10
@@ -805,7 +1009,7 @@ function BuildingGeneratorModule.spawnAmbientPadPolesInZone(player, bldZoneId, c
 end
 
 
-	local function spawnDecorPadPole(buildingModel: Model, polePrefab: Instance)
+local function spawnDecorPadPole(buildingModel: Model, polePrefab: Instance)
 	if not (buildingModel and polePrefab) then return end
 	local pad = buildingModel:FindFirstChild("ConcretePad")
 	if not (pad and pad:IsA("BasePart")) then return end
@@ -867,299 +1071,299 @@ end
 	pole:SetAttribute("NoAutoLink", true)     -- marker (optional)
 end
 
-	local function parentPlot(inst)
-		-- climb ancestors until we hit “Plot_12345”, or nil
-		local ptr = inst
-		while ptr and ptr.Parent do
-			if ptr.Name:match("^Plot_%d+$") then return ptr end
-			ptr = ptr.Parent
-		end
+local function parentPlot(inst)
+	-- climb ancestors until we hit “Plot_12345”, or nil
+	local ptr = inst
+	while ptr and ptr.Parent do
+		if ptr.Name:match("^Plot_%d+$") then return ptr end
+		ptr = ptr.Parent
 	end
+end
 
-	local function buildingCenter(model : Model)
-		-- use full bounding box instead of PrimaryPart alone
-		local cf, _ = model:GetBoundingBox()
-		return cf.Position
-	end
+local function buildingCenter(model : Model)
+	-- use full bounding box instead of PrimaryPart alone
+	local cf, _ = model:GetBoundingBox()
+	return cf.Position
+end
 
-	local WEALTHED_ZONES : { [string]: boolean } = {
-		Residential = true, Commercial = true, Industrial = true,
-		ResDense    = true, CommDense   = true, IndusDense   = true,
-	}
+local WEALTHED_ZONES : { [string]: boolean } = {
+	Residential = true, Commercial = true, Industrial = true,
+	ResDense    = true, CommDense   = true, IndusDense   = true,
+}
 
-	---------------------------------------------------------------------
-	-- gather candidate buildings *only inside the same plot* and
-	-- return them sorted by distance (nearest first) -------------------
-	---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- gather candidate buildings *only inside the same plot* and
+-- return them sorted by distance (nearest first) -------------------
+---------------------------------------------------------------------
 
-	local function hasGrassPart(model : Model) : boolean
-		for _, d in ipairs(model:GetDescendants()) do
-			if d:IsA("BasePart") then
-				local mat = d.Material
-				if mat == Enum.Material.Grass      -- classic grass
-					or mat == Enum.Material.LeafyGrass   -- newer material
-				then
-					return true
-				end
-			end
-		end
-		return false
-	end
-
-	local function getGrassPart(model : Model)
-		for _, p in ipairs(model:GetDescendants()) do
-			if p:IsA("BasePart") then
-				local m = p.Material
-				if m == Enum.Material.Grass or m == Enum.Material.LeafyGrass then
-					return p
-				end
-			end
-		end
-		return nil
-	end
-
-	local function _hasDecToken(s : any) : boolean
-		return type(s) == "string" and string.find(string.lower(s), "dec", 1, true) ~= nil
-	end
-
-	local function _tileWealthForPlacement(mode, defaultWealthState, player, zoneId, x, z)
-		local w = defaultWealthState or "Poor"
-		if WEALTHED_ZONES[mode] and typeof(ZoneTrackerModule.getGridWealth) == "function" then
-			local isPop = typeof(ZoneTrackerModule.isZonePopulating) == "function"
-				and ZoneTrackerModule.isZonePopulating(player, zoneId)
-			if not isPop then
-				w = ZoneTrackerModule.getGridWealth(player, zoneId, x, z) or w
-			end
-		end
-		return w
-	end
-
-	local function isDecorModel(model : Instance) : boolean
-		if not (model and model:IsA("Model")) then return false end
-		-- Heuristics: model name, WealthState attribute, or any descendant part name
-		if _hasDecToken(model.Name) then return true end
-		local ws = model:GetAttribute("WealthState")
-		if ws and tostring(ws) == "Decorations" then return true end
-		for _, d in ipairs(model:GetDescendants()) do
-			if d:IsA("BasePart") and _hasDecToken(d.Name) then
+local function hasGrassPart(model : Model) : boolean
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local mat = d.Material
+			if mat == Enum.Material.Grass      -- classic grass
+				or mat == Enum.Material.LeafyGrass   -- newer material
+			then
 				return true
 			end
 		end
-		return false
 	end
+	return false
+end
 
-	local function getPoleAttachmentsOnBaseParts(padPole : Instance)
-		local found = {}
-		for _, a in ipairs(padPole:GetDescendants()) do
-			if a:IsA("Attachment") and (a.Name == "1" or a.Name == "2") then
-				if a.Parent and a.Parent:IsA("BasePart") then
-					table.insert(found, a)
-				end
+local function getGrassPart(model : Model)
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local m = p.Material
+			if m == Enum.Material.Grass or m == Enum.Material.LeafyGrass then
+				return p
 			end
 		end
-		table.sort(found, function(a,b) return a.Name < b.Name end) -- "1" then "2"
-		return found
 	end
+	return nil
+end
 
-	---------------------------------------------------------------------
-	-- build-side helper: fabricate a random “ServiceIn” attachment
-	---------------------------------------------------------------------
-	local function createRoofAttachment(model : Model, exclude : Instance?)
-		-- helper: is this BasePart OK to use?
-		local function ok(p : Instance)
-			return p:IsA("BasePart")
-				and not IGNORE_FOR_SERVICE_DROP[p.Name]     
-				and not (exclude and p:IsDescendantOf(exclude))  
-				and not _hasDecToken(p.Name)                     
+local function _hasDecToken(s : any) : boolean
+	return type(s) == "string" and string.find(string.lower(s), "dec", 1, true) ~= nil
+end
+
+local function _tileWealthForPlacement(mode, defaultWealthState, player, zoneId, x, z)
+	local w = defaultWealthState or "Poor"
+	if WEALTHED_ZONES[mode] and typeof(ZoneTrackerModule.getGridWealth) == "function" then
+		local isPop = typeof(ZoneTrackerModule.isZonePopulating) == "function"
+			and ZoneTrackerModule.isZonePopulating(player, zoneId)
+		if not isPop then
+			w = ZoneTrackerModule.getGridWealth(player, zoneId, x, z) or w
 		end
+	end
+	return w
+end
 
-		-- Prefer PrimaryPart if valid
-		local pp = model.PrimaryPart
-		if pp and ok(pp) then
-			local att = Instance.new("Attachment")
-			att.Name     = "ServiceIn"
-			att.Position = Vector3.new(0, pp.Size.Y * 0.5 + ROOF_CLEARANCE, 0) -- local space
-			att.Parent   = pp
-			return att
+local function isDecorModel(model : Instance) : boolean
+	if not (model and model:IsA("Model")) then return false end
+	-- Heuristics: model name, WealthState attribute, or any descendant part name
+	if _hasDecToken(model.Name) then return true end
+	local ws = model:GetAttribute("WealthState")
+	if ws and tostring(ws) == "Decorations" then return true end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") and _hasDecToken(d.Name) then
+			return true
 		end
+	end
+	return false
+end
 
-		-- Otherwise pick the top-most valid BasePart (not the pole, not the pad)
-		local host, topY = nil, -math.huge
-		for _, p in ipairs(model:GetDescendants()) do
-			if ok(p) then
-				local y = p.Position.Y + p.Size.Y * 0.5
-				if y > topY then host, topY = p, y end
+local function getPoleAttachmentsOnBaseParts(padPole : Instance)
+	local found = {}
+	for _, a in ipairs(padPole:GetDescendants()) do
+		if a:IsA("Attachment") and (a.Name == "1" or a.Name == "2") then
+			if a.Parent and a.Parent:IsA("BasePart") then
+				table.insert(found, a)
 			end
 		end
-		if not host then return nil end
+	end
+	table.sort(found, function(a,b) return a.Name < b.Name end) -- "1" then "2"
+	return found
+end
 
-		local rx = (math.random() - 0.5) * host.Size.X
-		local rz = (math.random() - 0.5) * host.Size.Z
+---------------------------------------------------------------------
+-- build-side helper: fabricate a random “ServiceIn” attachment
+---------------------------------------------------------------------
+local function createRoofAttachment(model : Model, exclude : Instance?)
+	-- helper: is this BasePart OK to use?
+	local function ok(p : Instance)
+		return p:IsA("BasePart")
+			and not IGNORE_FOR_SERVICE_DROP[p.Name]     
+			and not (exclude and p:IsDescendantOf(exclude))  
+			and not _hasDecToken(p.Name)                     
+	end
+
+	-- Prefer PrimaryPart if valid
+	local pp = model.PrimaryPart
+	if pp and ok(pp) then
 		local att = Instance.new("Attachment")
 		att.Name     = "ServiceIn"
-		att.Position = Vector3.new(rx, host.Size.Y * 0.5 + ROOF_CLEARANCE, rz) -- local
-		att.Parent   = host
+		att.Position = Vector3.new(0, pp.Size.Y * 0.5 + ROOF_CLEARANCE, 0) -- local space
+		att.Parent   = pp
 		return att
 	end
 
-	---------------------------------------------------------------------
-	-- single rope helper
-	---------------------------------------------------------------------
-	local function makeDropRope(att0 : Attachment, att1 : Attachment)
-		local rope            = Instance.new("RopeConstraint")
-		rope.Attachment0      = att0
-		rope.Attachment1      = att1
-		rope.Visible          = true
-		rope.Color            = BrickColor.new("Black")
-		rope.Thickness        = 0.05
-		rope.WinchEnabled     = false
-		rope.Restitution      = 0
-		local span            = (att0.WorldPosition - att1.WorldPosition).Magnitude
-		rope.Length           = span + 0.75          -- small slack
-		rope.Parent           = att0.Parent
+	-- Otherwise pick the top-most valid BasePart (not the pole, not the pad)
+	local host, topY = nil, -math.huge
+	for _, p in ipairs(model:GetDescendants()) do
+		if ok(p) then
+			local y = p.Position.Y + p.Size.Y * 0.5
+			if y > topY then host, topY = p, y end
+		end
 	end
-	---------------------------------------------------------------------
-	-- gather candidate buildings around a point (no pre-tagging needed)
-	---------------------------------------------------------------------
-	local function findNearbyBuildings(padPole : Instance, radius : number)
-		local plot   = parentPlot(padPole)
-		if not plot then return {} end
+	if not host then return nil end
 
-		local origin = (padPole:IsA("Model") and padPole.PrimaryPart and padPole.PrimaryPart.Position)
-			or (padPole:IsA("BasePart") and padPole.Position)
-		if not origin then return {} end
+	local rx = (math.random() - 0.5) * host.Size.X
+	local rz = (math.random() - 0.5) * host.Size.Z
+	local att = Instance.new("Attachment")
+	att.Name     = "ServiceIn"
+	att.Position = Vector3.new(rx, host.Size.Y * 0.5 + ROOF_CLEARANCE, rz) -- local
+	att.Parent   = host
+	return att
+end
 
-		local populated = plot:FindFirstChild("Buildings")
-			and plot.Buildings:FindFirstChild("Populated")
-		if not populated then return {} end
+---------------------------------------------------------------------
+-- single rope helper
+---------------------------------------------------------------------
+local function makeDropRope(att0 : Attachment, att1 : Attachment)
+	local rope            = Instance.new("RopeConstraint")
+	rope.Attachment0      = att0
+	rope.Attachment1      = att1
+	rope.Visible          = true
+	rope.Color            = BrickColor.new("Black")
+	rope.Thickness        = 0.05
+	rope.WinchEnabled     = false
+	rope.Restitution      = 0
+	local span            = (att0.WorldPosition - att1.WorldPosition).Magnitude
+	rope.Length           = span + 0.75          -- small slack
+	rope.Parent           = att0.Parent
+end
+---------------------------------------------------------------------
+-- gather candidate buildings around a point (no pre-tagging needed)
+---------------------------------------------------------------------
+local function findNearbyBuildings(padPole : Instance, radius : number)
+	local plot   = parentPlot(padPole)
+	if not plot then return {} end
 
-		local candidates = {}
-		for _, folder in ipairs(populated:GetChildren()) do
-			for _, inst in ipairs(folder:GetChildren()) do
-				if inst:IsA("Model") and not hasGrassPart(inst) then
-					local centre = buildingCenter(inst)
-					local dist   = (centre - origin).Magnitude
-					if dist <= radius then
-						table.insert(candidates, {m = inst, d = dist})
-					end
+	local origin = (padPole:IsA("Model") and padPole.PrimaryPart and padPole.PrimaryPart.Position)
+		or (padPole:IsA("BasePart") and padPole.Position)
+	if not origin then return {} end
+
+	local populated = plot:FindFirstChild("Buildings")
+		and plot.Buildings:FindFirstChild("Populated")
+	if not populated then return {} end
+
+	local candidates = {}
+	for _, folder in ipairs(populated:GetChildren()) do
+		for _, inst in ipairs(folder:GetChildren()) do
+			if inst:IsA("Model") and not hasGrassPart(inst) then
+				local centre = buildingCenter(inst)
+				local dist   = (centre - origin).Magnitude
+				if dist <= radius then
+					table.insert(candidates, {m = inst, d = dist})
 				end
 			end
 		end
-		table.sort(candidates, function(a,b) return a.d < b.d end)   -- nearest first
-		return candidates
+	end
+	table.sort(candidates, function(a,b) return a.d < b.d end)   -- nearest first
+	return candidates
+end
+
+---------------------------------------------------------------------
+-- PUBLIC: call from spawnPadPowerPoles after you parent the new pole
+---------------------------------------------------------------------
+local function attachRandomServiceDrops(padPole : Instance)
+	local poleAtt = getPoleAttachmentsOnBaseParts(padPole)
+	if #poleAtt < 2 then
+		warn("attachRandomServiceDrops: need attachments '1' and '2' on BaseParts")
+		return
 	end
 
-	---------------------------------------------------------------------
-	-- PUBLIC: call from spawnPadPowerPoles after you parent the new pole
-	---------------------------------------------------------------------
-	local function attachRandomServiceDrops(padPole : Instance)
-		local poleAtt = getPoleAttachmentsOnBaseParts(padPole)
-		if #poleAtt < 2 then
-			warn("attachRandomServiceDrops: need attachments '1' and '2' on BaseParts")
-			return
-		end
+	local cand = findNearbyBuildings(padPole, MAX_DROP_DISTANCE)
+	if #cand == 0 then return end
 
-		local cand = findNearbyBuildings(padPole, MAX_DROP_DISTANCE)
-		if #cand == 0 then return end
-
-		-- walk outward until we find a non-Dec house with a valid roof attachment
-		local roofAtt, targetModel
-		for _, rec in ipairs(cand) do
-			if not isDecorModel(rec.m) then
-				local att = createRoofAttachment(rec.m, padPole) -- still excludes the pole/pad
-				if att then
-					roofAtt     = att
-					targetModel = rec.m
-					break
-				end
+	-- walk outward until we find a non-Dec house with a valid roof attachment
+	local roofAtt, targetModel
+	for _, rec in ipairs(cand) do
+		if not isDecorModel(rec.m) then
+			local att = createRoofAttachment(rec.m, padPole) -- still excludes the pole/pad
+			if att then
+				roofAtt     = att
+				targetModel = rec.m
+				break
 			end
 		end
-		if not roofAtt then return end
+	end
+	if not roofAtt then return end
 
-		makeDropRope(poleAtt[1], roofAtt)
-		makeDropRope(poleAtt[2], roofAtt)
+	makeDropRope(poleAtt[1], roofAtt)
+	makeDropRope(poleAtt[2], roofAtt)
 
-		if DEBUG then
-			print("[ServiceDrop]",
-				"target:", targetModel and targetModel.Name or "nil",
-				"span:", (poleAtt[1].WorldPosition - roofAtt.WorldPosition).Magnitude
-			)
-		end
+	if DEBUG then
+		print("[ServiceDrop]",
+			"target:", targetModel and targetModel.Name or "nil",
+			"span:", (poleAtt[1].WorldPosition - roofAtt.WorldPosition).Magnitude
+		)
+	end
+end
+
+local function spawnElectricBox(buildingModel : Model, prefab, targetPart : BasePart)
+	if not (prefab and targetPart) then return end
+
+	-- Stage 3 of the prefab
+	local box = prefab.stages
+		and prefab.stages.Stage3
+		and prefab.stages.Stage3:Clone()
+	if not box then return end
+
+	-- ↑ This is the only line you need to tweak ↓
+	if box:IsA("Model") and box.PrimaryPart then
+		box:SetPrimaryPartCFrame(targetPart.CFrame * CFrame.new(0, 0.5, 0))
+	else
+		box.CFrame = targetPart.CFrame * CFrame.new(0, 0.5, 0)
 	end
 
-	local function spawnElectricBox(buildingModel : Model, prefab, targetPart : BasePart)
-		if not (prefab and targetPart) then return end
+	box.Name   = "ElectricBox"
+	box.Parent = buildingModel
+end
 
-		-- Stage 3 of the prefab
-		local box = prefab.stages
-			and prefab.stages.Stage3
-			and prefab.stages.Stage3:Clone()
-		if not box then return end
 
-		-- ↑ This is the only line you need to tweak ↓
-		if box:IsA("Model") and box.PrimaryPart then
-			box:SetPrimaryPartCFrame(targetPart.CFrame * CFrame.new(0, 0.5, 0))
-		else
-			box.CFrame = targetPart.CFrame * CFrame.new(0, 0.5, 0)
+--Spawn powerpoles at concrete pad helper function
+local function spawnPadPowerPoles(buildingModel, polePrefab)
+	local grassPart = getGrassPart(buildingModel)
+	if grassPart then
+		if math.random() < 0.25 then                   -- 25 % roll
+			spawnElectricBox(buildingModel, electricBoxPrefab, grassPart)
 		end
-
-		box.Name   = "ElectricBox"
-		box.Parent = buildingModel
+		return                                         -- never place a pole on grass
 	end
 
+	local pad = buildingModel:FindFirstChild("ConcretePad")
+	if not (pad and polePrefab) then return end           -- nothing to do
 
-	--Spawn powerpoles at concrete pad helper function
-	local function spawnPadPowerPoles(buildingModel, polePrefab)
-		local grassPart = getGrassPart(buildingModel)
-		if grassPart then
-			if math.random() < 0.25 then                   -- 25 % roll
-				spawnElectricBox(buildingModel, electricBoxPrefab, grassPart)
+	-- 25 % chance that *this pad* gets a pole
+	if math.random() >= 0.25 then return end
+
+	-- local-space corner offsets (pad Y centre == top face)
+	local dx, dz  =  pad.Size.X * 0.5,  pad.Size.Z * 0.5
+	local offsets = {
+		Vector3.new( dx, pad.Size.Y * 0.5,  dz),
+		Vector3.new(-dx, pad.Size.Y * 0.5,  dz),
+		Vector3.new( dx, pad.Size.Y * 0.5, -dz),
+		Vector3.new(-dx, pad.Size.Y * 0.5, -dz),
+	}
+
+	-- choose one corner at random
+	local off = offsets[math.random(#offsets)]
+
+	local pole = polePrefab:Clone()
+	pole.Name  = "PadPole"
+	if pole:IsA("Model") and pole.PrimaryPart then
+		pole:SetPrimaryPartCFrame(pad.CFrame * CFrame.new(off))
+	else
+		pole.CFrame = pad.CFrame * CFrame.new(off)
+	end
+	pole.Parent = buildingModel
+	pole:SetAttribute("IsPadPole", true)
+	attachRandomServiceDrops(pole)
+
+	local zid = buildingModel:GetAttribute("ZoneId")
+	if zid then
+		local uidStr = zid:match("_(%d+)_") or zid:match("_(%d+)$")
+		local uid    = uidStr and tonumber(uidStr)
+		if uid then
+			local plr = game:GetService("Players"):GetPlayerByUserId(uid)
+			if plr then
+				PadPoleSpawned:Fire(plr, pole)
 			end
-			return                                         -- never place a pole on grass
 		end
-		
-		local pad = buildingModel:FindFirstChild("ConcretePad")
-		if not (pad and polePrefab) then return end           -- nothing to do
-
-		-- 25 % chance that *this pad* gets a pole
-		if math.random() >= 0.25 then return end
-
-		-- local-space corner offsets (pad Y centre == top face)
-		local dx, dz  =  pad.Size.X * 0.5,  pad.Size.Z * 0.5
-		local offsets = {
-			Vector3.new( dx, pad.Size.Y * 0.5,  dz),
-			Vector3.new(-dx, pad.Size.Y * 0.5,  dz),
-			Vector3.new( dx, pad.Size.Y * 0.5, -dz),
-			Vector3.new(-dx, pad.Size.Y * 0.5, -dz),
-		}
-
-		-- choose one corner at random
-		local off = offsets[math.random(#offsets)]
-
-		local pole = polePrefab:Clone()
-		pole.Name  = "PadPole"
-		if pole:IsA("Model") and pole.PrimaryPart then
-			pole:SetPrimaryPartCFrame(pad.CFrame * CFrame.new(off))
-		else
-			pole.CFrame = pad.CFrame * CFrame.new(off)
-		end
-		pole.Parent = buildingModel
-		pole:SetAttribute("IsPadPole", true)
-		attachRandomServiceDrops(pole)
-		
-		local zid = buildingModel:GetAttribute("ZoneId")
-		if zid then
-			local uidStr = zid:match("_(%d+)_") or zid:match("_(%d+)$")
-			local uid    = uidStr and tonumber(uidStr)
-			if uid then
-				local plr = game:GetService("Players"):GetPlayerByUserId(uid)
-				if plr then
-					PadPoleSpawned:Fire(plr, pole)
-				end
-			end
-		end
-		
 	end
+
+end
 
 
 
@@ -1281,429 +1485,440 @@ function BuildingGeneratorModule.spawnPadPowerPoles(buildingModel, polePrefab, a
 end
 
 
-	--Powerline integration end
+--Powerline integration end
 
-	-- Function to check if a building can be placed at the given grid coordinates
-	function BuildingGeneratorModule.canPlaceBuilding(player, zoneBounds, buildingSize, startX, startZ, zoneId, mode)
-		local endX = startX + buildingSize.width  - 1
-		local endZ = startZ + buildingSize.depth - 1
-		if  startX < zoneBounds.minX or startZ < zoneBounds.minZ
-			or endX > zoneBounds.maxX  or endZ > zoneBounds.maxZ
-		then
-			return false
-		end
-
-		-- Overlay may sit on others, but still must not trample an active reservation
-		if OverlayZoneTypes[mode] then
-			return not GridUtils.anyReservationsBlocked(player, zoneId, startX, startZ, buildingSize.width, buildingSize.depth)
-		end
-
-		for x = startX, endX do
-			for z = startZ, endZ do
-				if GridUtils.isReservedByOther(player, zoneId, x, z) then
-					return false
-				end
-				if ZoneTrackerModule.isGridOccupied(
-					player, x, z,
-					{ excludeOccupantId = zoneId, excludeZoneTypes = OverlapExclusions }
-					) then
-					return false
-				end
-			end
-		end
-		return true
+-- Function to check if a building can be placed at the given grid coordinates
+function BuildingGeneratorModule.canPlaceBuilding(player, zoneBounds, buildingSize, startX, startZ, zoneId, mode)
+	local endX = startX + buildingSize.width  - 1
+	local endZ = startZ + buildingSize.depth - 1
+	if  startX < zoneBounds.minX or startZ < zoneBounds.minZ
+		or endX > zoneBounds.maxX  or endZ > zoneBounds.maxZ
+	then
+		return false
 	end
 
-	-- Generate buildings at specific Grid Coordinates
-	function BuildingGeneratorModule.generateBuilding(
-		terrain, parentFolder, player, zoneId, mode, gridCoord, buildingData,
-		isUtility, rotationY, onPlaced, wealthState, skipStages, existingReservationHandle,
-		quotaCtx
-	)
-		skipStages = skipStages or false
-		rotationY  = rotationY or 0
+	-- Overlay may sit on others, but still must not trample an active reservation
+	if OverlayZoneTypes[mode] then
+		return not GridUtils.anyReservationsBlocked(player, zoneId, startX, startZ, buildingSize.width, buildingSize.depth)
+	end
 
-		-- Adopt any passed-in reservation handle immediately and install helpers
-		local resHandle = existingReservationHandle
-		local function _releaseReservation()
-			if resHandle then
-				GridUtils.releaseReservation(resHandle)
-				resHandle = nil
+	for x = startX, endX do
+		for z = startZ, endZ do
+			if GridUtils.isReservedByOther(player, zoneId, x, z) then
+				return false
+			end
+			if ZoneTrackerModule.isGridOccupied(
+				player, x, z,
+				{ excludeOccupantId = zoneId, excludeZoneTypes = OverlapExclusions }
+				) then
+				return false
 			end
 		end
-		local function _abortEarly(msg)
-			if msg then warn(msg) end
-			_releaseReservation()
-			return
+	end
+	return true
+end
+
+-- Generate buildings at specific Grid Coordinates
+function BuildingGeneratorModule.generateBuilding(
+	terrain, parentFolder, player, zoneId, mode, gridCoord, buildingData,
+	isUtility, rotationY, onPlaced, wealthState, skipStages, existingReservationHandle,
+	quotaCtx
+)
+	skipStages = skipStages or false
+	rotationY  = rotationY or 0
+
+	-- Adopt any passed-in reservation handle immediately and install helpers
+	local resHandle = existingReservationHandle
+	local function _releaseReservation()
+		if resHandle then
+			GridUtils.releaseReservation(resHandle)
+			resHandle = nil
 		end
+	end
+	local function _abortEarly(msg)
+		if msg then warn(msg) end
+		_releaseReservation()
+		return
+	end
 
-		-- Early checks (safe to abort without leaking a passed-in handle)
-		if shouldAbort(player, zoneId) then
-			return _abortEarly("zone tombstoned/aborted")
-		end
+	-- Early checks (safe to abort without leaking a passed-in handle)
+	if shouldAbort(player, zoneId) then
+		return _abortEarly("zone tombstoned/aborted")
+	end
 
-		if typeof(gridCoord) ~= "table" or gridCoord.x == nil or gridCoord.z == nil then
-			warn("BuildingGeneratorModule: Invalid gridCoord provided.", gridCoord)
-			return _abortEarly("invalid gridCoord")
-		end
+	if typeof(gridCoord) ~= "table" or gridCoord.x == nil or gridCoord.z == nil then
+		warn("BuildingGeneratorModule: Invalid gridCoord provided.", gridCoord)
+		return _abortEarly("invalid gridCoord")
+	end
 
-		if not terrain then
-			warn("BuildingGeneratorModule: 'terrain' parameter is nil.")
-			return _abortEarly("no terrain")
-		end
+	if not terrain then
+		warn("BuildingGeneratorModule: 'terrain' parameter is nil.")
+		return _abortEarly("no terrain")
+	end
 
-		local playerPlot = terrain.Parent
-		local gBounds, gTerrains = getGlobalBoundsForPlot(playerPlot)
+	local playerPlot = terrain.Parent
+	local gBounds, gTerrains = getGlobalBoundsForPlot(playerPlot)
 
-		local terrainSize = terrain.Size
-		local terrainPos  = terrain.Position
+	local terrainSize = terrain.Size
+	local terrainPos  = terrain.Position
 
-		-- Retrieve building size dynamically from Stage3
-		local finalStage = (buildingData and buildingData.stages) and buildingData.stages.Stage3
-		if not finalStage then
-			warn(string.format(
-				"BuildingGeneratorModule: Stage3 missing for '%s' (will skip placement).",
-				buildingData and tostring(buildingData.name) or "nil"
-				))
-			return _abortEarly("Stage3 missing")
-		end
+	-- Retrieve building size dynamically from Stage3
+	local finalStage = (buildingData and buildingData.stages) and buildingData.stages.Stage3
+	if not finalStage then
+		warn(string.format(
+			"BuildingGeneratorModule: Stage3 missing for '%s' (will skip placement).",
+			buildingData and tostring(buildingData.name) or "nil"
+			))
+		return _abortEarly("Stage3 missing")
+	end
 
-		-- Calculate the extents size of the final stage
-		local buildingSizeVector
-		if finalStage:IsA("Model") then
-			if finalStage.PrimaryPart then
-				buildingSizeVector = finalStage.PrimaryPart.Size
-			else
-				warn(string.format("BuildingGeneratorModule: Stage3 of '%s' does not have a PrimaryPart.", buildingData.name))
-				return _abortEarly("Stage3 model has no PrimaryPart")
-			end
+	-- Calculate the extents size of the final stage
+	local buildingSizeVector
+	if finalStage:IsA("Model") then
+		if finalStage.PrimaryPart then
+			buildingSizeVector = finalStage.PrimaryPart.Size
 		else
-			buildingSizeVector = finalStage.Size
-			if not buildingSizeVector then
-				warn(string.format("BuildingGeneratorModule: Stage3 of '%s' is not a Model and lacks Size property.", buildingData.name))
-				return _abortEarly("Stage3 part has no Size")
-			end
+			warn(string.format("BuildingGeneratorModule: Stage3 of '%s' does not have a PrimaryPart.", buildingData.name))
+			return _abortEarly("Stage3 model has no PrimaryPart")
 		end
-
-		-- Calculate building size in grid units (ceil)
-		local buildingWidth = math.floor(buildingSizeVector.X / GRID_SIZE)
-		local buildingDepth = math.floor(buildingSizeVector.Z / GRID_SIZE)
-		if buildingSizeVector.X % GRID_SIZE > 0 then buildingWidth += 1 end
-		if buildingSizeVector.Z % GRID_SIZE > 0 then buildingDepth += 1 end
-
-		-- Adjust dimensions based on rotation
-		local rotatedWidth, rotatedDepth = buildingWidth, buildingDepth
-		if rotationY == 90 or rotationY == 270 then
-			rotatedWidth, rotatedDepth = buildingDepth, buildingWidth
-		end
-
-		-- Overlay handling (remove underlying stuff before we actually place)
-		local impactedZones
-		if OverlayZoneTypes[mode] then
-			impactedZones = removeAndArchiveUnderlyingBuildings(
-				player, zoneId,
-				gridCoord.x, gridCoord.z,
-				rotatedWidth, rotatedDepth
-			)
-		end
-
-		-- Ensure we hold a reservation for the exact footprint (assume ownership and release)
-		if not resHandle then
-			resHandle = select(1, GridUtils.reserveFootprint(
-				player, zoneId, "building",
-				gridCoord.x, gridCoord.z,
-				rotatedWidth, rotatedDepth,
-				{ ttl = 15.0 }
-				))
-			if not resHandle then
-				debugPrint(("[reserve] %s @(%d,%d) blocked"):format(
-					buildingData and buildingData.name or "?", gridCoord.x, gridCoord.z))
-				return _abortEarly("reserveFootprint failed")
-			end
-		end
-
-		----------------------------------------------------------------------
-		-- From here on: **protected section** — make sure we never leak resHandle
-		----------------------------------------------------------------------
-		local ok, err = xpcall(function()
-
-			-- Compute building's world position
-			local cellCenterX, _, cellCenterZ =
-				GridUtils.globalGridToWorldPosition(gridCoord.x, gridCoord.z, gBounds, gTerrains)
-
-			local topLeftWorldX = cellCenterX - (GRID_SIZE / 2)
-			local topLeftWorldZ = cellCenterZ - (GRID_SIZE / 2)
-
-			local buildingWidthWorld  = rotatedWidth * GRID_SIZE
-			local buildingDepthWorld  = rotatedDepth * GRID_SIZE
-			local halfWidthWorld      = buildingWidthWorld * 0.5
-			local halfDepthWorld      = buildingDepthWorld * 0.5
-
-			local finalPosition = Vector3.new(
-				topLeftWorldX + halfWidthWorld,
-				terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
-				topLeftWorldZ + halfDepthWorld
-			)
-
-			-- Helper to place a stage at the correct position/rotation
-			local function placeStage(stageModel)
-				local stageClone = stageModel:Clone()
-				if stageClone:IsA("Model") then
-					stageClone:SetPrimaryPartCFrame(
-						CFrame.new(finalPosition) * CFrame.Angles(0, math.rad(rotationY), 0)
-					)
-				else
-					stageClone.Position    = finalPosition
-					stageClone.Orientation = Vector3.new(0, rotationY, 0)
-				end
-				stageClone.Parent = parentFolder
-				stageClone:SetAttribute("ZoneId", zoneId)
-				stageClone:SetAttribute("BuildingName", buildingData.name)
-				stageClone:SetAttribute("WealthState", wealthState or "Poor")
-				if isUtility then stageClone:SetAttribute("IsUtility", true) end
-				return stageClone
-			end
-
-			-- Stage flow
-			local finalStageClone
-			if not skipStages then
-				local stage1Clones = {}
-				local allTracks    = {}
-
-				local function collectAnimations(root)
-					local out = {}
-					for _, desc in ipairs(root:GetDescendants()) do
-						if desc:IsA("Animation") then
-							table.insert(out, desc)
-						end
-					end
-					return out
-				end
-
-				for dx = 0, rotatedWidth - 1 do
-					for dz = 0, rotatedDepth - 1 do
-						local cx, _, cz = GridUtils.globalGridToWorldPosition(
-							gridCoord.x + dx,
-							gridCoord.z + dz,
-							gBounds, gTerrains
-						)
-						local pos = Vector3.new(
-							cx,
-							terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
-							cz
-						)
-
-						local preview = buildingData.stages.Stage1:Clone()
-						if preview:IsA("Model") and preview.PrimaryPart then
-							preview:SetPrimaryPartCFrame(
-								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-									CFrame.Angles(0, math.rad(rotationY), 0)
-							)
-						else
-							preview.CFrame =
-								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-								CFrame.Angles(0, math.rad(rotationY), 0)
-						end
-						preview.Parent = parentFolder
-						preview:SetAttribute("ZoneId", zoneId)
-						preview:SetAttribute("BuildingName", buildingData.name)
-						preview:SetAttribute("WealthState", wealthState or "Poor")
-						preview:SetAttribute("GridX", gridCoord.x)
-						preview:SetAttribute("GridZ", gridCoord.z)
-						preview:SetAttribute("RotationY", rotationY)
-						if isUtility then preview:SetAttribute("IsUtility", true) end
-
-						table.insert(stage1Clones, preview)
-
-						-- Try to gather an animation to play
-						local animator, animations = nil, {}
-						local animController = preview:FindFirstChild("AnimationController", true)
-						if animController then
-							animator   = animController:FindFirstChildOfClass("Animator", true)
-							animations = collectAnimations(animator or animController)
-						end
-						if (not animator) or #animations == 0 then
-							local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
-							if humanoid then
-								animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
-								animations = collectAnimations(animator)
-							end
-						end
-						if animator and #animations > 0 then
-							local track = animator:LoadAnimation(animations[1])
-							table.insert(allTracks, track)
-						end
-					end
-				end
-
-				local waitDuration = 0
-				if #allTracks > 0 then
-					for _, track in ipairs(allTracks) do
-						-- Some rigs report Length=0 until the first frame; poll briefly
-						while track.Length == 0 do waitScaled(0.02) end
-						-- Speed up the animation itself
-						if BuildSpeed.enabled then
-							track:AdjustSpeed(BuildSpeed.multiplier)
-						else
-							track:AdjustSpeed(1)
-						end
-						waitDuration = math.max(waitDuration, track.Length)
-						track:Play()
-					end
-					-- Even though we sped the track, Roblox keeps Length as the authoring length.
-					-- So we scale the *wait* duration ourselves:
-					waitScaled(waitDuration)
-				else
-					waitScaled(getBuildingInterval())
-				end
-
-				if shouldAbort(player, zoneId) then
-					for _, preview in ipairs(stage1Clones) do
-						if preview and preview.Parent then preview:Destroy() end
-					end
-					ZoneTrackerModule.setZonePopulating(player, zoneId, false)
-					return _abortEarly("aborted during Stage1")
-				end
-
-				for _, preview in ipairs(stage1Clones) do
-					preview:Destroy()
-				end
-
-				-- Stage 2
-				local stage2 = placeStage(buildingData.stages.Stage2)
-				stage2.Anchored   = true
-				stage2.CanCollide = false
-
-				-- Stage 3
-				waitScaled(getBuildingInterval())
-				finalStageClone = placeStage(buildingData.stages.Stage3)
-				stage2:Destroy()
-			else
-				finalStageClone = placeStage(buildingData.stages.Stage3)
-			end
-
-			-- Concrete pad
-			createConcretePad(finalStageClone)
-
-			-- Remove overlapping NatureZones (archive for undo)
-			local plotName  = "Plot_" .. player.UserId
-			local playerPlot2 = Workspace.PlayerPlots:FindFirstChild(plotName)
-			if playerPlot2 then
-				local natureZonesFolder = playerPlot2:FindFirstChild("NatureZones")
-				if natureZonesFolder then
-					for _, nz in ipairs(natureZonesFolder:GetChildren()) do
-						local nzCFrame, nzSize
-						if nz:IsA("Model") then
-							nzCFrame, nzSize = nz:GetBoundingBox()
-						elseif nz:IsA("BasePart") then
-							nzCFrame, nzSize = nz.CFrame, nz.Size
-						end
-						if nzCFrame and nzSize then
-							local buildingPrimary = finalStageClone.PrimaryPart or finalStageClone
-							if buildingPrimary then
-								if aabbOverlap2D(buildingPrimary.Position, buildingPrimary.Size, nzCFrame.Position, nzSize) then
-									local nzClone = nz:Clone()
-									LayerManagerModule.storeRemovedObject("NatureZones", zoneId, {
-										instanceClone  = nzClone,
-										originalParent = nz.Parent,
-										cframe         = nzCFrame
-									})
-									nz:Destroy()
-								end
-							end
-						end
-					end
-				end
-			end
-
-			-- Quadtree insert
-			local buildingObject = {
-				x = gridCoord.x,
-				y = gridCoord.z,
-				width = rotatedWidth,
-				height = rotatedDepth,
-				buildingId = zoneId .. "_" .. gridCoord.x .. "_" .. gridCoord.z
-			}
-			QuadtreeService:insert(buildingObject)
-
-			-- Abort check before marking occupancy
-			if shouldAbort(player, zoneId) then
-				if finalStageClone and finalStageClone.Parent then
-					finalStageClone:Destroy()
-				end
-				return _abortEarly("aborted before occupancy")
-			end
-
-			-- Mark grid as occupied for the building's area
-			local buildingId = buildingObject.buildingId
-			for x = gridCoord.x, gridCoord.x + rotatedWidth - 1 do
-				for z = gridCoord.z, gridCoord.z + rotatedDepth - 1 do
-					ZoneTrackerModule.markGridOccupied(player, x, z, 'building', buildingId, mode)
-				end
-			end
-
-			-- If this was an overlay, ask the impacted original zone(s) to refill *their* gaps.
-			-- We pass the overlay zoneId as `refillSourceZoneId` so those refills can be tagged & later removed on undo.
-			if OverlayZoneTypes[mode] and impactedZones and next(impactedZones) and BuildingGeneratorModule._refillZoneGaps then
-				task.defer(function()
-					for originalZoneId in pairs(impactedZones) do
-						local zd = ZoneTrackerModule.getZoneById(player, originalZoneId)
-						if zd then
-							BuildingGeneratorModule._refillZoneGaps(player, originalZoneId, zd.mode, nil, nil, nil, zoneId)
-						end
-					end
-				end)
-			end
-
-			-- IMPORTANT: release reservation here (assumed ownership even if passed-in)
-			_releaseReservation()
-
-			-- Stamp rebuild attrs
-			finalStageClone:SetAttribute("GridX", gridCoord.x)
-			finalStageClone:SetAttribute("GridZ", gridCoord.z)
-			finalStageClone:SetAttribute("RotationY", rotationY)
-			finalStageClone:SetAttribute("BaseRotationY", rotationY)
-
-			if finalStageClone:IsA("Model") then
-				local pivotCF = finalStageClone:GetPivot()
-				local _, yRot = select(1, pivotCF:ToEulerAnglesXYZ())
-				finalStageClone:SetAttribute("OriginalOrientationY", math.deg(yRot))
-				finalStageClone:SetAttribute("OriginalPivot", pivotCF)
-			else
-				finalStageClone:SetAttribute("OriginalOrientationY", finalStageClone.Orientation.Y)
-			end
-		
-			recordQuotaPlacement(quotaCtx, mode, wealthState or "Poor", buildingData and buildingData.name)
-		
-			task.defer(function()
-				Wigw8mPlacedEvent:Fire(player, zoneId, {
-					mode         = mode,
-					building     = finalStageClone,
-					buildingName = buildingData.name,
-					gridX        = gridCoord.x,
-					gridZ        = gridCoord.z,
-					rotationY    = rotationY,
-					isUtility    = isUtility and true or false,
-					wealthState  = wealthState or "Poor",
-				})
-			end)
-
-			debugPrint(string.format(
-				"BuildingGeneratorModule: Placed building '%s' at Grid (%d, %d) with rotation %d degrees%s.",
-				buildingData.name, gridCoord.x, gridCoord.z, rotationY, isUtility and " [Utility]" or ""
-				))
-
-			if onPlaced then onPlaced() end
-		end, debug.traceback)
-
-		-- Guaranteed cleanup on unexpected runtime errors
-		if not ok then
-			_releaseReservation() -- idempotent
-			warn(("[generateBuilding] runtime error while placing '%s':\n%s")
-				:format(buildingData and buildingData.name or "?", tostring(err)))
-			return
+	else
+		buildingSizeVector = finalStage.Size
+		if not buildingSizeVector then
+			warn(string.format("BuildingGeneratorModule: Stage3 of '%s' is not a Model and lacks Size property.", buildingData.name))
+			return _abortEarly("Stage3 part has no Size")
 		end
 	end
+
+	-- Calculate building size in grid units (ceil)
+	local buildingWidth = math.floor(buildingSizeVector.X / GRID_SIZE)
+	local buildingDepth = math.floor(buildingSizeVector.Z / GRID_SIZE)
+	if buildingSizeVector.X % GRID_SIZE > 0 then buildingWidth += 1 end
+	if buildingSizeVector.Z % GRID_SIZE > 0 then buildingDepth += 1 end
+
+	-- Adjust dimensions based on rotation
+	local rotatedWidth, rotatedDepth = buildingWidth, buildingDepth
+	if rotationY == 90 or rotationY == 270 then
+		rotatedWidth, rotatedDepth = buildingDepth, buildingWidth
+	end
+
+	-- Overlay handling (remove underlying stuff before we actually place)
+	local impactedZones
+	if OverlayZoneTypes[mode] then
+		impactedZones = removeAndArchiveUnderlyingBuildings(
+			player, zoneId,
+			gridCoord.x, gridCoord.z,
+			rotatedWidth, rotatedDepth
+		)
+	end
+
+	-- Ensure we hold a reservation for the exact footprint (assume ownership and release)
+	if not resHandle then
+		resHandle = select(1, GridUtils.reserveFootprint(
+			player, zoneId, "building",
+			gridCoord.x, gridCoord.z,
+			rotatedWidth, rotatedDepth,
+			{ ttl = 15.0 }
+			))
+		if not resHandle then
+			debugPrint(("[reserve] %s @(%d,%d) blocked"):format(
+				buildingData and buildingData.name or "?", gridCoord.x, gridCoord.z))
+			return _abortEarly("reserveFootprint failed")
+		end
+	end
+
+	----------------------------------------------------------------------
+	-- From here on: **protected section** — make sure we never leak resHandle
+	----------------------------------------------------------------------
+	local ok, err = xpcall(function()
+
+		-- Compute building's world position
+		local cellCenterX, _, cellCenterZ =
+			GridUtils.globalGridToWorldPosition(gridCoord.x, gridCoord.z, gBounds, gTerrains)
+
+		local topLeftWorldX = cellCenterX - (GRID_SIZE / 2)
+		local topLeftWorldZ = cellCenterZ - (GRID_SIZE / 2)
+
+		local buildingWidthWorld  = rotatedWidth * GRID_SIZE
+		local buildingDepthWorld  = rotatedDepth * GRID_SIZE
+		local halfWidthWorld      = buildingWidthWorld * 0.5
+		local halfDepthWorld      = buildingDepthWorld * 0.5
+
+		local finalPosition = Vector3.new(
+			topLeftWorldX + halfWidthWorld,
+			terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
+			topLeftWorldZ + halfDepthWorld
+		)
+
+		-- Helper to place a stage at the correct position/rotation
+		local function placeStage(stageModel)
+			local stageClone = stageModel:Clone()
+			if stageClone:IsA("Model") then
+				stageClone:SetPrimaryPartCFrame(
+					CFrame.new(finalPosition) * CFrame.Angles(0, math.rad(rotationY), 0)
+				)
+			else
+				stageClone.Position    = finalPosition
+				stageClone.Orientation = Vector3.new(0, rotationY, 0)
+			end
+			stageClone.Parent = parentFolder
+			stageClone:SetAttribute("ZoneId", zoneId)
+			stageClone:SetAttribute("BuildingName", buildingData.name)
+			stageClone:SetAttribute("WealthState", wealthState or "Poor")
+			if isUtility then stageClone:SetAttribute("IsUtility", true) end
+			return stageClone
+		end
+
+		-- Stage flow
+		local finalStageClone
+		if not skipStages then
+			local stage1Clones = {}
+			local allTracks    = {}
+
+			local function collectAnimations(root)
+				local out = {}
+				for _, desc in ipairs(root:GetDescendants()) do
+					if desc:IsA("Animation") then
+						table.insert(out, desc)
+					end
+				end
+				return out
+			end
+
+			for dx = 0, rotatedWidth - 1 do
+				for dz = 0, rotatedDepth - 1 do
+					local cx, _, cz = GridUtils.globalGridToWorldPosition(
+						gridCoord.x + dx,
+						gridCoord.z + dz,
+						gBounds, gTerrains
+					)
+					local pos = Vector3.new(
+						cx,
+						terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
+						cz
+					)
+
+					local preview = buildingData.stages.Stage1:Clone()
+					if preview:IsA("Model") and preview.PrimaryPart then
+						preview:SetPrimaryPartCFrame(
+							CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+								CFrame.Angles(0, math.rad(rotationY), 0)
+						)
+					else
+						preview.CFrame =
+							CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+							CFrame.Angles(0, math.rad(rotationY), 0)
+					end
+					preview.Parent = parentFolder
+					preview:SetAttribute("ZoneId", zoneId)
+					preview:SetAttribute("BuildingName", buildingData.name)
+					preview:SetAttribute("WealthState", wealthState or "Poor")
+					preview:SetAttribute("GridX", gridCoord.x)
+					preview:SetAttribute("GridZ", gridCoord.z)
+					preview:SetAttribute("RotationY", rotationY)
+					if isUtility then preview:SetAttribute("IsUtility", true) end
+
+					table.insert(stage1Clones, preview)
+
+					-- Try to gather an animation to play
+					local animator, animations = nil, {}
+					local animController = preview:FindFirstChild("AnimationController", true)
+					if animController then
+						animator   = animController:FindFirstChildOfClass("Animator", true)
+						animations = collectAnimations(animator or animController)
+					end
+					if (not animator) or #animations == 0 then
+						local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
+						if humanoid then
+							animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
+							animations = collectAnimations(animator)
+						end
+					end
+					if animator and #animations > 0 then
+						local track = animator:LoadAnimation(animations[1])
+						table.insert(allTracks, track)
+					end
+				end
+			end
+
+			local waitDuration = 0
+			local constructionSoundHandle
+			if #allTracks > 0 then
+				if shouldPlayConstructionAudio(mode) then
+					constructionSoundHandle = startConstructionSound(stage1Clones, parentFolder)
+				end
+				local playbackSpeed = BuildSpeed.enabled and BuildSpeed.multiplier or 1
+				for _, track in ipairs(allTracks) do
+					-- Some rigs report Length=0 until the first frame; poll briefly
+					while track.Length == 0 do waitScaled(0.02) end
+					waitDuration = math.max(waitDuration, track.Length)
+					-- Force the animation to actually play at the fast-build speed so later
+					-- keyframes (like the construction SFX trigger) still fire.
+					track:Play(0, 1, playbackSpeed)
+					if playbackSpeed ~= 1 then
+						track:AdjustSpeed(playbackSpeed)
+					end
+				end
+				-- Even though we sped the track, Roblox keeps Length as the authoring length.
+				-- So we scale the *wait* duration ourselves:
+				waitScaled(waitDuration)
+			else
+				waitScaled(getBuildingInterval())
+			end
+
+			if constructionSoundHandle then
+				stopConstructionSound(constructionSoundHandle)
+				constructionSoundHandle = nil
+			end
+
+			if shouldAbort(player, zoneId) then
+				for _, preview in ipairs(stage1Clones) do
+					if preview and preview.Parent then preview:Destroy() end
+				end
+				ZoneTrackerModule.setZonePopulating(player, zoneId, false)
+				return _abortEarly("aborted during Stage1")
+			end
+
+			for _, preview in ipairs(stage1Clones) do
+				preview:Destroy()
+			end
+
+			-- Stage 2
+			local stage2 = placeStage(buildingData.stages.Stage2)
+			stage2.Anchored   = true
+			stage2.CanCollide = false
+
+			-- Stage 3
+			waitScaled(getBuildingInterval())
+			finalStageClone = placeStage(buildingData.stages.Stage3)
+			stage2:Destroy()
+		else
+			finalStageClone = placeStage(buildingData.stages.Stage3)
+		end
+
+		-- Concrete pad
+		createConcretePad(finalStageClone)
+
+		-- Remove overlapping NatureZones (archive for undo)
+		local plotName  = "Plot_" .. player.UserId
+		local playerPlot2 = Workspace.PlayerPlots:FindFirstChild(plotName)
+		if playerPlot2 then
+			local natureZonesFolder = playerPlot2:FindFirstChild("NatureZones")
+			if natureZonesFolder then
+				for _, nz in ipairs(natureZonesFolder:GetChildren()) do
+					local nzCFrame, nzSize
+					if nz:IsA("Model") then
+						nzCFrame, nzSize = nz:GetBoundingBox()
+					elseif nz:IsA("BasePart") then
+						nzCFrame, nzSize = nz.CFrame, nz.Size
+					end
+					if nzCFrame and nzSize then
+						local buildingPrimary = finalStageClone.PrimaryPart or finalStageClone
+						if buildingPrimary then
+							if aabbOverlap2D(buildingPrimary.Position, buildingPrimary.Size, nzCFrame.Position, nzSize) then
+								local nzClone = nz:Clone()
+								LayerManagerModule.storeRemovedObject("NatureZones", zoneId, {
+									instanceClone  = nzClone,
+									originalParent = nz.Parent,
+									cframe         = nzCFrame
+								})
+								nz:Destroy()
+							end
+						end
+					end
+				end
+			end
+		end
+
+		-- Quadtree insert
+		local buildingObject = {
+			x = gridCoord.x,
+			y = gridCoord.z,
+			width = rotatedWidth,
+			height = rotatedDepth,
+			buildingId = zoneId .. "_" .. gridCoord.x .. "_" .. gridCoord.z
+		}
+		QuadtreeService:insert(buildingObject)
+
+		-- Abort check before marking occupancy
+		if shouldAbort(player, zoneId) then
+			if finalStageClone and finalStageClone.Parent then
+				finalStageClone:Destroy()
+			end
+			return _abortEarly("aborted before occupancy")
+		end
+
+		-- Mark grid as occupied for the building's area
+		local buildingId = buildingObject.buildingId
+		for x = gridCoord.x, gridCoord.x + rotatedWidth - 1 do
+			for z = gridCoord.z, gridCoord.z + rotatedDepth - 1 do
+				ZoneTrackerModule.markGridOccupied(player, x, z, 'building', buildingId, mode)
+			end
+		end
+
+		-- If this was an overlay, ask the impacted original zone(s) to refill *their* gaps.
+		-- We pass the overlay zoneId as `refillSourceZoneId` so those refills can be tagged & later removed on undo.
+		if OverlayZoneTypes[mode] and impactedZones and next(impactedZones) and BuildingGeneratorModule._refillZoneGaps then
+			task.defer(function()
+				for originalZoneId in pairs(impactedZones) do
+					local zd = ZoneTrackerModule.getZoneById(player, originalZoneId)
+					if zd then
+						BuildingGeneratorModule._refillZoneGaps(player, originalZoneId, zd.mode, nil, nil, nil, zoneId)
+					end
+				end
+			end)
+		end
+
+		-- IMPORTANT: release reservation here (assumed ownership even if passed-in)
+		_releaseReservation()
+
+		-- Stamp rebuild attrs
+		finalStageClone:SetAttribute("GridX", gridCoord.x)
+		finalStageClone:SetAttribute("GridZ", gridCoord.z)
+		finalStageClone:SetAttribute("RotationY", rotationY)
+		finalStageClone:SetAttribute("BaseRotationY", rotationY)
+
+		if finalStageClone:IsA("Model") then
+			local pivotCF = finalStageClone:GetPivot()
+			local _, yRot = select(1, pivotCF:ToEulerAnglesXYZ())
+			finalStageClone:SetAttribute("OriginalOrientationY", math.deg(yRot))
+			finalStageClone:SetAttribute("OriginalPivot", pivotCF)
+		else
+			finalStageClone:SetAttribute("OriginalOrientationY", finalStageClone.Orientation.Y)
+		end
+
+		addAmbientLoopForZone(mode, finalStageClone)
+
+		recordQuotaPlacement(quotaCtx, mode, wealthState or "Poor", buildingData and buildingData.name)
+
+		task.defer(function()
+			Wigw8mPlacedEvent:Fire(player, zoneId, {
+				mode         = mode,
+				building     = finalStageClone,
+				buildingName = buildingData.name,
+				gridX        = gridCoord.x,
+				gridZ        = gridCoord.z,
+				rotationY    = rotationY,
+				isUtility    = isUtility and true or false,
+				wealthState  = wealthState or "Poor",
+			})
+		end)
+
+		debugPrint(string.format(
+			"BuildingGeneratorModule: Placed building '%s' at Grid (%d, %d) with rotation %d degrees%s.",
+			buildingData.name, gridCoord.x, gridCoord.z, rotationY, isUtility and " [Utility]" or ""
+			))
+
+		if onPlaced then onPlaced() end
+	end, debug.traceback)
+
+	-- Guaranteed cleanup on unexpected runtime errors
+	if not ok then
+		_releaseReservation() -- idempotent
+		warn(("[generateBuilding] runtime error while placing '%s':\n%s")
+			:format(buildingData and buildingData.name or "?", tostring(err)))
+		return
+	end
+end
 
 local ROTATION_BLOCKING_ZONES = {
 	RoadZone = true,       -- any zoneId starting with "RoadZone_"
@@ -2040,58 +2255,58 @@ function BuildingGeneratorModule.orientBuildingToward(buildingInstance: Instance
 
 	--print("[orientBuildingToward]",buildingInstance.Name,"Snapped rotation:", snapped,"Pivot after orientation =", buildingInstance:GetPivot())
 end
-	-- Reverts orientation to the building’s originally stored attribute
-	function BuildingGeneratorModule.revertBuildingOrientation(buildingInstance: Instance)
-		if not buildingInstance then return end
-		
-		local function syncZonePlate(rotY)
-			local zoneId = buildingInstance:GetAttribute("ZoneId")
-			if not zoneId then return end
+-- Reverts orientation to the building’s originally stored attribute
+function BuildingGeneratorModule.revertBuildingOrientation(buildingInstance: Instance)
+	if not buildingInstance then return end
 
-			-- climb the hierarchy until we hit “Plot_<UserId>”
-			local plot = buildingInstance.Parent
-			while plot and not plot.Name:match("^Plot_%d+$") do
-				plot = plot.Parent
-			end
-			if plot then
-				ZoneDisplay.updateZonePartRotation(plot, zoneId, rotY % 360)
-			end
-		end
-		
-		local pivotCF = buildingInstance:GetAttribute("OriginalPivot")
-		if pivotCF then
-			if buildingInstance:IsA("Model") then
-				buildingInstance:PivotTo(pivotCF)
-			else
-				buildingInstance.CFrame = pivotCF
-			end
-			return
-		end
+	local function syncZonePlate(rotY)
+		local zoneId = buildingInstance:GetAttribute("ZoneId")
+		if not zoneId then return end
 
-		-- If you only stored the Y rotation
-		local origY = buildingInstance:GetAttribute("OriginalOrientationY")
-		if origY then
-			if buildingInstance:IsA("Model") then
-				local currentPos = buildingInstance:GetPivot().Position
-				buildingInstance:PivotTo(
-					CFrame.new(currentPos)
-						* CFrame.Angles(0, math.rad(origY), 0)
-				)
-			else
-				local currentPos = buildingInstance.Position
-				buildingInstance.CFrame =
-					CFrame.new(currentPos)
-					* CFrame.Angles(0, math.rad(origY), 0)
-			end
+		-- climb the hierarchy until we hit “Plot_<UserId>”
+		local plot = buildingInstance.Parent
+		while plot and not plot.Name:match("^Plot_%d+$") do
+			plot = plot.Parent
+		end
+		if plot then
+			ZoneDisplay.updateZonePartRotation(plot, zoneId, rotY % 360)
 		end
 	end
 
+	local pivotCF = buildingInstance:GetAttribute("OriginalPivot")
+	if pivotCF then
+		if buildingInstance:IsA("Model") then
+			buildingInstance:PivotTo(pivotCF)
+		else
+			buildingInstance.CFrame = pivotCF
+		end
+		return
+	end
+
+	-- If you only stored the Y rotation
+	local origY = buildingInstance:GetAttribute("OriginalOrientationY")
+	if origY then
+		if buildingInstance:IsA("Model") then
+			local currentPos = buildingInstance:GetPivot().Position
+			buildingInstance:PivotTo(
+				CFrame.new(currentPos)
+					* CFrame.Angles(0, math.rad(origY), 0)
+			)
+		else
+			local currentPos = buildingInstance.Position
+			buildingInstance.CFrame =
+				CFrame.new(currentPos)
+				* CFrame.Angles(0, math.rad(origY), 0)
+		end
+	end
+end
 
 
 
-	-- (The rest of the module remains unchanged.)
-	-- Helper function for first pass building placement
-	-- Helper function for first pass building placement (ENHANCED with reservations)
+
+-- (The rest of the module remains unchanged.)
+-- Helper function for first pass building placement
+-- Helper function for first pass building placement (ENHANCED with reservations)
 -- Helper function for first pass building placement (ENHANCED: true O(#seeds) when tileWhitelist is given)
 local function placeBuildings(
 	player, zoneId, mode, buildingsList, isUtility,
@@ -2291,7 +2506,7 @@ end
 
 BuildingGeneratorModule._placeBuildings = placeBuildings
 
-	-- Second pass placement without fallback cube
+-- Second pass placement without fallback cube
 local function placeBuildingsSecondPass(
 	player, zoneId, mode, buildingsList, isUtility,
 	terrain, zoneFolder, utilitiesFolder, leftoverCells,
@@ -2479,9 +2694,9 @@ local function placeBuildingsSecondPass(
 		end -- occupancy check
 	end -- for each leftover cell
 end
-	BuildingGeneratorModule._placeBuildingsSecondPass = placeBuildingsSecondPass
+BuildingGeneratorModule._placeBuildingsSecondPass = placeBuildingsSecondPass
 
-	-- Populates a Zone with Buildings
+-- Populates a Zone with Buildings
 function BuildingGeneratorModule.populateZone(
 	player,
 	zoneId,
@@ -2759,6 +2974,9 @@ function BuildingGeneratorModule.populateZone(
 			buildingsPlacedCounter += 1
 			if buildingsPlacedCounter >= nextEventThreshold then
 				buildingsPlacedEvent:Fire(player, zoneId, buildingsPlacedCounter)
+				if shouldPlayBuildUISound(mode) then
+					playBuildUISound(player)
+				end
 				debugPrint(string.format("Fired BuildingsPlaced event for Zone '%s' after %d buildings placed.",
 					zoneId, buildingsPlacedCounter))
 				buildingsPlacedCounter = 0
@@ -2946,6 +3164,9 @@ function BuildingGeneratorModule.populateZone(
 
 		if buildingsPlacedCounter > 0 then
 			buildingsPlacedEvent:Fire(player, zoneId, buildingsPlacedCounter)
+			if shouldPlayBuildUISound(mode) then
+				playBuildUISound(player)
+			end
 			debugPrint(string.format(
 				"Flushed BuildingsPlaced for Zone '%s' with final batch of %d.",
 				zoneId, buildingsPlacedCounter
@@ -2960,55 +3181,55 @@ function BuildingGeneratorModule.populateZone(
 	end)
 end
 
-	-- Remove buildings associated with a zone
-	function BuildingGeneratorModule.removeBuilding(player, zoneId, zoneData)
-		local plotName = "Plot_" .. player.UserId
-		local playerPlot = Workspace.PlayerPlots:FindFirstChild(plotName)
-		if not playerPlot then
-			warn("BuildingGeneratorModule: Player plot '" .. plotName .. "' not found.")
-			return
-		end
-
-		local buildingsFolder = playerPlot:FindFirstChild("Buildings")
-		if not buildingsFolder then return end
-
-		local populatedFolder = buildingsFolder:FindFirstChild("Populated")
-		if not populatedFolder then return end
-
-		local foldersToCheck = {
-			populatedFolder:FindFirstChild(zoneId),
-			populatedFolder:FindFirstChild("Utilities"),
-		}
-
-		for _, folder in ipairs(foldersToCheck) do
-			if folder then
-				for _, child in ipairs(folder:GetChildren()) do
-					if child:IsA("Model") or child:IsA("BasePart") then
-						if child:GetAttribute("ZoneId") == zoneId then
-							_clearOccupancyForInstance(player, zoneId, child)
-							local concretePad = child:FindFirstChild("ConcretePad")
-							if concretePad then
-								concretePad:Destroy()
-							end
-							child:Destroy()
-						end
-					end
-				end
-
-				-- If it's the specific zone folder and it's now empty, remove it
-				if folder.Name == zoneId and #folder:GetChildren() == 0 then
-					folder:Destroy()
-				end
-			end
-		end
-
-		debugPrint("BuildingGeneratorModule: Buildings removed for zone:", zoneId)
+-- Remove buildings associated with a zone
+function BuildingGeneratorModule.removeBuilding(player, zoneId, zoneData)
+	local plotName = "Plot_" .. player.UserId
+	local playerPlot = Workspace.PlayerPlots:FindFirstChild(plotName)
+	if not playerPlot then
+		warn("BuildingGeneratorModule: Player plot '" .. plotName .. "' not found.")
+		return
 	end
 
-	local nonUpgradeableZoneTypes = {
-		WaterTower = true,
-		-- Add more zone types here if needed
+	local buildingsFolder = playerPlot:FindFirstChild("Buildings")
+	if not buildingsFolder then return end
+
+	local populatedFolder = buildingsFolder:FindFirstChild("Populated")
+	if not populatedFolder then return end
+
+	local foldersToCheck = {
+		populatedFolder:FindFirstChild(zoneId),
+		populatedFolder:FindFirstChild("Utilities"),
 	}
+
+	for _, folder in ipairs(foldersToCheck) do
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				if child:IsA("Model") or child:IsA("BasePart") then
+					if child:GetAttribute("ZoneId") == zoneId then
+						_clearOccupancyForInstance(player, zoneId, child)
+						local concretePad = child:FindFirstChild("ConcretePad")
+						if concretePad then
+							concretePad:Destroy()
+						end
+						child:Destroy()
+					end
+				end
+			end
+
+			-- If it's the specific zone folder and it's now empty, remove it
+			if folder.Name == zoneId and #folder:GetChildren() == 0 then
+				folder:Destroy()
+			end
+		end
+	end
+
+	debugPrint("BuildingGeneratorModule: Buildings removed for zone:", zoneId)
+end
+
+local nonUpgradeableZoneTypes = {
+	WaterTower = true,
+	-- Add more zone types here if needed
+}
 
 	--[[function BuildingGeneratorModule.upgradeBuilding(player, zoneId, buildingName, newWealthState, mode, style)
 		debugPrint(string.format(
@@ -3111,40 +3332,40 @@ end
 	]]
 
 
-	function BuildingGeneratorModule.upgradeZone(player, zoneId, newWealthState, mode, style)
-		debugPrint(string.format("Upgrading zone '%s' to wealth '%s'...", zoneId, newWealthState))
-		
-		if not WEALTHED_ZONES[mode] then
-			debugPrint(("upgradeZone: ignoring wealth change for non-wealthed mode '%s'"):format(tostring(mode)))
-			return
-		end
-		
-		if nonUpgradeableZoneTypes[mode] then
-			debugPrint("Upgrade blocked: zone type is non-upgradeable.")
-			return
-		end
-		if not (newWealthState == "Poor" or newWealthState == "Medium" or newWealthState == "Wealthy") then
-			warn("Invalid wealth state: " .. tostring(newWealthState))
-			return
-		end
+function BuildingGeneratorModule.upgradeZone(player, zoneId, newWealthState, mode, style)
+	debugPrint(string.format("Upgrading zone '%s' to wealth '%s'...", zoneId, newWealthState))
 
-		local plotName = "Plot_" .. player.UserId
-		local playerPlot = Workspace.PlayerPlots:FindFirstChild(plotName)
-		if not playerPlot then return warn("Player plot not found: " .. plotName) end
+	if not WEALTHED_ZONES[mode] then
+		debugPrint(("upgradeZone: ignoring wealth change for non-wealthed mode '%s'"):format(tostring(mode)))
+		return
+	end
 
-		local gridList = ZoneTrackerModule.getZoneGridList(player, zoneId)
-		if not gridList or #gridList == 0 then return warn("No grid data for zone " .. zoneId) end
+	if nonUpgradeableZoneTypes[mode] then
+		debugPrint("Upgrade blocked: zone type is non-upgradeable.")
+		return
+	end
+	if not (newWealthState == "Poor" or newWealthState == "Medium" or newWealthState == "Wealthy") then
+		warn("Invalid wealth state: " .. tostring(newWealthState))
+		return
+	end
 
-		-- 1) Clear instances *and* occupancy
-		BuildingGeneratorModule.removeBuilding(player, zoneId)
+	local plotName = "Plot_" .. player.UserId
+	local playerPlot = Workspace.PlayerPlots:FindFirstChild(plotName)
+	if not playerPlot then return warn("Player plot not found: " .. plotName) end
 
-		-- 2) Re-run full population pipeline with wealth override
-		-- NOTE: We keep the old monkey-patch path below purely as a documented fallback.
-		BuildingGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, nil, false, newWealthState)
-	
-		zonePopulatedEvent:Fire(player, zoneId, {})
-		if worldDirtyEvent then worldDirtyEvent:Fire(player, "UpgradeZone|" .. tostring(zoneId)) end
-	
+	local gridList = ZoneTrackerModule.getZoneGridList(player, zoneId)
+	if not gridList or #gridList == 0 then return warn("No grid data for zone " .. zoneId) end
+
+	-- 1) Clear instances *and* occupancy
+	BuildingGeneratorModule.removeBuilding(player, zoneId)
+
+	-- 2) Re-run full population pipeline with wealth override
+	-- NOTE: We keep the old monkey-patch path below purely as a documented fallback.
+	BuildingGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, nil, false, newWealthState)
+
+	zonePopulatedEvent:Fire(player, zoneId, {})
+	if worldDirtyEvent then worldDirtyEvent:Fire(player, "UpgradeZone|" .. tostring(zoneId)) end
+
 		--[[ LEGACY MONKEY-PATCH PATH (kept for backward compatibility documentation):
 		local prev = BuildingMasterList.getBuildingsByZone
 		BuildingMasterList.getBuildingsByZone = function(zType, zStyle, wealthState)
@@ -3153,7 +3374,7 @@ end
 		BuildingGeneratorModule.populateZone(player, zoneId, mode, gridList, nil)
 		BuildingMasterList.getBuildingsByZone = prev
 		]]
-	end
+end
 
 -- Small helpers for the coalescer
 local function _mapAddSeedSet(dstSet, cells)
@@ -3579,34 +3800,34 @@ end
 BuildingGeneratorModule._refillZoneGaps = _refillZoneGaps
 math.randomseed(os.clock())
 
-	function BuildingGeneratorModule.removeRefillPlacementsForOverlay(player, sourceZoneId)
-		local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
-		if not plot then return end
+function BuildingGeneratorModule.removeRefillPlacementsForOverlay(player, sourceZoneId)
+	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
+	if not plot then return end
 
-		local populated = plot:FindFirstChild("Buildings")
-			and plot.Buildings:FindFirstChild("Populated")
-		if not populated then return end
+	local populated = plot:FindFirstChild("Buildings")
+		and plot.Buildings:FindFirstChild("Populated")
+	if not populated then return end
 
-		for _, folder in ipairs(populated:GetChildren()) do
-			for _, inst in ipairs(folder:GetChildren()) do
-				if (inst:IsA("Model") or inst:IsA("BasePart"))
-					and inst:GetAttribute("RefilledBy") == sourceZoneId
-				then
-					-- Clear occupancy for the whole footprint, then delete the instance.
-					local zid = inst:GetAttribute("ZoneId")
-					_clearOccupancyForInstance(player, zid or sourceZoneId, inst)
-					inst:Destroy()
-				end
+	for _, folder in ipairs(populated:GetChildren()) do
+		for _, inst in ipairs(folder:GetChildren()) do
+			if (inst:IsA("Model") or inst:IsA("BasePart"))
+				and inst:GetAttribute("RefilledBy") == sourceZoneId
+			then
+				-- Clear occupancy for the whole footprint, then delete the instance.
+				local zid = inst:GetAttribute("ZoneId")
+				_clearOccupancyForInstance(player, zid or sourceZoneId, inst)
+				inst:Destroy()
 			end
 		end
 	end
+end
 
-	local function shuffle(t)
-		for i = #t, 2, -1 do
-			local j = math.random(i)
-			t[i], t[j] = t[j], t[i]
-		end
+local function shuffle(t)
+	for i = #t, 2, -1 do
+		local j = math.random(i)
+		t[i], t[j] = t[j], t[i]
 	end
+end
 
 function BuildingGeneratorModule.upgradeGrid(player, zoneId, gridX, gridZ, newWealthState, mode, style)
 	debugPrint(("upgradeGrid → Zone '%s' @ (%d,%d) to wealth '%s'"):format(zoneId, gridX, gridZ, newWealthState))
@@ -4128,4 +4349,4 @@ end
 
 
 return BuildingGeneratorModule
-	--Line 3308
+--Line 3308

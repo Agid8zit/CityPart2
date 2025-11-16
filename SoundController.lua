@@ -4,6 +4,7 @@ local SoundController = {}
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Dependencies
 local Sounds = require(ReplicatedStorage.Scripts.Sounds)
@@ -231,11 +232,13 @@ function SoundController.PlaySoundOnceOnPart(SoundCategory: string, SoundName: s
 	SoundNode.Parent = workspace._Misc
 	
 	-- Move/Update SoundNode
-	local Heartbeat;
-	Heartbeat = RunService.Heartbeat:Connect(function()
+	local Heartbeat
+	Heartbeat = RunServiceScheduler.onHeartbeat(function()
 		if not BasePart.Parent then
-			Heartbeat:Disconnect()
-			Heartbeat = nil
+			if Heartbeat then
+				Heartbeat()
+				Heartbeat = nil
+			end
 		else
 			SoundNode.Position = BasePart.Position
 		end

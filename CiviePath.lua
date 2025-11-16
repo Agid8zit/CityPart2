@@ -1,7 +1,19 @@
 local CivPathing = {}
 CivPathing.__index = CivPathing
 
---Service
+----------------------------------------------------------------------
+-- Sections
+--   1) Module setup & configuration
+--   2) Zone state & event wiring
+--   3) Math / grid helpers
+--   4) Adjacency & destination helpers
+--   5) Path building entry points
+----------------------------------------------------------------------
+
+----------------------------------------------------------------------
+-- 1) Module setup & configuration
+----------------------------------------------------------------------
+
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local Workspace           = game:GetService("Workspace")
 local ZoneTrackerModule   = require(game.ServerScriptService.Build.Zones.ZoneManager.ZoneTracker)
@@ -15,7 +27,9 @@ local ZoneAddedEvent   = BindableEvents and BindableEvents:FindFirstChild("ZoneA
 local ZoneRemovedEvent = BindableEvents and BindableEvents:FindFirstChild("ZoneRemoved")
 
 
+----------------------------------------------------------------------
 -- Config / Injection points
+----------------------------------------------------------------------
 
 CivPathing.Debug                   = false
 
@@ -62,8 +76,9 @@ local adjProvider = nil
 function CivPathing.setAdjacencyProvider(fn) adjProvider = fn end
 
 
--- State
-
+----------------------------------------------------------------------
+-- 2) Zone state & event wiring
+----------------------------------------------------------------------
 local zones = {}
 CivPathing.zones = zones
 
@@ -71,8 +86,9 @@ local function dprint(...) if CivPathing.Debug then print("[CivPathing]", ...) e
 local UP = Vector3.new(0,1,0)
 
 
--- Math / Grid helpers
-
+----------------------------------------------------------------------
+-- 3) Math / Grid helpers
+----------------------------------------------------------------------
 local directionAngles = {
 	North=270, NorthEast=315, East=0, SouthEast=45,
 	South=90,  SouthWest=135, West=180, NorthWest=225
@@ -152,6 +168,7 @@ function CivPathing.isPassthroughMode(mode) return mode ~= nil and CivPathing.Pa
 
 
 -- Zone tracker integration
+-- Track zone payloads from Build pipeline so we can reuse descriptors.
 function CivPathing.onZoneAdded(a, b)
 	if typeof(a) == "Instance" and a:IsA("Player") then
 		local player, zoneId = a, tostring(b)
@@ -168,6 +185,7 @@ function CivPathing.onZoneAdded(a, b)
 	zones[id] = payload
 end
 
+-- Drop cached descriptors when a zone disappears.
 function CivPathing.onZoneRemoved(a, b)
 	local zoneId = (typeof(a) == "Instance" and a:IsA("Player")) and tostring(b) or tostring(a)
 	if not zoneId then return end
@@ -324,6 +342,10 @@ local function _buildRoadCellSet(player, roadModes)
 	return set
 end
 
+----------------------------------------------------------------------
+-- 4) Adjacency & destination helpers
+----------------------------------------------------------------------
+
 function CivPathing.nearestRoadNodeFromZone(zone, radius)
 	local adj = getAdjacency(); if not adj then return nil end
 	local list = zone and zone.gridList; if not list or #list == 0 then return nil end
@@ -414,6 +436,7 @@ local function _neighborsFiltered(c, blocked, allowDiag, noCornerCut)
 	return out
 end
 
+-- Build a lookup of "forbidden" grid cells when generating off-road stubs.
 function CivPathing.buildBlockedCellsFromZones(player, opts)
 	opts = opts or {}
 	local blocked = {}
@@ -451,6 +474,49 @@ function CivPathing.buildBlockedCellsFromZones(player, opts)
 	return blocked
 end
 
+local function buildZoneCellSet(zone)
+	if not zone or not zone.gridList or #zone.gridList == 0 then return nil end
+	local set = table.create(#zone.gridList)
+	for _, c in ipairs(zone.gridList) do
+		set[CivPathing.nodeKey(c)] = true
+	end
+	return set
+end
+CivPathing.buildZoneCellSet = buildZoneCellSet
+
+local function trimLeadingZoneCells(path, zoneSet)
+	if not (path and zoneSet and next(zoneSet)) then return path end
+	local keepIdx = 1
+	while keepIdx < #path and zoneSet[CivPathing.nodeKey(path[keepIdx])] do
+		keepIdx += 1
+	end
+	if keepIdx > 1 then
+		local trimmed = table.create(#path - keepIdx + 1)
+		for i = keepIdx, #path do
+			trimmed[#trimmed+1] = path[i]
+		end
+		return trimmed
+	end
+	return path
+end
+
+local function trimTrailingZoneCells(path, zoneSet)
+	if not (path and zoneSet and next(zoneSet)) then return path end
+	local keepIdx = #path
+	while keepIdx > 1 and zoneSet[CivPathing.nodeKey(path[keepIdx])] do
+		keepIdx -= 1
+	end
+	if keepIdx < #path then
+		local trimmed = table.create(keepIdx)
+		for i = 1, keepIdx do
+			trimmed[#trimmed+1] = path[i]
+		end
+		return trimmed
+	end
+	return path
+end
+
+-- Basic A* over grid cells (used for the off-road stubs / stumbles).
 function CivPathing.findGridPathAvoiding(a, b, opts)
 	opts = opts or {}
 	local blocked       = opts.blocked or {}
@@ -529,6 +595,10 @@ end
 
 
 -- Road-first hybrid: off-road stub → road BFS → off-road stub
+----------------------------------------------------------------------
+-- 5) Path building helpers
+----------------------------------------------------------------------
+
 local function _pickCurbOffset(plot, player, roadPath, stickSign, dstWorldPts)
 	-- cell world step (studs)
 	local function _cellStepWorld_local(plot)
@@ -654,6 +724,8 @@ local function _planOffroadStub(player, aCell, bCell, opts)
 end
 
 -- PUBLIC: expected entry point. Behavior: road-first if graph available.
+----------------------------------------------------------------------
+-- Full road-first itinerary (origin zone -> road BFS -> destination zone).
 function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 	opts = opts or {}
 	local allowDiag   = (opts.allowDiagonals ~= nil) and opts.allowDiagonals or CivPathing.AllowDiagonals
@@ -664,6 +736,9 @@ function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 		or #srcZone.gridList == 0 or #dstZone.gridList == 0 then
 		return nil
 	end
+
+	local srcCellSet = buildZoneCellSet(srcZone)
+	local dstCellSet = buildZoneCellSet(dstZone)
 
 	-- Never route *to* a road/passthrough zone as a destination
 	if CivPathing.isRoadMode(dstZone.mode) or CivPathing.isPassthroughMode(dstZone.mode) then
@@ -708,7 +783,11 @@ function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 			allowDiagonals = allowDiag,
 			noCornerCut    = noCornerCut,
 		})
-		return g and CivPathing.gridPathToWorld(g, plot) or nil
+		if not g then return nil end
+		g = trimLeadingZoneCells(g, srcCellSet)
+		g = trimTrailingZoneCells(g, dstCellSet)
+		if not g or #g < 2 then return nil end
+		return CivPathing.gridPathToWorld(g, plot)
 	end
 
 	-- Off-road stub (src -> entryRoad)
@@ -719,6 +798,7 @@ function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 	local pre = _planOffroadStub(player, aCell, entryRoad, {
 		blocked  = blockA, allowDiag = allowDiag, noCornerCut = noCornerCut
 	}) or { aCell, entryRoad }
+	pre = trimLeadingZoneCells(pre, srcCellSet)
 
 	-- Road leg
 	local roadPath = roadBFS(entryRoad, exitRoad)
@@ -730,7 +810,11 @@ function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 			allowDiagonals = allowDiag,
 			noCornerCut    = noCornerCut,
 		})
-		return g and CivPathing.gridPathToWorld(g, plot) or nil
+		if not g then return nil end
+		g = trimLeadingZoneCells(g, srcCellSet)
+		g = trimTrailingZoneCells(g, dstCellSet)
+		if not g or #g < 2 then return nil end
+		return CivPathing.gridPathToWorld(g, plot)
 	end
 
 	-- Off-road stub (exitRoad -> dst)
@@ -741,6 +825,7 @@ function CivPathing.hybridZoneToZonePath(plot, player, srcZone, dstZone, opts)
 	local tail = _planOffroadStub(player, exitRoad, bCell, {
 		blocked  = blockB, allowDiag = allowDiag, noCornerCut = noCornerCut
 	}) or { exitRoad, bCell }
+	tail = trimTrailingZoneCells(tail, dstCellSet)
 
 	-- Assemble as WORLD path with sticky curb offset for road leg
 	local world = {}
@@ -780,6 +865,7 @@ function CivPathing.replanIfOnRoad(plot, player, currentCell, dstZone, opts)
 	if not dstZone or not currentCell then return nil end
 	if not (roadBFS and (adjProvider and adjProvider())) then return nil end
 
+	local dstCellSet = buildZoneCellSet(dstZone)
 	local cellModes = _buildCellModeIndex(player)
 	local key = CivPathing.nodeKey(currentCell)
 	local isRoad = _isRoadCellKey(key, cellModes, opts and opts.roadModes or CivPathing.RoadModes)
@@ -815,6 +901,7 @@ function CivPathing.replanIfOnRoad(plot, player, currentCell, dstZone, opts)
 	local tail = CivPathing.findGridPathAvoiding(exitRoad, bCell, {
 		blocked  = blocked, allowDiagonals = CivPathing.AllowDiagonals, noCornerCut = CivPathing.NoCornerCutting
 	}) or { exitRoad, bCell }
+	tail = trimTrailingZoneCells(tail, dstCellSet)
 
 	-- Assemble world with curb offset on the road leg only
 	local world = {}
@@ -835,5 +922,9 @@ function CivPathing.replanIfOnRoad(plot, player, currentCell, dstZone, opts)
 	for i=1,#tail do world[#world+1] = CivPathing.gridToWorld(tail[i], plot) end
 	return world
 end
+
+----------------------------------------------------------------------
+-- Public API export
+----------------------------------------------------------------------
 
 return CivPathing

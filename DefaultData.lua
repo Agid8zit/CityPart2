@@ -9,7 +9,8 @@ local CITY_STORAGE_SCHEMA = 1
 -- Transit progression constants (used by both BusDepot and Airport)
 local MAX_TIERS       = 10     -- Tier 1..10
 local MAX_TIER_LEVEL  = 100    -- Each tier levels 0..100
-local START_UNLOCK    = 0      -- 0 => unlockedTiers = floor(0/10)+1 = 1 tier at start
+local LEVELS_PER_TIER_UNLOCK = 3
+local START_UNLOCK    = 0      -- 0 => unlockedTiers = floor(0/LEVELS_PER_TIER_UNLOCK)+1 = 1 tier at start
 
 -- ======================================================================
 -- Utilities
@@ -25,7 +26,7 @@ end
 
 local function makeTransitNode()
 	-- transit.<mode>:
-	--   unlock : number  (drives how many tiers exist: floor(unlock/10)+1)
+	--   unlock : number  (drives how many tiers exist: floor(unlock/LEVELS_PER_TIER_UNLOCK)+1)
 	--   tiers  : array-like table { [1] = {level=0}, [2] = {level=0}, ... }
 	-- We seed Tier 1 at level 0; higher tiers appear as unlock rises.
 	local tiers = { [1] = { level = 0 } }
@@ -170,6 +171,7 @@ DefaultData.StartingData = {
 
 	-- Monetization (ACCOUNT-WIDE)
 	OwnedGamepasses = {},
+	OwnedBadges = {},
 	
 
 	Onboarding = {
@@ -229,7 +231,7 @@ DefaultData.StartingData = {
 --   transit/airport/tiers/<tierIndex>/level      : number (0..100)
 --
 -- Unlocked tier count (both):
---   unlockedTiers = math.floor(unlock/10) + 1   -- clamp to 1..MAX_TIERS
+--   unlockedTiers = math.floor(unlock/LEVELS_PER_TIER_UNLOCK) + 1   -- clamp to 1..MAX_TIERS
 --
 -- Earnings rule (suggested; server authoritative):
 --   totalTicketsPerSec = sum_{for each unlocked tier}( BusDepotUpgrades.GetEarnedTicketSec(level) )
@@ -238,12 +240,12 @@ DefaultData.StartingData = {
 -- UI rule (client):
 --   - Render one "Template" per unlocked tier (1..unlockedTiers).
 --   - Each template shows its own Level (0..100) and Upgrade button until it hits 100.
---   - A new tier appears each time unlock crosses 10, 20, 30, ... (you choose how unlock increases).
+--   - A new tier appears each time unlock crosses 3, 6, 9, ... (you choose how unlock increases).
 --
 -- Unlock progression source (choose one, server-side):
 --   A) Tie unlock to city progression / quests / milestones → write transit/<mode>/unlock directly.
 --   B) Tie unlock to total tier progress (e.g., sum of all tier levels).
---      Example: unlock = math.min( sum(levels), 1000 )  -- every +10 unlocks a new tier.
+--      Example: unlock = math.min( sum(levels), 1000 )  -- every +3 unlocks a new tier.
 --
 -- ======================================================================
 

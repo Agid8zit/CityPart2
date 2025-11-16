@@ -103,10 +103,18 @@ if not BindableEvents:FindFirstChild("ZoneRemoved") then
 	debugPrint("BindableEvent 'ZoneRemoved' created.")
 end
 
+if not BindableEvents:FindFirstChild("ZoneRequirementChanged") then
+	local requirementChanged = Instance.new("BindableEvent")
+	requirementChanged.Name = "ZoneRequirementChanged"
+	requirementChanged.Parent = BindableEvents
+	debugPrint("BindableEvent 'ZoneRequirementChanged' created.")
+end
+
 local zonePopulatedBindable = BindableEvents:WaitForChild("ZonePopulated")
 
 ZoneTrackerModule.zoneAddedEvent = BindableEvents:FindFirstChild("ZoneAdded")
 ZoneTrackerModule.zoneRemovedEvent = BindableEvents:FindFirstChild("ZoneRemoved")
+ZoneTrackerModule.zoneRequirementChangedEvent = BindableEvents:FindFirstChild("ZoneRequirementChanged")
 ZoneTrackerModule.demandUpdatedEvent = BindableEvents:FindFirstChild("DemandUpdated")
 
 
@@ -707,8 +715,13 @@ function ZoneTrackerModule.markZoneRequirement(player, zoneId, requirement, stat
 	local userId = player.UserId
 	local zone = ZoneTrackerModule.allZones[userId] and ZoneTrackerModule.allZones[userId][zoneId]
 	if zone and zone.requirements[requirement] ~= nil then
-		zone.requirements[requirement] = status
-		debugPrint(string.format("Requirement '%s' for zone '%s' set to %s.", requirement, zoneId, tostring(status)))
+		if zone.requirements[requirement] ~= status then
+			zone.requirements[requirement] = status
+			debugPrint(string.format("Requirement '%s' for zone '%s' set to %s.", requirement, zoneId, tostring(status)))
+			if ZoneTrackerModule.zoneRequirementChangedEvent then
+				ZoneTrackerModule.zoneRequirementChangedEvent:Fire(player, zoneId, requirement, status)
+			end
+		end
 		--ZoneTrackerModule.publishDemand(player)
 	else
 		warn(string.format("ZoneTrackerModule: Cannot set requirement '%s' for zone '%s' of player '%s'.", requirement, zoneId, player.Name))

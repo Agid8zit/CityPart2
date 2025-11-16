@@ -2,8 +2,6 @@
 local PlayerDataInterfaceService = {}
 
 -- Roblox Services
-local RunService = game:GetService("RunService")
-local BadgeService = game:GetService("BadgeService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -12,12 +10,34 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local Constants = require(ReplicatedStorage.Scripts.Constants)
 local Gamepasses = require(ReplicatedStorage.Scripts.Gamepasses)
 local PlayerDataService = require(ServerScriptService.Services.PlayerDataService)
+local BadgeServiceModule = require(ServerScriptService.Services.BadgeService)
+local OnboardingServiceOk, OnboardingService = pcall(function()
+	return require(ServerScriptService.Players.OnboardingService)
+end)
+if not OnboardingServiceOk then
+	OnboardingService = nil
+end
+
+local EventsFolder = ReplicatedStorage:WaitForChild("Events")
+local BindableEvents = EventsFolder:WaitForChild("BindableEvents")
+local function ensureBE(name: string): BindableEvent
+	local be = BindableEvents:FindFirstChild(name)
+	if be and be:IsA("BindableEvent") then
+		return be
+	end
+	local nb = Instance.new("BindableEvent")
+	nb.Name = name
+	nb.Parent = BindableEvents
+	return nb
+end
+local ForceDisableOnboardingBE: BindableEvent = ensureBE("ForceDisableOnboarding")
 
 -- ======================================================================
 -- Transit helpers (per-tier schema normalized to NUMERIC levels)
 -- ======================================================================
 local MAX_TIERS = 10
 local MAX_TIER_LEVEL = 100
+local LEVELS_PER_TIER_UNLOCK = 3
 
 local function _ensureTransitNode(saveFile, key) -- key = "busDepot" | "airport"
 	saveFile.transit = saveFile.transit or {}
@@ -46,7 +66,7 @@ local function _ensureTransitNode(saveFile, key) -- key = "busDepot" | "airport"
 end
 
 local function _unlockedTiers(unlock)
-	local t = math.floor(math.max(0, tonumber(unlock) or 0) / 10) + 1
+	local t = math.floor(math.max(0, tonumber(unlock) or 0) / LEVELS_PER_TIER_UNLOCK) + 1
 	return math.clamp(t, 1, MAX_TIERS)
 end
 
@@ -56,6 +76,7 @@ function PlayerDataInterfaceService.OnLoad(Player: Player, PlayerData)
 	--PlayerData.Coins = math.round(PlayerData.Coins)
 	warn("!!! START WITH EVERYTHING FOR TESTING !!!")
 
+	PlayerData.OwnedBadges = PlayerData.OwnedBadges or {}
 	local SaveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
 
 	_ensureTransitNode(SaveFile, "busDepot")
@@ -151,81 +172,17 @@ function PlayerDataInterfaceService.GiveMissingGamepasses(Player: Player)
 	end
 end
 
-function PlayerDataInterfaceService.GiveBadge(Player: Player, BadgeName: string)
-	---- Flag
-	--if DebugFlags.DEBUG_IGNORE_GIVING_BADGES then return end
-
-	---- Data check
-	--local PlayerData = PlayerDataService.AllPlayerData[Player]
-	--if not PlayerData then return end
-
-	---- Badge
-	--if not Badges.Has(BadgeName) then
-	--	warn("Attempting to give non-existent badge ("..BadgeName..")")
-	--	return
-	--end
-
-	---- Ignore if already have badge
-	--if PlayerData.OwnedBadges[BadgeName] then return end
-
-	---- Give them badge
-	--local BadgeID = Badges.GetIDFromName(BadgeName)
-	--local Success, ErrMsg = pcall(function()
-	--	if RunService:IsStudio() then
-	--		return true
-	--	else
-	--		return BadgeService:AwardBadge(Player.UserId, BadgeID)
-	--	end
-	--end)
-	---- Badge failed, retry for 10 seconds
-	--local Timeout = os.clock() + 10
-	--while not Success and os.clock() < Timeout do
-	--	task.wait()
-	--	Success, ErrMsg = pcall(function()
-	--		if RunService:IsStudio() then
-	--			return true
-	--		else
-	--			return BadgeService:AwardBadge(Player.UserId, BadgeID)
-	--		end
-	--	end)
-	--end
-
-	---- Data
-	--if Success then
-	--
-	--	-- Badge Notif
-	--	NotificationService.TriggerBadgeNotification(Player, BadgeName)
-	--else
-	--	-- Error popup
-	--	NotificationService.CreatePopupMessage(Player, "Badge Failed to be Awarded ("..BadgeName..")")
-	--end
+function PlayerDataInterfaceService.GiveBadge(Player: Player, BadgeKey: string)
+	local success, reason = BadgeServiceModule.Award(Player, BadgeKey)
+	if not success then
+		warn(string.format("[PlayerDataInterface] Failed to award badge %s to %s (%s)", BadgeKey, Player.Name, tostring(reason)))
+	end
+	return success, reason
 end
 
 function PlayerDataInterfaceService.GiveMissingBadges(Player: Player)
-	---- Ignore in studio
-	--if RunService:IsStudio() and DebugFlags.DEBUG_IGNORE_BADGE_MISSING_CHECK_IN_STUDIO then return end
-
-	---- Data check
-	--local PlayerData = PlayerDataService.AllPlayerData[Player]
-	--if not PlayerData then return end
-
-	--for BadgeName, Data in Badges.GetBadgesRaw() do
-	--	-- If already own, ignore
-	--	--print(Player, BadgeName, BadgeID)
-	--	if PlayerData.OwnedBadges[BadgeName] then continue end
-
-	--	-- Owns it in store
-	--	local Success, Result = pcall(function()
-	--		return BadgeService:UserHasBadgeAsync(Player.UserId, Data.BadgeID)
-	--	end)
-	--	--print(Success, Result)
-	--	if Success and Result then
-	--		print("[Badge] Gave Missing Badge ("..BadgeName..") to Player ("..Player.Name..")")
-	--		PlayerDataService.ModifyData(Player, "OwnedBadges/"..BadgeName, true) -- own
-	--		-- Analytics
-	--		--AnalyticsService.FunnlEventOnce(Player, Enums.FUNNEL_EVENT_RECURRING.EARNED_A_BADGE)
-	--	end
-	--end
+	BadgeServiceModule.SyncOwnedBadges(Player)
+	BadgeServiceModule.AwardFirstSession(Player)
 end
 
 function PlayerDataInterfaceService.GetCoinsInSaveData(Player: Player)
@@ -353,11 +310,26 @@ RF_DeleteSaveFile.OnServerInvoke = function(Player: Player, SlotID: string)
 	if not PlayerData then return false end
 	if not PlayerData.savefiles[SlotID] then return false end
 
+	local function markDeletionDuringOnboarding()
+		if OnboardingService then
+			local okRecord, err = pcall(function()
+				OnboardingService.RecordDeletionDuringOnboarding(Player.UserId, Player)
+			end)
+			if not okRecord then
+				warn("[PlayerDataInterface] RecordDeletionDuringOnboarding failed: ", err)
+			end
+		else
+			warn("[PlayerDataInterface] OnboardingService missing; forcing disable only")
+		end
+		ForceDisableOnboardingBE:Fire(Player)
+	end
+
 	-- remove the slot
 	PlayerDataService.ModifyData(Player, "savefiles/"..SlotID, nil)
 
 	-- if deleting current slot, recreate a fresh one in the same position
 	if PlayerData.currentSaveFile == SlotID then
+		markDeletionDuringOnboarding()
 		local DefaultDataModule = require(ServerScriptService.PlayerDataService.DefaultData)
 		local EmptySaveFile = DefaultDataModule.newSaveFile()
 		EmptySaveFile.cityName = ""
@@ -444,7 +416,7 @@ function PlayerDataInterfaceService.GetTransitTierLevel(Player: Player, mode: "b
 	local node = _ensureTransitNode(sf, mode)
 
 	local ti = math.clamp(math.floor(tonumber(tierIndex) or 1), 1, MAX_TIERS)
-	local need = math.clamp(math.floor((node.unlock or 0) / 10) + 1, 1, MAX_TIERS)
+	local need = math.clamp(math.floor((node.unlock or 0) / LEVELS_PER_TIER_UNLOCK) + 1, 1, MAX_TIERS)
 
 	if node.tiers[ti] == nil and ti <= need then node.tiers[ti] = 0 end
 	return tonumber(node.tiers[ti]) or 0
@@ -456,7 +428,7 @@ function PlayerDataInterfaceService.SetTransitTierLevel(Player: Player, mode: "b
 	local node = _ensureTransitNode(sf, mode)
 
 	local ti = math.clamp(math.floor(tonumber(tierIndex) or 1), 1, MAX_TIERS)
-	local need = math.clamp(math.floor((node.unlock or 0) / 10) + 1, 1, MAX_TIERS)
+	local need = math.clamp(math.floor((node.unlock or 0) / LEVELS_PER_TIER_UNLOCK) + 1, 1, MAX_TIERS)
 	if ti > need then return end
 
 	local clamped = math.clamp(tonumber(newLevel) or 0, 0, MAX_TIER_LEVEL)

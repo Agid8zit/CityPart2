@@ -22,6 +22,7 @@ local ZoneTrackerModule = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local GridConf   = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Grid")
 local GridUtils  = require(GridConf:WaitForChild("GridUtil"))
 local GridConfig = require(GridConf:WaitForChild("GridConfig"))
+local GRID_SIZE = GridConfig.GRID_SIZE or 4
 
 local BuildingManager    = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("BuildingManager")
 local BuildingMasterList = require(BuildingManager:WaitForChild("BuildingMasterList"))
@@ -67,8 +68,10 @@ local DEBUG_LOGS    = false
 local BUILD_INTERVAL = 0.1
 local Y_OFFSET       = 0.01
 local AVOID_ROPES_THROUGH_NON_ROAD = true
-local BRIDGE_TO_NEAREST_PADPOLE    = false --These are BUILDING ZONE SPECIFIC these are not the normal poles
-local PADPOLE_LINK_MAX_DISTANCE = 80
+local BRIDGE_TO_NEAREST_PADPOLE    = false -- These are BUILDING ZONE SPECIFIC these are not the normal poles
+local PADPOLE_LINK_MAX_GRIDS       = 2
+local BUILDING_PADPOLE_MAX_GRIDS   = 3
+local PADPOLE_LINK_MAX_DISTANCE    = PADPOLE_LINK_MAX_GRIDS * GRID_SIZE
 print("[PowerGeneratorModule] Loaded")
 
 ---------------------------------------------------------------------
@@ -186,6 +189,12 @@ local function findFreeNeighborInside(gridSet, lastCoord)
 		end
 	end
 	return lastCoord -- fallback: same tile (won't look as nice, but is safe)
+end
+
+local function planarGridDistance(posA: Vector3, posB: Vector3): number
+	local dx = math.abs(posA.X - posB.X)
+	local dz = math.abs(posA.Z - posB.Z)
+	return math.max(dx, dz) / GRID_SIZE
 end
 
 -- Try to locate a padpole model in the player's plot. Adapt the name/attribute checks to your prefab.
@@ -519,6 +528,18 @@ function PowerGeneratorModule.connectPadPoleToPowerZone(player, padPole)
 		-- best-effort: unbounded search as a last resort
 		pole, dist = _nearestPoleModel(zoneFolder, pos, 1e9)
 		if not pole then return end
+	end
+
+	local linkGridDelta = planarGridDistance(_modelPos(pole), pos)
+	if linkGridDelta > PADPOLE_LINK_MAX_GRIDS then
+		if DEBUG_LOGS then
+			debugPrint(string.format(
+				"PadPole->zone link suppressed; %.2f grids away (limit=%d)",
+				linkGridDelta,
+				PADPOLE_LINK_MAX_GRIDS
+			))
+		end
+		return
 	end
 
 	-- Ensure the stamp is present
@@ -1121,7 +1142,7 @@ function linkPoles(prevPole: Instance, currPole: Instance)
 	createRope(pair1b, pair2b)
 end
 
-local MAX_BRIDGE_DISTANCE = 80 -- tweak
+local MAX_BRIDGE_DISTANCE = PADPOLE_LINK_MAX_DISTANCE
 
 local function modelWorldPos(m: Instance)
 	return (m.PrimaryPart and m.PrimaryPart.Position) or m:GetPivot().Position
@@ -1146,8 +1167,18 @@ local function bridgePadPoleToNearestLine(plot: Instance, padPole: Model)
 	local pos = modelWorldPos(padPole)
 	local line, dist = findNearestLineOnPlot(plot, pos)
 	if line and dist <= MAX_BRIDGE_DISTANCE then
-		linkPoles(line, padPole)           -- uses your existing "1"/"2" attachments
-		padPole:SetAttribute("BridgedToLine", true)
+		local linePos = modelWorldPos(line)
+		local gridDelta = planarGridDistance(linePos, pos)
+		if gridDelta <= PADPOLE_LINK_MAX_GRIDS then
+			linkPoles(line, padPole)           -- uses your existing "1"/"2" attachments
+			padPole:SetAttribute("BridgedToLine", true)
+		elseif DEBUG_LOGS then
+			debugPrint(string.format(
+				"Skipping padpole bridge (%.2f grids away; limit=%d)",
+				gridDelta,
+				PADPOLE_LINK_MAX_GRIDS
+			))
+		end
 	end
 end
 
@@ -1442,28 +1473,55 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 				if nonRoadCrossBlock then
 					if BRIDGE_TO_NEAREST_PADPOLE and lastPlacedPole and lastPlacedCoord and not bridgedZones[foreignZoneId] then
 						local jumperCoord = findFreeNeighborInside(gridSet, lastPlacedCoord)
-						local before = zoneFolder:GetChildren()
-						PowerGeneratorModule.generatePowerSegment(
-							terrain, zoneFolder, player, zoneId, mode,
-							jumperCoord, basePower, 0, onLinePlaced
-						)
-						local jumperInstance
-						for _, inst in ipairs(zoneFolder:GetChildren()) do
-							if not table.find(before, inst) then jumperInstance = inst; break end
+						local gb, terrains = getGlobalBoundsForPlot(playerPlot)
+						local jumperWorldPos
+						if gb then
+							local jx, jy, jz = GridUtils.globalGridToWorldPosition(jumperCoord.x, jumperCoord.z, gb, terrains)
+							jumperWorldPos = Vector3.new(jx, jy, jz)
 						end
-						if jumperInstance then
-							linkPoles(lastPlacedPole, jumperInstance)
-							local jumperPos = (jumperInstance.PrimaryPart and jumperInstance.PrimaryPart.Position)
-								or jumperInstance:GetPivot().Position
-							local padpole = findNearestPadPole(playerPlot, jumperPos)
-							if padpole then
-								linkPoles(jumperInstance, padpole)
-							else
-								warn("No padpole found to bridge to; jumper placed but no external tether created.")
+
+						local padpole = jumperWorldPos and findNearestPadPole(playerPlot, jumperWorldPos) or nil
+						local canBridge = false
+						local gridDelta
+						if padpole and jumperWorldPos then
+							gridDelta = planarGridDistance(jumperWorldPos, modelWorldPos(padpole))
+							canBridge = gridDelta <= BUILDING_PADPOLE_MAX_GRIDS
+							if not canBridge and DEBUG_LOGS then
+								debugPrint(string.format(
+									"Padpole bridge blocked for %s: %.2f grids away (limit=%d)",
+									tostring(foreignZoneId), gridDelta, BUILDING_PADPOLE_MAX_GRIDS
+								))
 							end
-							lastPlacedPole   = nil
-							lastPlacedCoord  = nil
-							bridgedZones[foreignZoneId] = true
+						elseif DEBUG_LOGS then
+							debugPrint(string.format(
+								"Padpole bridge blocked for %s: no candidate within range",
+								tostring(foreignZoneId)
+							))
+						end
+
+						if canBridge and padpole then
+							local before = zoneFolder:GetChildren()
+							PowerGeneratorModule.generatePowerSegment(
+								terrain, zoneFolder, player, zoneId, mode,
+								jumperCoord, basePower, 0, onLinePlaced
+							)
+							local jumperInstance
+							for _, inst in ipairs(zoneFolder:GetChildren()) do
+								if not table.find(before, inst) then jumperInstance = inst; break end
+							end
+							if jumperInstance then
+								linkPoles(lastPlacedPole, jumperInstance)
+								linkPoles(jumperInstance, padpole)
+								lastPlacedPole   = nil
+								lastPlacedCoord  = nil
+								bridgedZones[foreignZoneId] = true
+							end
+						else
+							if not padpole then
+								warn("No padpole found to bridge to; jumper suppressed.")
+							end
+							lastPlacedPole  = nil
+							lastPlacedCoord = nil
 						end
 					else
 						lastPlacedPole  = nil

@@ -5,6 +5,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui") -- Added: fallback notification path
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Remote Events
 local RemoteEventsFolder = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents")
@@ -346,6 +347,18 @@ BE_GridGuard.Event:Connect(function(action, spec)
 		-- NOTE: do NOT call _finishGuard(false) here (which fires BE_GuardFB).
 	end
 end)
+
+-- If onboarding is globally disabled (skip/completed), immediately release any active guard so
+-- GridVisualizer stops gating player input.
+BE_ToggleOB.Event:Connect(function(enabled)
+	if enabled ~= false then
+		return
+	end
+	_clearGuardUI()
+	guard.active = false
+	guard.spec   = nil
+	guard.stage  = nil
+end)
 -- ============================================================================
 
 -- Debounce
@@ -618,11 +631,11 @@ end
 -- MOVE GHOST MODEL (APPLYING ROTATION)
 local function startGhostMovement()
 	if moveConnection then
-		moveConnection:Disconnect()
+		moveConnection()
 		moveConnection = nil
 	end
 
-	moveConnection = RunService.RenderStepped:Connect(function()
+	moveConnection = RunServiceScheduler.onRenderStepped(function()
 		if ghostModel and ghostModel.PrimaryPart then
 			local target = mouse.Target
 			if target and (target.Name == "GridSquare" or target.Name == "CardinalGridSquare") then
@@ -659,7 +672,7 @@ local function removeGhost()
 		ghostModel = nil
 	end
 	if moveConnection then
-		moveConnection:Disconnect()
+		moveConnection()
 		moveConnection = nil
 	end
 	clearFootprintHighlights()
@@ -896,7 +909,7 @@ local function showCardinalGrids(startCoord)
 end
 
 -- INPUT HANDLER
-RunService.Heartbeat:Connect(function()
+RunServiceScheduler.onHeartbeat(function()
 	local target = mouse.Target
 	if target and target:IsA("Part") and (target.Name == "GridSquare" or target.Name == "CardinalGridSquare") then
 		GridSelectionBox.Adornee = target
@@ -917,7 +930,7 @@ local function click(target)
 		end
 
 		print("Clicked grid coords: x =", x_grid, "z =", z_grid)
-		
+
 		-- === Guided lock (generic) ==========================================
 		if guard.active and guard.spec and currentMode == guard.spec.mode then
 			local gx, gz = x_grid, z_grid
@@ -1193,13 +1206,13 @@ local function click(target)
 
 			print("Placing", currentMode, "from:", coord.x, coord.z, "to", endCoord.x, endCoord.z)
 			ExecuteCommandEvent:FireServer("BuildZone", coord, endCoord, currentMode, buildingRotation)
-			
+
 			if _pendingPointGuardPayload and _pendingPointGuardPayload.mode == currentMode then
 				pcall(function() BE_GuardFB:Fire("done", _pendingPointGuardPayload) end)
 				_pendingPointGuardPayload = nil
 			end
 
-			
+
 			target.Color = Color3.new(0, 0, 1)
 			removeGhost()
 			clearAll()
@@ -1293,7 +1306,7 @@ displayGridEvent.OnClientEvent:Connect(function(mode)
 		ghostModel.Parent = Workspace
 		startGhostMovement()
 	end
-	
+
 	--Onboarding
 	if guard.active and guard.spec and guard.spec.mode == currentMode then
 		local first = guard.spec.from or guard.spec.point or guard.spec.one
@@ -1301,7 +1314,7 @@ displayGridEvent.OnClientEvent:Connect(function(mode)
 		if p then _mark(p) end
 		_spawnOrMoveAlarmAtCoord(first)
 	end
-	
+
 end)
 
 -- PLOT ASSIGNED EVENT

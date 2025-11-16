@@ -143,7 +143,7 @@ end
 local function formatLastPlayedLabel(timestamp: any): string
 	local value = tonumber(timestamp)
 	if not value or value <= 0 then
-		return "Last Played: —"
+		return "Last Played: -"
 	end
 
 	local ok, dt
@@ -173,6 +173,55 @@ local function formatLastPlayedLabel(timestamp: any): string
 	end
 
 	return ("Last Played: %s"):format(formatted)
+end
+
+local INLINE_DATE_COLOR_HEX = "B6BDC7"
+
+local function escapeRichText(text: any): string
+	if typeof(text) ~= "string" then
+		if text == nil then
+			text = ""
+		else
+			text = tostring(text)
+		end
+	end
+	return (text :: string)
+		:gsub("&", "&amp;")
+		:gsub("<", "&lt;")
+		:gsub(">", "&gt;")
+end
+
+local function applyNameAndLastPlayed(frame: Frame, displayName: string, lastPlayedStamp: any)
+	local nameLbl = frame:FindFirstChild("name")
+	local dateLbl = frame:FindFirstChild("date")
+	local formattedDate = formatLastPlayedLabel(lastPlayedStamp)
+
+	if dateLbl and dateLbl:IsA("TextLabel") then
+		dateLbl.Visible = true
+		dateLbl.TextTransparency = 0
+		dateLbl.Text = formattedDate
+		if nameLbl and nameLbl:IsA("TextLabel") then
+			nameLbl.RichText = false
+			nameLbl.TextWrapped = true
+			nameLbl.TextTruncate = Enum.TextTruncate.None
+			nameLbl.TextYAlignment = Enum.TextYAlignment.Top
+			nameLbl.Text = displayName
+		end
+		return
+	end
+
+	if nameLbl and nameLbl:IsA("TextLabel") then
+		nameLbl.RichText = true
+		nameLbl.TextWrapped = true
+		nameLbl.TextTruncate = Enum.TextTruncate.None
+		nameLbl.TextYAlignment = Enum.TextYAlignment.Top
+		nameLbl.Text = string.format(
+			"%s\n<font color=\"#%s\" size=\"18\">%s</font>",
+			escapeRichText(displayName),
+			INLINE_DATE_COLOR_HEX,
+			escapeRichText(formattedDate)
+		)
+	end
 end
 
 local function resolveGuiButton(obj: Instance?): GuiButton?
@@ -238,21 +287,15 @@ end
 
 local function paintAsSave(frame: Frame, s: SaveRow, isCurrent: boolean, inDeleteMode: boolean)
 	local icon = frame:FindFirstChild("icon") :: ImageLabel?
-	local dateLbl = frame:FindFirstChild("date") :: TextLabel?
-	local nameLbl = frame:FindFirstChild("name") :: TextLabel?
 	local right = frame:FindFirstChild("right")
 	local btn = (right and right:FindFirstChildWhichIsA("ImageButton")) :: ImageButton?
 	local btnText = (btn and btn:FindFirstChildWhichIsA("TextLabel")) :: TextLabel?
+	local displayName = resolveSaveDisplayName(s.cityName, s.id)
 
 	if icon then
 		icon.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
 	end
-	if nameLbl then
-		nameLbl.Text = resolveSaveDisplayName(s.cityName, s.id)
-	end
-	if dateLbl then
-		dateLbl.Text = formatLastPlayedLabel(s.lastPlayed)
-	end
+	applyNameAndLastPlayed(frame, displayName, s.lastPlayed)
 
 	if not (btn and btnText) then return end
 
@@ -315,17 +358,15 @@ end
 
 local function paintAsNew(frame: Frame)
 	local icon = frame:FindFirstChild("icon") :: ImageLabel?
-	local dateLbl = frame:FindFirstChild("date") :: TextLabel?
-	local nameLbl = frame:FindFirstChild("name") :: TextLabel?
 	local right = frame:FindFirstChild("right")
 	local btn = (right and right:FindFirstChildWhichIsA("ImageButton")) :: ImageButton?
 	local btnText = (btn and btn:FindFirstChildWhichIsA("TextLabel")) :: TextLabel?
+	local displayName = "New Save"
 
 	if icon then
 		icon.Image = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
 	end
-	if dateLbl then dateLbl.Text = "Last Played: —" end
-	if nameLbl then nameLbl.Text = "New Save" end
+	applyNameAndLastPlayed(frame, displayName, nil)
 
 	if btn and btnText then
 		btn.Active = true

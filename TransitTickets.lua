@@ -4,6 +4,7 @@ local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local TweenService        = game:GetService("TweenService")
 local Workspace           = game:GetService("Workspace")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- ZoneTracker signals (listen-only)
 local Build       = ServerScriptService:WaitForChild("Build")
@@ -14,6 +15,7 @@ local ZoneTracker = require(ZoneMgr:WaitForChild("ZoneTracker"))
 -- Services
 local PlayerDataInterfaceService = require(ServerScriptService.Services.PlayerDataInterfaceService)
 local PlayerDataService          = require(ServerScriptService.Services.PlayerDataService)
+local BadgeServiceModule         = require(ServerScriptService.Services.BadgeService)
 
 -- Upgrades
 local AirportUpgrades  = require(ReplicatedStorage.Scripts.AirportUpgrades)
@@ -41,13 +43,25 @@ local RE_BusDepotSync    = ensureRE("BusDepotSync")   -- (zoneId, tiersTbl, unlo
 local BindableEvents     = Events:WaitForChild("BindableEvents")
 local ZonePopulatedEvent = BindableEvents:WaitForChild("ZonePopulated")
 local ZoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
+local function ensureBindableEvent(name: string): BindableEvent
+	local ev = BindableEvents:FindFirstChild(name)
+	if ev and ev:IsA("BindableEvent") then
+		return ev
+	end
+	local newEvent = Instance.new("BindableEvent")
+	newEvent.Name = name
+	newEvent.Parent = BindableEvents
+	return newEvent
+end
+local TransitBusTierChangedEvent = ensureBindableEvent("TransitBusTierChanged")
 
 -- ===================================================================
 local MAX_TIERS = 10
 local MAX_TIER_LEVEL = 100
+local LEVELS_PER_TIER_UNLOCK = 3
 
 local function unlockedTiers(unlock: number): number
-	local t = math.floor(math.max(0, tonumber(unlock) or 0) / 10) + 1
+	local t = math.floor(math.max(0, tonumber(unlock) or 0) / LEVELS_PER_TIER_UNLOCK) + 1
 	if t < 1 then t = 1 end
 	if t > MAX_TIERS then t = MAX_TIERS end
 	return t
@@ -57,6 +71,30 @@ local function clamp(n: number, lo: number, hi: number)
 	if n < lo then return lo end
 	if n > hi then return hi end
 	return n
+end
+
+local function recordHasMaxTier(rec)
+	if not rec or type(rec.tiers) ~= "table" then
+		return false
+	end
+	for _, lvl in pairs(rec.tiers) do
+		if (tonumber(lvl) or 0) >= MAX_TIER_LEVEL then
+			return true
+		end
+	end
+	return false
+end
+
+local function maybeAwardAirportBadge(player, rec)
+	if recordHasMaxTier(rec) then
+		BadgeServiceModule.AwardAirportMaxTier(player)
+	end
+end
+
+local function maybeAwardBusBadge(player, rec)
+	if recordHasMaxTier(rec) then
+		BadgeServiceModule.AwardBusMaxTier(player)
+	end
 end
 
 -- ===================================================================
@@ -77,10 +115,10 @@ local USE_SHARED_BOBBING = 1==1
 local BOB_SPEED = 2
 local BOB_AMPLITUDE = 0.5
 local ActiveUpgradeBobs = {} :: {[BasePart]: {base: Vector3, phase: number}}
-local heartbeatConn: RBXScriptConnection? = nil
+local heartbeatConn: (() -> ())? = nil
 local function ensureHeartbeat()
 	if heartbeatConn then return end
-	heartbeatConn = RunService.Heartbeat:Connect(function()
+	heartbeatConn = RunServiceScheduler.onHeartbeat(function()
 		if not USE_SHARED_BOBBING then return end
 		local tnow = os.clock()
 		for part, info in pairs(ActiveUpgradeBobs) do
@@ -91,7 +129,10 @@ local function ensureHeartbeat()
 				ActiveUpgradeBobs[part] = nil
 			end
 		end
-		if next(ActiveUpgradeBobs) == nil then heartbeatConn:Disconnect(); heartbeatConn = nil end
+		if next(ActiveUpgradeBobs) == nil and heartbeatConn then
+			heartbeatConn()
+			heartbeatConn = nil
+		end
 	end)
 end
 local function startBobbing(part: BasePart, basePos: Vector3)
@@ -155,29 +196,29 @@ local function hideUpgradeAlarm(player: Player, zoneId: string)
 end
 
 -- Frontier unlock rule (shared): only current frontier tier can unlock next.
--- Unlock becomes exactly 10 * tierIndex (tier 2 => 20) the first time frontier reaches >=10.
+-- Unlock becomes exactly LEVELS_PER_TIER_UNLOCK * tierIndex the first time the frontier reaches the threshold.
 local function bumpUnlockIfThresholdCrossed(rec, tierIndex: number, oldLevel: number, newLevel: number): boolean
 	local frontier = unlockedTiers(rec.unlock)           -- 1..MAX_TIERS
 	if tierIndex ~= frontier then return false end
 
-	local targetUnlock = math.min(MAX_TIER_LEVEL, tierIndex * 10) -- 10,20,30,...
+	local targetUnlock = math.min(MAX_TIER_LEVEL, tierIndex * LEVELS_PER_TIER_UNLOCK)
 	if rec.unlock >= targetUnlock then return false end
 
-	if newLevel >= 10 then
+	if newLevel >= LEVELS_PER_TIER_UNLOCK then
 		rec.unlock = targetUnlock
 		return true
 	end
 	return false
 end
 
--- Optional: catch-up on load if a player already crossed a frontier-10 but unlock is behind.
+-- Optional: catch-up on load if a player already crossed a frontier threshold but unlock is behind.
 local function reconcileUnlockFromTiersFrontier(rec)
-	-- Walk contiguous tiers from 1 upward; stop at first tier with level <10.
+	-- Walk contiguous tiers from 1 upward; stop at first tier below the threshold.
 	local k = 1
-	while rec.tiers[k] ~= nil and (rec.tiers[k] or 0) >= 10 and k < MAX_TIERS do
+	while rec.tiers[k] ~= nil and (rec.tiers[k] or 0) >= LEVELS_PER_TIER_UNLOCK and k < MAX_TIERS do
 		k += 1
 	end
-	local desiredUnlock = (k - 1) * 10  -- 0,10,20,...
+	local desiredUnlock = (k - 1) * LEVELS_PER_TIER_UNLOCK
 	if desiredUnlock > rec.unlock then
 		rec.unlock = desiredUnlock
 	end
@@ -344,18 +385,22 @@ ZoneTracker.zoneAddedEvent.Event:Connect(function(player: Player, zoneId: string
 	local data = PlayerDataService.GetSaveFileData(player); if not data then return end
 
 	if zoneData.mode == "Airport" then
+		AirportState[player] = AirportState[player] or {}
 		local rec = readTransitNode(data, "airport")
 		reconcileUnlockFromTiersFrontier(rec) -- catch-up if needed
 		AirportState[player][zoneId] = rec
 		fireAirportSnapshot(player, zoneId, rec)
 		recomputeUpgradeAlarmForZone(player, zoneId, "Airport")
+		maybeAwardAirportBadge(player, rec)
 
 	elseif zoneData.mode == "BusDepot" or zoneData.mode == "Bus Depot" then
+		BusDepotState[player] = BusDepotState[player] or {}
 		local rec = readTransitNode(data, "busDepot")
 		-- (bus already behaved; keep as-is or add reconcile if desired)
 		BusDepotState[player][zoneId] = rec
 		fireBusSnapshot(player, zoneId, rec)
 		recomputeUpgradeAlarmForZone(player, zoneId, "BusDepot")
+		maybeAwardBusBadge(player, rec)
 	end
 end)
 
@@ -374,7 +419,7 @@ end)
 
 -- Per-second accrual + alarms
 local NextTick = os.time() + 1
-RunService.Heartbeat:Connect(function()
+RunServiceScheduler.onHeartbeat(function()
 	if os.time() < NextTick then return end
 	NextTick = os.time() + 1
 
@@ -431,8 +476,11 @@ RE_UpgradeAirport.OnServerEvent:Connect(function(player: Player, zoneId: string,
 	-- increment level
 	local newLevel = lvl + 1
 	rec.tiers[tierIndex] = newLevel
+	if newLevel >= MAX_TIER_LEVEL then
+		maybeAwardAirportBadge(player, rec)
+	end
 
-	-- bump unlock if frontier tier reached >=10 (first time), map to 10 * tierIndex
+	-- bump unlock if the frontier tier hits the threshold (first time), map to LEVELS_PER_TIER_UNLOCK * tierIndex
 	local bumped = bumpUnlockIfThresholdCrossed(rec, tierIndex, lvl, newLevel)
 	if bumped then
 		-- Persist unlock first
@@ -478,8 +526,11 @@ RE_UpgradeBusDepot.OnServerEvent:Connect(function(player: Player, zoneId: string
 	-- increment level
 	local newLevel = lvl + 1
 	rec.tiers[tierIndex] = newLevel
+	if newLevel >= MAX_TIER_LEVEL then
+		maybeAwardBusBadge(player, rec)
+	end
 
-	-- bump unlock if frontier tier reached >=10 (first time), map to 10 * tierIndex
+	-- bump unlock if the frontier tier hits the threshold (first time), map to LEVELS_PER_TIER_UNLOCK * tierIndex
 	local bumped = bumpUnlockIfThresholdCrossed(rec, tierIndex, lvl, newLevel)
 	if bumped then
 		PlayerDataService.ModifySaveData(player, "transit/busDepot/unlock", rec.unlock)
@@ -497,6 +548,9 @@ RE_UpgradeBusDepot.OnServerEvent:Connect(function(player: Player, zoneId: string
 	-- Send snapshot (now includes updated unlock when applicable)
 	RE_UpgradeBusDepot:FireClient(player, zoneId, rec.tiers, rec.unlock)
 	RE_BusDepotSync:FireClient(player, zoneId, rec.tiers, rec.unlock)
+
+	-- Notify world-facing systems (BusHandler) so visuals refresh immediately
+	TransitBusTierChangedEvent:Fire(player)
 
 	recomputeUpgradeAlarmForZone(player, zoneId, "BusDepot")
 end)
@@ -525,11 +579,13 @@ local function seedExistingZonesForPlayer(player: Player)
 			AirportState[player][zoneId] = rec
 			fireAirportSnapshot(player, zoneId, rec)
 			recomputeUpgradeAlarmForZone(player, zoneId, "Airport")
+			maybeAwardAirportBadge(player, rec)
 		elseif (z.mode == "BusDepot" or z.mode == "Bus Depot") and not BusDepotState[player][zoneId] then
 			local rec = readTransitNode(data, "busDepot")
 			BusDepotState[player][zoneId] = rec
 			fireBusSnapshot(player, zoneId, rec)
 			recomputeUpgradeAlarmForZone(player, zoneId, "BusDepot")
+			maybeAwardBusBadge(player, rec)
 		end
 	end
 end

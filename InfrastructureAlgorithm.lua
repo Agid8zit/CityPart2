@@ -47,7 +47,7 @@ local function wPrint(msg)
 	end
 end
 
--- compact grid key
+-- compact grid key (used only for the UF over cells)
 local function keyXZ(x, z)
 	return tostring(x) .. "|" .. tostring(z)
 end
@@ -77,7 +77,11 @@ end
 ----------------------------------------------------------------------
 --  Data structures
 ----------------------------------------------------------------------
--- playerId → { Power = { zones = {..}, adjacency = {..}, unionFind = {..}, cells = {}, ufCells = {..} },
+-- playerId → { Power = { zones = {..}, adjacency = {..}, unionFind = {..},
+--                        cells = { [x] = { [z] = { [zoneId]=true } } },
+--                        ufCells = { parent, rank, present, sourceRoots },
+--                        ufCellsDirty, rebuildScheduled,
+--                        notifyQueue = { [zoneId]=zoneData }, notifyScheduled },
 --              Water = {..}, Road = {..} }
 NetworkManager.networks = {}
 
@@ -177,13 +181,82 @@ local function ensurePlayerNetwork(player, networkType)
 	if not nets[networkType] then
 		nets[networkType] = {
 			zones     = {},      -- [zoneId] → zoneData
-			adjacency = {},      -- [zoneId] → { neighbourId, … }
+			adjacency = {},      -- [zoneId] → { [neighbourId]=true, ... }
 			unionFind = { parent = {}, rank = {} },
-			cells     = {},      -- [keyXZ] → { [zoneId]=true, ... }
+			cells     = {},      -- nested: [x] → [z] → { [zoneId] = true }
 			ufCells   = nil,     -- cell-level DSU cache (built on demand)
+			-- incremental rebuild + notify coalescing
+			ufCellsDirty     = false,
+			rebuildScheduled = false,
+			notifyQueue      = {},
+			notifyScheduled  = false,
 		}
 	end
 	return nets[networkType]
+end
+
+----------------------------------------------------------------------
+--  Adjacency (use sets for O(1) add/remove)
+----------------------------------------------------------------------
+local function adjEnsure(net, id)
+	net.adjacency[id] = net.adjacency[id] or {}
+end
+
+local function adjAdd(net, a, b)
+	if a == b then return end
+	adjEnsure(net, a); adjEnsure(net, b)
+	net.adjacency[a][b] = true
+	net.adjacency[b][a] = true
+end
+
+local function adjRemoveEverywhere(net, id)
+	local neigh = net.adjacency[id]
+	if neigh then
+		for n, _ in pairs(neigh) do
+			if net.adjacency[n] then
+				net.adjacency[n][id] = nil
+			end
+		end
+	end
+	net.adjacency[id] = nil
+end
+
+local function adjCount(net, id)
+	local t = net.adjacency[id]
+	if not t then return 0 end
+	local n = 0
+	for _ in pairs(t) do n += 1 end
+	return n
+end
+
+----------------------------------------------------------------------
+--  Cell index (nested tables: cells[x][z] -> set(zoneId))
+----------------------------------------------------------------------
+local function getCellBucket(net, x, z, create)
+	local col = net.cells[x]
+	if not col then
+		if not create then return nil end
+		col = {}
+		net.cells[x] = col
+	end
+	local bucket = col[z]
+	if not bucket and create then
+		bucket = {}
+		col[z] = bucket
+	end
+	return bucket
+end
+
+local function clearCellIfEmpty(net, x, z)
+	local col = net.cells[x]
+	if not col then return end
+	local bucket = col[z]
+	if bucket and next(bucket) == nil then
+		col[z] = nil
+		if next(col) == nil then
+			net.cells[x] = nil
+		end
+	end
 end
 
 ----------------------------------------------------------------------
@@ -209,12 +282,7 @@ local function indexZoneCells(net, zoneId, gridList)
 	for _, coord in ipairs(gridList) do
 		local x, z = getXZ(coord)
 		if x ~= nil and z ~= nil then
-			local k = keyXZ(x, z)
-			local bucket = net.cells[k]
-			if bucket == nil then
-				bucket = {}
-				net.cells[k] = bucket
-			end
+			local bucket = getCellBucket(net, x, z, true)
 			bucket[zoneId] = true
 		elseif DEBUG_LOGS then
 			warn("NetworkManager.indexZoneCells: bad coord:", coord)
@@ -227,16 +295,44 @@ local function deindexZoneCells(net, zoneId, gridList)
 	for _, coord in ipairs(gridList) do
 		local x, z = getXZ(coord)
 		if x ~= nil and z ~= nil then
-			local k = keyXZ(x, z)
-			local bucket = net.cells[k]
+			local bucket = getCellBucket(net, x, z, false)
 			if bucket then
 				bucket[zoneId] = nil
-				local empty = true
-				for _ in pairs(bucket) do empty = false; break end
-				if empty then net.cells[k] = nil end
+				clearCellIfEmpty(net, x, z)
 			end
 		end
 	end
+end
+
+----------------------------------------------------------------------
+--  Incremental rebuild + notify coalescing
+----------------------------------------------------------------------
+function NetworkManager.scheduleCellRebuild(player, networkType)
+	local net = ensurePlayerNetwork(player, networkType)
+	net.ufCellsDirty = true
+	if net.rebuildScheduled then return end
+	net.rebuildScheduled = true
+	task.defer(function()
+		net.rebuildScheduled = false
+		if net.ufCellsDirty then
+			NetworkManager.rebuildCellUnionFind(player, networkType)
+			net.ufCellsDirty = false
+		end
+	end)
+end
+
+local function queueNetworkReady(player, networkType, zoneId, zoneData)
+	local net = ensurePlayerNetwork(player, networkType)
+	net.notifyQueue[zoneId] = zoneData or (net.zones and net.zones[zoneId])
+	if net.notifyScheduled then return end
+	net.notifyScheduled = true
+	task.defer(function()
+		net.notifyScheduled = false
+		for zid, zdata in pairs(net.notifyQueue) do
+			NetworkReadyEvent:Fire(player, zid, zdata)
+			net.notifyQueue[zid] = nil
+		end
+	end)
 end
 
 ----------------------------------------------------------------------
@@ -246,21 +342,25 @@ function NetworkManager.rebuildCellUnionFind(player, networkType)
 	local net = ensurePlayerNetwork(player, networkType)
 
 	local uf  = { parent = {}, rank = {} }
-	local present = {}        -- set of infra cell keys "x|z" that exist
-	local sourceCells = {}    -- list of source cell keys
+	local present = {}          -- set of infra cell keys "x|z"
+	local coords  = {}          -- k -> {x=?, z=?} (avoid string parsing)
+	local sourceKeys = {}       -- set of source cell keys
 
 	-- 1) collect infra cells + mark sources
 	for _, z in pairs(net.zones) do
 		if isInfraMode(z.mode, networkType) then
+			local zIsSource = NetworkManager.isSourceZone(z, networkType)
 			for _, c in ipairs(z.gridList or {}) do
-				if c and c.x ~= nil and c.z ~= nil then
-					local k = keyXZ(c.x, c.z)
-					present[k] = true
-					if uf.parent[k] == nil then
+				local x, cz = getXZ(c)
+				if x ~= nil and cz ~= nil then
+					local k = keyXZ(x, cz)
+					if not present[k] then
+						present[k] = true
+						coords[k]  = { x = x, z = cz }
 						uf.parent[k], uf.rank[k] = k, 0
 					end
-					if NetworkManager.isSourceZone(z, networkType) then
-						sourceCells[#sourceCells+1] = k
+					if zIsSource then
+						sourceKeys[k] = true
 					end
 				end
 			end
@@ -268,9 +368,8 @@ function NetworkManager.rebuildCellUnionFind(player, networkType)
 	end
 
 	-- 2) connect neighbour infra cells (4‑ or 8‑way depending on USE_DIAGONAL_ADJ)
-	for k, _ in pairs(present) do
-		local xs, zs = k:match("([^|]+)|([^|]+)")
-		local x, z = tonumber(xs), tonumber(zs)
+	for k, c in pairs(coords) do
+		local x, z = c.x, c.z
 		for _, off in ipairs(adjacentOffsets) do
 			local nk = keyXZ(x + off[1], z + off[2])
 			if present[nk] then
@@ -281,12 +380,17 @@ function NetworkManager.rebuildCellUnionFind(player, networkType)
 
 	-- 3) compute source roots
 	local roots = {}
-	for _, k in ipairs(sourceCells) do
+	for k, _ in pairs(sourceKeys) do
 		roots[uf_find(uf, k)] = true
 	end
 
 	-- store
-	net.ufCells = { parent = uf.parent, rank = uf.rank, present = present, sourceRoots = roots }
+	net.ufCells = {
+		parent      = uf.parent,
+		rank        = uf.rank,
+		present     = present,
+		sourceRoots = roots,
+	}
 end
 
 -- Query: is this infra cell connected to any source cell?
@@ -294,8 +398,9 @@ function NetworkManager.isCellConnectedToSource(player, networkType, gx, gz)
 	local net = NetworkManager.networks[player.UserId]
 		and NetworkManager.networks[player.UserId][networkType]
 	if not net then return false end
-	if not net.ufCells then
+	if net.ufCellsDirty or not net.ufCells then
 		NetworkManager.rebuildCellUnionFind(player, networkType)
+		net.ufCellsDirty = false
 		if not net.ufCells then return false end
 	end
 	local k = keyXZ(gx, gz)
@@ -312,7 +417,7 @@ function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
 
 	-- Register zone
 	net.zones[zoneId]              = zoneData
-	net.adjacency[zoneId]          = net.adjacency[zoneId] or {}
+	adjEnsure(net, zoneId)
 	net.unionFind.parent[zoneId]   = zoneId
 	net.unionFind.rank[zoneId]     = 0
 
@@ -322,10 +427,10 @@ function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
 	-- Connect to neighbours already present (uses our internal index)
 	NetworkManager.updateZoneConnections(player, zoneId, zoneData, networkType)
 
-	-- Keep cell-level DSU current after add
-	NetworkManager.rebuildCellUnionFind(player, networkType)
+	-- Defer one cell DSU rebuild for this tick (coalesced across changes)
+	NetworkManager.scheduleCellRebuild(player, networkType)
 
-	-- One-shot post-tick rescan
+	-- One-shot post-tick rescan (adjacency only); keep DSU rebuild deferred
 	if POST_TICK_RESCAN then
 		task.defer(function()
 			local stillHere = NetworkManager.networks[player.UserId]
@@ -333,19 +438,20 @@ function NetworkManager.addZoneToNetwork(player, zoneId, zoneData, networkType)
 				and NetworkManager.networks[player.UserId][networkType].zones[zoneId]
 			if stillHere then
 				NetworkManager.updateZoneConnections(player, zoneId, zoneData, networkType)
-				-- Cell DSU is topology based; adding connections does not change present cells,
-				-- but rebuild anyway to be explicit & future-safe.
-				NetworkManager.rebuildCellUnionFind(player, networkType)
+				NetworkManager.scheduleCellRebuild(player, networkType)
 			end
 		end)
 	end
 
 	-- optional debug
 	if NetworkManager.isSourceZone(zoneData, networkType)
-		and #(net.adjacency[zoneId]) == 0
+		and adjCount(net, zoneId) == 0
 	then
 		dPrint(("Zone %s is a standalone %s source."):format(zoneId, networkType))
 	end
+
+	-- Coalesced notify (downstream systems rescan once)
+	queueNetworkReady(player, networkType, zoneId, zoneData)
 end
 
 function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
@@ -358,10 +464,9 @@ function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
 	-- capture neighbours BEFORE unlinking (to notify them after rebuild)
 	local neighbours = {}
 	do
-		local list = net.adjacency[zoneId]
-		if list then
-			for i = 1, #list do
-				local nid = list[i]
+		local neighSet = net.adjacency[zoneId]
+		if neighSet then
+			for nid, _ in pairs(neighSet) do
 				if nid and nid ~= zoneId then
 					neighbours[#neighbours+1] = nid
 				end
@@ -372,28 +477,23 @@ function NetworkManager.removeZoneFromNetwork(player, zoneId, networkType)
 	-- de-index cells
 	deindexZoneCells(net, zoneId, zData and zData.gridList)
 
-	-- unlink from all adjacency lists
-	for parentId, list in pairs(net.adjacency) do
-		for i = #list, 1, -1 do
-			if list[i] == zoneId then table.remove(list, i) end
-		end
-	end
+	-- unlink from adjacency
+	adjRemoveEverywhere(net, zoneId)
 
 	-- purge own tables
-	net.adjacency[zoneId]        = nil
 	net.zones[zoneId]            = nil
 	net.unionFind.parent[zoneId] = zoneId
 	net.unionFind.rank[zoneId]   = net.unionFind.rank[zoneId] or 0
 
-	-- rebuild DSUs (zone-level then cell-level)
+	-- rebuild zone-level DSU (cheap) and mark cells DSU dirty (deferred)
 	NetworkManager.rebuildUnionFind(player, networkType)
-	NetworkManager.rebuildCellUnionFind(player, networkType)
+	NetworkManager.scheduleCellRebuild(player, networkType)
 
-	-- notify surviving neighbours so downstream systems rescan
+	-- notify surviving neighbours so downstream systems rescan (coalesced)
 	for _, nid in ipairs(neighbours) do
 		local nz = net.zones[nid]
 		if nz then
-			NetworkReadyEvent:Fire(player, nid, nz)
+			queueNetworkReady(player, networkType, nid, nz)
 		end
 	end
 end
@@ -403,17 +503,11 @@ end
 ----------------------------------------------------------------------
 function NetworkManager.updateZoneConnections(player, zoneId, zoneData, networkType)
 	local net = ensurePlayerNetwork(player, networkType)
-	net.adjacency[zoneId] = net.adjacency[zoneId] or {}
+	adjEnsure(net, zoneId)
 
 	for adjId, _ in pairs(NetworkManager.getAdjacentZones(player, zoneData.gridList, networkType)) do
 		if adjId ~= zoneId then
-			net.adjacency[adjId] = net.adjacency[adjId] or {}
-			if not table.find(net.adjacency[zoneId], adjId) then
-				table.insert(net.adjacency[zoneId], adjId)
-			end
-			if not table.find(net.adjacency[adjId], zoneId) then
-				table.insert(net.adjacency[adjId], zoneId)
-			end
+			adjAdd(net, zoneId, adjId)
 			uf_union(net.unionFind, zoneId, adjId)
 		end
 	end
@@ -429,14 +523,15 @@ function NetworkManager.rebuildUnionFind(player, networkType)
 		uf.parent[zid], uf.rank[zid] = zid, 0
 	end
 	for zid, neighbours in pairs(net.adjacency) do
-		for _, nid in ipairs(neighbours) do
+		for nid, _ in pairs(neighbours) do
 			uf_union(uf, zid, nid)
 		end
 	end
 	net.unionFind = uf
 
-	-- keep cell-level DSU in sync with any topology rebuilds
-	NetworkManager.rebuildCellUnionFind(player, networkType)
+	-- mark cell-level DSU dirty; rebuild is coalesced
+	net.ufCellsDirty = true
+	NetworkManager.scheduleCellRebuild(player, networkType)
 end
 
 ----------------------------------------------------------------------
@@ -509,8 +604,7 @@ function NetworkManager.getAdjacentZones(player, gridList, networkType)
 			local x, z = getXZ(coord)
 			if x ~= nil and z ~= nil then
 				-- same-cell
-				local k0 = keyXZ(x, z)
-				local bucket0 = net.cells[k0]
+				local bucket0 = getCellBucket(net, x, z, false)
 				if bucket0 then
 					for nid in pairs(bucket0) do
 						out[nid] = net.zones[nid]
@@ -519,8 +613,7 @@ function NetworkManager.getAdjacentZones(player, gridList, networkType)
 				-- neighbours
 				for _, off in ipairs(adjacentOffsets) do
 					local gx, gz = x + off[1], z + off[2]
-					local k = keyXZ(gx, gz)
-					local bucket = net.cells[k]
+					local bucket = getCellBucket(net, gx, gz, false)
 					if bucket then
 						for nid in pairs(bucket) do
 							out[nid] = net.zones[nid]
@@ -544,9 +637,9 @@ function NetworkManager.getAdjacentZones(player, gridList, networkType)
 				end
 				for _, off in ipairs(adjacentOffsets) do
 					local gx, gz = coord.x + off[1], coord.z + off[2]
-					local z = ZoneTrackerModule.getAnyZoneAtGrid(player, gx, gz)
-					if z and NetworkManager.isZonePartOfNetwork(z, networkType) then
-						out[z.zoneId] = z
+					local zt = ZoneTrackerModule.getAnyZoneAtGrid(player, gx, gz)
+					if zt and NetworkManager.isZonePartOfNetwork(zt, networkType) then
+						out[zt.zoneId] = zt
 					end
 				end
 			elseif DEBUG_LOGS then
@@ -580,9 +673,7 @@ local function onZoneAdded(player, zoneId, zoneData)
 		dPrint(("Unrecognized mode on add: %s"):format(tostring(zoneData.mode)))
 	end
 
-	if relevant then
-		NetworkReadyEvent:Fire(player, zoneId, zoneData)
-	end
+	-- Do NOT fire NetworkReady directly here; addZoneToNetwork() queued it.
 end
 
 local function onZoneCreated(player, zoneId, mode, gridList)
@@ -634,15 +725,18 @@ function NetworkManager.rebuildAllForPlayer(player)
 		end
 	end
 
-	-- Pass 2: rebuild connectivity for each type (also rebuilds cell DSUs)
+	-- Pass 2: rebuild connectivity for each type (also flags cell DSUs dirty)
 	NetworkManager.rebuildUnionFind(player, "Water")
 	NetworkManager.rebuildUnionFind(player, "Power")
 	NetworkManager.rebuildUnionFind(player, "Road")
 
-	-- Pass 3: notify downstream (ZoneRequirementsChecker listens to NetworkReady)
-	for networkType, net in pairs(NetworkManager.networks[pid]) do
-		for zid, zdata in pairs(net.zones) do
-			NetworkReadyEvent:Fire(player, zid, zdata)
+	-- Pass 3: notify downstream (batched)
+	for _, networkType in ipairs({"Water","Power","Road"}) do
+		local net = NetworkManager.networks[pid] and NetworkManager.networks[pid][networkType]
+		if net then
+			for zid, zdata in pairs(net.zones) do
+				queueNetworkReady(player, networkType, zid, zdata)
+			end
 		end
 	end
 end
@@ -674,7 +768,7 @@ function NetworkManager.debugDump(player, networkType)
 	if not net then print("  <none>"); return end
 	for zid, data in pairs(net.zones) do
 		print(("  • %s  (%s)  neighbours=%d")
-			:format(zid, data.mode, #(net.adjacency[zid] or {})))
+			:format(zid, data.mode, adjCount(net, zid)))
 	end
 end
 

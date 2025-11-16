@@ -22,6 +22,7 @@ end)
 -- UI
 local UI: ScreenGui = script.Parent :: ScreenGui
 local LocalPlayer: Player = Players.LocalPlayer
+local PlayerGui: PlayerGui = LocalPlayer:WaitForChild("PlayerGui") :: PlayerGui
 
 local UI_MainFrame: Frame = UI:WaitForChild("MainFrame") :: Frame
 local UI_Inner: Frame = (UI_MainFrame:WaitForChild("Container") :: Frame):WaitForChild("Container") :: Frame
@@ -57,6 +58,8 @@ local RF_SwitchToSlot: RemoteFunction?    = findRF("SwitchToSlot")
 -- Local state
 -- RENAMED: we now store the user's *raw* local text (not filtered).
 local storedRawText: string = ""
+local userHasLocalOverride = false
+local suppressTextSignal = false
 
 -- Helpers ------------------------------------------------------------------
 local MIN_LEN = 3
@@ -76,6 +79,14 @@ end
 
 local function setStoredRaw(value: any)
 	storedRawText = normalizeName(value)
+end
+
+local function applyServerCityName(text: string?)
+	suppressTextSignal = true
+	UI_SearchBox.Text = text or ""
+	suppressTextSignal = false
+	setStoredRaw(UI_SearchBox.Text)
+	userHasLocalOverride = false
 end
 
 local function ulen(s: string): number
@@ -112,11 +123,35 @@ local function doExit()
 	exitDebounce = true
 	playClick()
 	UI.Enabled = false
+	userHasLocalOverride = false
 	UI:SetAttribute("PendingSlotId", nil) -- clear staged
 	if GuiService.SelectedObject then
 		GuiService.SelectedObject = nil
 	end
 	task.delay(0.1, function() exitDebounce = false end)
+end
+
+local function closeLoadMenuGui()
+	local loadGui = PlayerGui:FindFirstChild("LoadMenu")
+	if not (loadGui and loadGui:IsA("ScreenGui")) then
+		return
+	end
+
+	local logic = loadGui:FindFirstChild("Logic")
+	if logic and logic:IsA("ModuleScript") then
+		local ok, loadMenu = pcall(function()
+			return require(logic)
+		end)
+		if ok and type(loadMenu) == "table" and type(loadMenu.OnHide) == "function" then
+			local success, err = pcall(loadMenu.OnHide)
+			if not success then
+				warn("[CityName] LoadMenu.OnHide failed: ", err)
+			end
+			return
+		end
+	end
+
+	loadGui.Enabled = false
 end
 
 -- Public API ---------------------------------------------------------------
@@ -241,18 +276,26 @@ function CityName.Init(): ()
 		StepCompleted:FireServer("CityNamed")
 		-- 4) close
 		doExit()
+		closeLoadMenuGui()
 	end)
 
 	-- While typing, we *only* keep the local raw string in sync (no server filtering).
 	UI_SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
-		if not UI.Enabled then return end
 		setStoredRaw(UI_SearchBox.Text or "")
+		if not UI.Enabled then return end
+		if suppressTextSignal then return end
+		userHasLocalOverride = true
 	end)
 
 	-- On focus lost, just trim locally; do not filter via server.
 	UI_SearchBox.FocusLost:Connect(function()
-		UI_SearchBox.Text = normalizeName(UI_SearchBox.Text or "")
-		setStoredRaw(UI_SearchBox.Text)
+		local trimmed = normalizeName(UI_SearchBox.Text or "")
+		if UI_SearchBox.Text ~= trimmed then
+			suppressTextSignal = true
+			UI_SearchBox.Text = trimmed
+			suppressTextSignal = false
+		end
+		setStoredRaw(trimmed)
 	end)
 
 	if PlayerDataControllerOk and PlayerDataController then
@@ -266,18 +309,28 @@ function CityName.Init(): ()
 			if typeof(sf) ~= "table" then return end
 
 			-- Prefer saved filtered cityName if present, otherwise prompt.
+			local serverName = tostring(sf.cityName or "")
 			if needsPromptName(sf.cityName) then
+				local placeholder = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
 				if not UI.Enabled then
-					setStoredRaw("")
-					UI_SearchBox.Text = ""
-					UI_SearchBox.PlaceholderText = ("Enter a name (%d-%d chars)"):format(MIN_LEN, MAX_LEN)
+					applyServerCityName("")
+					UI_SearchBox.PlaceholderText = placeholder
 					CityName.OnShow()
+				elseif not userHasLocalOverride then
+					applyServerCityName("")
+					UI_SearchBox.PlaceholderText = placeholder
 				end
-			else
-				-- Show what players previously saw (filtered). Keep raw buffer aligned.
-				UI_SearchBox.Text = tostring(sf.cityName or "")
-				setStoredRaw(UI_SearchBox.Text)
+				return
 			end
+
+			if userHasLocalOverride then
+				if normalizeName(storedRawText) ~= normalizeName(serverName) then
+					return
+				end
+				userHasLocalOverride = false
+			end
+
+			applyServerCityName(serverName)
 		end
 
 		if typeof(PlayerDataController.ListenForAnyDataChange) == "function" then

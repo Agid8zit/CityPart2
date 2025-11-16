@@ -449,6 +449,7 @@ local BOB_SPEED     = 2              -- radians / sec
 local BOB_AMPLITUDE = 0.5            -- studs
 
 local RunService     = game:GetService("RunService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 local ActiveAlarms   = {}            -- [part] = { base = Vector3, phase = number }
 local heartbeatConn  -- lazily made
 
@@ -459,7 +460,7 @@ local function attachSharedBobbing(part, basePos)
 
 	if heartbeatConn then return end
 	local t = 0
-	heartbeatConn = RunService.Heartbeat:Connect(function(dt)
+	heartbeatConn = RunServiceScheduler.onHeartbeat(function(dt)
 		t += dt
 		for p,info in pairs(ActiveAlarms) do
 			if p.Parent then
@@ -468,8 +469,8 @@ local function attachSharedBobbing(part, basePos)
 				ActiveAlarms[p] = nil   -- clean up stray
 			end
 		end
-		if next(ActiveAlarms) == nil then
-			heartbeatConn:Disconnect()
+		if next(ActiveAlarms) == nil and heartbeatConn then
+			heartbeatConn()
 			heartbeatConn = nil
 		end
 	end)

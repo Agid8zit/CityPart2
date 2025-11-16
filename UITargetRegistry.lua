@@ -24,7 +24,8 @@ local BE_Reg  = ensure(BEs, "BindableEvent",    "OB_TargetRegistered")
 
 local UITargetRegistry = {}
 
-local Registry: {[string]: GuiObject} = {}
+-- Allow nil to represent "unregistered"
+local Registry: {[string]: GuiObject?} = {}
 
 -- === Core API ===
 function UITargetRegistry.Register(key: string, gui: GuiObject?)
@@ -38,7 +39,7 @@ function UITargetRegistry.Register(key: string, gui: GuiObject?)
 		Registry[key] = nil
 		BE_Reg:Fire(key, nil)
 	end
-	print("[UIReg] Register", key, gui and gui:GetFullName() or "nil")
+	--print("[UIReg] Register", key, gui and gui:GetFullName() or "nil")
 end
 
 function UITargetRegistry.Get(key: string): GuiObject?
@@ -87,10 +88,14 @@ end
 local _autoHooked = false
 local function _startAutoRegister()
 	if _autoHooked then return end
-	_autoHooked = true
 
 	local lp = Players.LocalPlayer
-	if not lp then return end -- server or during very early bootstrap
+	if not lp then
+		_autoHooked = true -- mark as done in this context (server/plugin) to avoid repeats
+		return
+	end
+
+	_autoHooked = true
 
 	-- Don't block the require; do the wiring shortly after.
 	task.defer(function()
@@ -98,15 +103,17 @@ local function _startAutoRegister()
 		if not pg then return end
 
 		-- Try once immediately (covers cases where HUD was already mounted)
-		local first = pg:FindFirstChild("BuildButton", true)
-		if first and first:IsA("GuiObject") then
-			UITargetRegistry.Register("BuildButton", first)
-		else
-			-- fallback: scan by attribute/text
-			for _, d in ipairs(pg:GetDescendants()) do
-				if _looksLikeBuildButton(d) then
-					UITargetRegistry.Register("BuildButton", d :: GuiObject)
-					break
+		if not Registry["BuildButton"] then
+			local first = pg:FindFirstChild("BuildButton", true)
+			if first and first:IsA("GuiObject") then
+				UITargetRegistry.Register("BuildButton", first)
+			else
+				-- fallback: scan by attribute/text
+				for _, d in ipairs(pg:GetDescendants()) do
+					if _looksLikeBuildButton(d) then
+						UITargetRegistry.Register("BuildButton", d :: GuiObject)
+						break
+					end
 				end
 			end
 		end
@@ -125,9 +132,9 @@ local function _startAutoRegister()
 			if cur and inst == cur then
 				-- Unregister old target
 				UITargetRegistry.Register("BuildButton", nil)
-				-- Find a replacement if one exists
+				-- Find a replacement if one exists (skip the one being removed)
 				for _, d in ipairs(pg:GetDescendants()) do
-					if _looksLikeBuildButton(d) then
+					if d ~= inst and _looksLikeBuildButton(d) then
 						UITargetRegistry.Register("BuildButton", d :: GuiObject)
 						break
 					end

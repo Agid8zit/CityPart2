@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui        = game:GetService("StarterGui")
 local TweenService      = game:GetService("TweenService")
 local RunService        = game:GetService("RunService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 local LocalPlayer = Players.LocalPlayer
 
 local UI = script.Parent
@@ -42,6 +43,11 @@ local DEFAULT_CHANNEL         = "global"
 local PREFER_LOCALIZATION     = true
 -- Ignore duplicate keys that arrive within this window (seconds)
 local COALESCE_WINDOW_SECONDS = 0.8
+local COALESCE_WINDOW_BY_KEY = {
+	["Cant overlap zones"]             = 0,
+	["Cant build on roads"]            = 0,
+	["Cant build on unique buildings"] = 0,
+}
 -- Candidate BoolValue names we treat as "world ready" gates (false = pause/queue, true = show)
 local READY_FLAG_NAMES = { "WorldReady", "CityReady", "WorldLoaded", "Loaded", "IsLoaded", "IsReady" }
 -- Grace period after reload before showing notifications
@@ -66,7 +72,7 @@ local _resolveFn  -- function?   (optional external resolver)
 local _readyValue   -- BoolValue?
 local _paused       = false -- if true: queue incoming toasts
 local _pending      = nil   -- last pending toast while paused {channel, key, opts}
-local _lastKeyAt    = {}    -- key -> os.clock() timestamp, for coalescing
+local _lastKeyAt    = {}    -- key -> wall-clock timestamp (seconds) for coalescing
 local _worldReloadCooldown = false -- block toasts during/just-after reload
 
 -- Active singleton node
@@ -129,6 +135,28 @@ local function ensureRichTextIfNeeded(label: TextLabel, text: string)
 	if string.find(text, "<[^>]+>") then
 		label.RichText = true
 		if not label.TextFits then label.TextFits = label.TextFits end
+	end
+end
+
+local function resetToastVisualState(node: Instance?)
+	if not node then return end
+	if node:IsA("GuiObject") then
+		node.Visible = true
+		node.BackgroundTransparency = node.BackgroundTransparency
+	end
+	for _, obj in ipairs(node:GetDescendants()) do
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+			obj.TextTransparency = 0
+			obj.Visible = true
+		elseif obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+			if obj.Name ~= "dropshadow" then
+				obj.ImageTransparency = 0
+				obj.Visible = true
+			else
+				obj.ImageTransparency = 0.3
+				obj.Visible = true
+			end
+		end
 	end
 end
 
@@ -464,7 +492,7 @@ function Notification.SetReadySource(obj)
 	elseif type(obj) == "function" then
 		_readyValue = nil
 		-- poll function lightly on heartbeat; pause when false
-		RunService.RenderStepped:Connect(function()
+		RunServiceScheduler.onRenderStepped(function()
 			local ok, val = pcall(obj)
 			if ok then
 				setPaused(not (val and true or false))
@@ -563,18 +591,26 @@ local function ensureSingletonNode()
 end
 
 -- ===== spawn/update toast =====
-local function showOrReplaceToast(langKey: string, explicitText: string?, duration: number?)
-	-- Coalesce identical keys within a short window to avoid spam
-	local now = os.clock()
-	local last = _lastKeyAt[langKey]
-	if last and (now - last) < COALESCE_WINDOW_SECONDS then
-		return
+local function showOrReplaceToast(langKey: string, explicitText: string?, duration: number?, forceDisplay: boolean?)
+	-- Coalesce identical keys within a short window to avoid spam (per-key overrides)
+	local window = coalesceWindowFor(langKey)
+	if not forceDisplay and window > 0 then
+		local now = time()
+		local last = _lastKeyAt[langKey]
+		if last and (now - last) < window then
+			return
+		end
+		_lastKeyAt[langKey] = now
+	else
+		_lastKeyAt[langKey] = time()
 	end
-	_lastKeyAt[langKey] = now
 
 	local node = ensureSingletonNode()
+	resetToastVisualState(node)
 	local label = getPreferredLabel(node)
 	if label then
+		label.TextTransparency = 0
+		label.Visible = true
 		label:SetAttribute("LangKey", langKey or "Unknown")
 
 		-- Priority: localization -> explicit server text -> key
@@ -645,7 +681,7 @@ function Notification.BindRemote(ev: RemoteEvent)
 	print(("[Notifications] Bound RemoteEvent: %s"):format(remoteName))
 
 	ev.OnClientEvent:Connect(function(payload)
-		local key; local txt; local dur; local channel; local forceText
+		local key; local txt; local dur; local channel; local forceText; local forceDisplay
 
 		if typeof(payload) == "string" then
 			key = payload
@@ -655,6 +691,7 @@ function Notification.BindRemote(ev: RemoteEvent)
 			dur       = payload.Duration
 			channel   = payload.Channel
 			forceText = payload.ForceText
+			forceDisplay = payload.ForceDisplay == true
 		end
 		if not key or key == "" then key = "Unknown" end
 
@@ -662,12 +699,24 @@ function Notification.BindRemote(ev: RemoteEvent)
 
 		-- Gate against reload; keep only the most-recent pending
 		if not isReadyNow() then
-			_pending = { channel = channel or DEFAULT_CHANNEL, key = key, opts = { text = (forceText and txt or nil), duration = dur } }
+			_pending = {
+				channel = channel or DEFAULT_CHANNEL,
+				key = key,
+				opts = {
+					text = (forceText and txt or nil),
+					duration = dur,
+					force = forceDisplay
+				},
+			}
 			return
 		end
 
 		-- Enforce singleton by default
-		Notification.ShowSingleton(channel or DEFAULT_CHANNEL, key, { text = (forceText and txt or nil), duration = dur })
+		Notification.ShowSingleton(
+			channel or DEFAULT_CHANNEL,
+			key,
+			{ text = (forceText and txt or nil), duration = dur, force = forceDisplay }
+		)
 	end)
 end
 
@@ -809,14 +858,19 @@ end
 function Notification.Show(langKey: string, opts)
 	local txt = opts and opts.text or nil
 	local dur = opts and opts.duration or nil
+	local force = opts and opts.force or false
 
 	if not isReadyNow() then
-		_pending = { channel = DEFAULT_CHANNEL, key = langKey, opts = { text = txt, duration = dur } }
+		_pending = {
+			channel = DEFAULT_CHANNEL,
+			key = langKey,
+			opts = { text = txt, duration = dur, force = force },
+		}
 		return
 	end
 
 	-- Route through ShowSingleton so we always reuse an existing toast for channel
-	return Notification.ShowSingleton(DEFAULT_CHANNEL, langKey, { text = txt, duration = dur })
+	return Notification.ShowSingleton(DEFAULT_CHANNEL, langKey, { text = txt, duration = dur, force = force })
 end
 
 local function findSingleton(channel: string)
@@ -824,6 +878,15 @@ local function findSingleton(channel: string)
 		return _singletonNode
 	end
 	return _findExistingToastForChannel(channel)
+end
+
+local function coalesceWindowFor(langKey: string?): number
+	if not langKey then return COALESCE_WINDOW_SECONDS end
+	local override = COALESCE_WINDOW_BY_KEY[langKey]
+	if type(override) == "number" then
+		return override
+	end
+	return COALESCE_WINDOW_SECONDS
 end
 
 -- implement hide + optional channel param
@@ -858,9 +921,14 @@ function Notification.ShowSingleton(channel: string, langKey: string, opts)
 
 	local txt = opts and opts.text or nil
 	local dur = opts and opts.duration or nil
+	local force = opts and opts.force or false
 
 	if not isReadyNow() then
-		_pending = { channel = channel, key = langKey, opts = { text = txt, duration = dur } }
+		_pending = {
+			channel = channel,
+			key = langKey,
+			opts = { text = txt, duration = dur, force = force },
+		}
 		return
 	end
 
@@ -872,7 +940,7 @@ function Notification.ShowSingleton(channel: string, langKey: string, opts)
 		_singletonNode = node
 	end
 
-	return showOrReplaceToast(langKey, txt, dur)
+	return showOrReplaceToast(langKey, txt, dur, force)
 end
 
 function Notification.ClearChannel(channel: string)

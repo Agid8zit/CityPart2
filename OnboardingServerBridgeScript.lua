@@ -392,6 +392,8 @@ end
 -- --------------------------------------------------------------------------------------
 -- Barrage 2 main
 -- --------------------------------------------------------------------------------------
+local BARRAGE2_STEP_COUNT = 3
+
 local function checkBarrage2(p: Player): boolean
 	local uid, now = p.UserId, os.clock()
 	local phase = b2Phase[uid] or "water"
@@ -466,19 +468,38 @@ local function checkBarrage2(p: Player): boolean
 	return false
 end
 
-local function startBarrage2(p: Player)
+local function startBarrage2(p: Player, resumeAt: number?, persistedPhase: string?)
 	local uid = _uid(p); if not uid then return end
 	if barrage2Started[uid] then return end
 	barrage2Started[uid] = true
-	b2Phase[uid] = "water"
-	print("[OB_B2] ▶ begin for", p.Name)
-	StateChanged:FireClient(p, "Onboarding_B2_Begin")
+	local stepCount = BARRAGE2_STEP_COUNT
+	local resumeIdx = tonumber(resumeAt)
+	if resumeIdx then
+		resumeIdx = math.clamp(math.floor(resumeIdx), 1, stepCount)
+	else
+		resumeIdx = nil
+	end
+	local phase = (persistedPhase == "power") and "power" or "water"
+	b2Phase[uid] = phase
+	print(("[OB_B2] ▶ begin for %s (resumeAt=%s phase=%s)"):format(p.Name, tostring(resumeIdx), phase))
+
+	local payload = nil
+	if resumeIdx and resumeIdx > 1 then
+		payload = { resumeAt = resumeIdx }
+	end
+	StateChanged:FireClient(p, "Onboarding_B2_Begin", payload)
 	StateChanged:FireClient(p, "Onboarding_B2_WaterPhaseBegin")
-	pcall(function()
-		if OnboardingService and OnboardingService.SetB2Phase then
-			OnboardingService.SetB2Phase(p, "water")
-		end
-	end)
+	if phase == "power" then
+		StateChanged:FireClient(p, "Onboarding_B2_WaterPhaseDone")
+		StateChanged:FireClient(p, "Onboarding_B2_PowerPhaseBegin")
+	end
+	if not persistedPhase then
+		pcall(function()
+			if OnboardingService and OnboardingService.SetB2Phase then
+				OnboardingService.SetB2Phase(p, "water")
+			end
+		end)
+	end
 	local statsBE = BE:FindFirstChild("StatsChanged") :: BindableEvent
 	if not statsBE then
 		statsBE = Instance.new("BindableEvent")
@@ -664,12 +685,36 @@ local function _reseedOnboardingFor(plr: Player)
 		end
 	end)
 
+	local b2ResumeAt: number? = nil
+	pcall(function()
+		if OnboardingService.GetGuardProgress then
+			local idx, total = OnboardingService.GetGuardProgress(plr, "barrage2")
+			if type(idx) == "number" and idx >= 1 then
+				local steps = BARRAGE2_STEP_COUNT
+				if type(total) == "number" and total > 0 then
+					steps = total
+				end
+				b2ResumeAt = math.clamp(math.floor(idx) + 1, 1, steps)
+			end
+		end
+	end)
+
+	local savedB2Phase: string? = nil
+	pcall(function()
+		if OnboardingService.GetB2Phase then
+			local phase = OnboardingService.GetB2Phase(plr)
+			if phase == "water" or phase == "power" then
+				savedB2Phase = phase
+			end
+		end
+	end)
+
 	if barrage1Completed[plr.UserId] then
 		print("[OB_B2] Reseed: B1 previously complete → starting B2")
 		hideArrow(plr)
 		roadPending[plr.UserId] = false
 		if not barrage2Started[plr.UserId] then
-			startBarrage2(plr)
+			startBarrage2(plr, b2ResumeAt, savedB2Phase)
 		end
 	elseif resumeAt then
 		print("[OB] Reseed: Resuming Barrage 1 at step", resumeAt)
@@ -692,6 +737,23 @@ local function _reseedOnboardingFor(plr: Player)
 		end
 	end
 end
+
+
+local function hookReloadFromCurrent(event: Instance?)
+	if not event or not event:IsA("BindableEvent") then
+		return false
+	end
+
+	event.Event:Connect(function(plr: Player)
+		-- Let SaveManager finish swapping live data before we inspect state again.
+		task.delay(0.25, function()
+			pcall(_reseedOnboardingFor, plr)
+		end)
+	end)
+
+	return true
+end
+
 -- --------------------------------------------------------------------------------------
 -- Lifecycle
 -- --------------------------------------------------------------------------------------
@@ -730,15 +792,32 @@ if BE_Toggle then
 	end)
 end
 
+local BE_ForceDisable = BE:FindFirstChild("ForceDisableOnboarding")
+if BE_ForceDisable then
+	BE_ForceDisable.Event:Connect(function(target)
+		if typeof(target) == "Instance" and target:IsA("Player") then
+			setOnboardingEnabled(target, false)
+		elseif typeof(target) == "table" then
+			for _, plr in ipairs(target) do
+				if typeof(plr) == "Instance" and plr:IsA("Player") then
+					setOnboardingEnabled(plr, false)
+				end
+			end
+		end
+	end)
+else
+	warn("[Onboarding] ForceDisableOnboarding bindable missing; delete flow will not clear onboarding immediately.")
+end
+
 -- >>> ADD: reseed when SaveEndpoints asks the server to reload the active slot
-if ReloadFromCurrentBE and ReloadFromCurrentBE:IsA("BindableEvent") then
-	ReloadFromCurrentBE.Event:Connect(function(plr: Player)
-		-- Let SaveManager finish swapping live data before we inspect
-		task.delay(0.25, function()
-			pcall(_reseedOnboardingFor, plr)
-		end)
+if not hookReloadFromCurrent(ReloadFromCurrentBE) then
+	BE.ChildAdded:Connect(function(child)
+		if child.Name == "RequestReloadFromCurrent" then
+			hookReloadFromCurrent(child)
+		end
 	end)
 end
+
 
 -- --------------------------------------------------------------------------------------
 -- Main bridge (client -> server)
@@ -870,7 +949,7 @@ StepCompleted.OnServerEvent:Connect(function(player: Player, stepName: any, data
 			end)
 			barrageStarted[uid], roadPending[uid], lastPulsed[uid] = nil, nil, nil
 			barrage1Completed[uid] = true
-			startBarrage2(player)
+			startBarrage2(player, nil, nil)
 			return
 		end
 		-- If we just finished the B3 "place Industrial rect" guard, begin connectivity checks

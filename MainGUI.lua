@@ -6,10 +6,12 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Dependencies
 local Abr = require(ReplicatedStorage.Scripts.UI.Abrv)
 local Events = ReplicatedStorage:WaitForChild("Events")
+local BindableEvents = Events:WaitForChild("BindableEvents")
 local Balancing = ReplicatedStorage:WaitForChild("Balancing")
 local UtilityGUI = require(ReplicatedStorage.Scripts.UI.UtilityGUI)
 local BalanceEconomy = require(Balancing:WaitForChild("BalanceEconomy"))
@@ -84,6 +86,18 @@ local activeFollowConn
 
 local deleteMode   = false
 local selectedPart = nil
+
+local function ensureDisableDeleteModeEvent(): BindableEvent
+	local evt = BindableEvents:FindFirstChild("DisableDeleteMode")
+	if not evt then
+		evt = Instance.new("BindableEvent")
+		evt.Name = "DisableDeleteMode"
+		evt.Parent = BindableEvents
+	end
+	return evt
+end
+
+local DisableDeleteModeEvent = ensureDisableDeleteModeEvent()
 
 -- Player plot & zone folders ---------------------------------------------------
 local playerPlot  = workspace.PlayerPlots:WaitForChild("Plot_"..LocalPlayer.UserId)
@@ -603,6 +617,10 @@ function MainGui.DisableDeleteMode()
 	end
 end
 
+DisableDeleteModeEvent.Event:Connect(function()
+	MainGui.DisableDeleteMode()
+end)
+
 -- Module Functions
 function MainGui.SetChartButton_GreenFillbar(Alpha: number)
 	TweenService:Create(UI_ChartsButton_GreenFillbar, TweenInfo.new(0.2), {
@@ -772,6 +790,7 @@ function MainGui.Init()
 	end)
 
 	-- UserInputs
+	local triggerDriveRequest -- set after drive controls are initialized
 	UserInputService.InputBegan:Connect(function(InputObject, GameProcessedEvent)
 		if not UI.Enabled then return end
 		if GameProcessedEvent then return end
@@ -793,9 +812,13 @@ function MainGui.Init()
 
 		elseif InputObject.KeyCode == Enum.KeyCode.V then
 			SoundController.PlaySoundOnce("UI", "SmallClick")
-			UI.right.removal.Delete.Visible = not UI.right.removal.Delete.Visible
-			UI.right.removal.Redo.Visible = not UI.right.removal.Redo.Visible
-			UI.right.removal.Undo.Visible = not UI.right.removal.Undo.Visible
+			local newVisible = not UI.right.removal.Delete.Visible
+			UI.right.removal.Delete.Visible = newVisible
+			UI.right.removal.Redo.Visible = newVisible
+			UI.right.removal.Undo.Visible = newVisible
+			if not newVisible then
+				MainGui.DisableDeleteMode()
+			end
 
 		elseif InputObject.KeyCode == Enum.KeyCode.T then
 			SoundController.PlaySoundOnce("UI", "SmallClick")
@@ -838,6 +861,11 @@ function MainGui.Init()
 		elseif InputObject.KeyCode == Enum.KeyCode.DPadRight then
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			ReplicatedStorage.Events.RemoteEvents.RedoCommand:FireServer()
+
+		elseif InputObject.KeyCode == Enum.KeyCode.G then
+			if triggerDriveRequest then
+				triggerDriveRequest()
+			end
 
 		elseif InputObject.KeyCode == Enum.KeyCode.DPadLeft then
 			SoundController.PlaySoundOnce("UI", "SmallClick")
@@ -948,9 +976,13 @@ function MainGui.Init()
 	
 	UI_DestroyButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
-		UI.right.removal.Delete.Visible = not UI.right.removal.Delete.Visible
-		UI.right.removal.Redo.Visible = not UI.right.removal.Redo.Visible
-		UI.right.removal.Undo.Visible = not UI.right.removal.Undo.Visible
+		local newVisible = not UI.right.removal.Delete.Visible
+		UI.right.removal.Delete.Visible = newVisible
+		UI.right.removal.Redo.Visible = newVisible
+		UI.right.removal.Undo.Visible = newVisible
+		if not newVisible then
+			MainGui.DisableDeleteMode()
+		end
 	end)
 
 	UI_DeleteButton.MouseButton1Down:Connect(function()
@@ -1086,6 +1118,7 @@ function MainGui.Init()
 		-- Fire remote; server will compute origin->farthest path and spawn
 		SpawnToDrive:FireServer()
 	end
+	triggerDriveRequest = triggerDrive
 	
 	local PlayUISoundRE = ReplicatedStorage.Events.RemoteEvents:FindFirstChild("PlayUISound")
 	if PlayUISoundRE then
@@ -1132,7 +1165,7 @@ function MainGui.Init()
 	CameraAttachEvt.OnClientEvent:Connect(function(carModel: Model?)
 		-- If server sends nil, that's a hard reset (toggle off / movement cancel)
 		if not carModel or not carModel:IsA("Model") or not carModel.PrimaryPart then
-			if activeFollowConn then activeFollowConn:Disconnect() end
+			if activeFollowConn then activeFollowConn() end
 			camera.CameraType = Enum.CameraType.Custom
 			local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
 			if hum then camera.CameraSubject = hum end
@@ -1153,12 +1186,12 @@ function MainGui.Init()
 
 		camera.CFrame = desiredCF()
 
-		if activeFollowConn then activeFollowConn:Disconnect() end
-		activeFollowConn = RunService.RenderStepped:Connect(function()
+		if activeFollowConn then activeFollowConn() end
+		activeFollowConn = RunServiceScheduler.onRenderStepped(function()
 			-- If the car goes away, stop following but DO NOT reset camera type here.
 			-- We wait for the next attach, or a server-sent nil.
 			if not carModel or not carModel.Parent or not carModel.PrimaryPart then
-				activeFollowConn:Disconnect()
+				activeFollowConn()
 				activeFollowConn = nil
 				return
 			end
@@ -1273,7 +1306,7 @@ function MainGui.Init()
 	workspace.PlayerPlots.ChildRemoved:Connect(function()
 		PlayerPlot = workspace.PlayerPlots:FindFirstChild("Plot_" .. LocalPlayer.UserId)
 	end)
-	RunService.Heartbeat:Connect(function()
+	RunServiceScheduler.onHeartbeat(function()
 		if not LocalPlayer.Character
 			or not LocalPlayer.Character.PrimaryPart
 			or not PlayerPlot

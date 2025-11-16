@@ -6,6 +6,8 @@ local Players         = game:GetService("Players")
 local RunService      = game:GetService("RunService")
 local TweenService    = game:GetService("TweenService")
 local ContentProvider = game:GetService("ContentProvider")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 local CityLoader = {}
 
@@ -80,7 +82,7 @@ local _state = {
 
 	-- anim/progress
 	percent = 0,
-	dotConn = nil :: RBXScriptConnection?,
+	dotConn = nil :: (() -> ())?,
 	popDebounce = 0.0,
 
 	-- messaging
@@ -127,8 +129,8 @@ local function imageTweenEffect(img: ImageLabel, startY: number, endSizeY: numbe
 
 	-- hop + scale
 	local started = os.clock()
-	local conn: RBXScriptConnection? = nil
-	conn = RunService.Heartbeat:Connect(function()
+	local conn: (() -> ())? = nil
+	conn = RunServiceScheduler.onHeartbeat(function()
 		local alpha = math.clamp((os.clock() - started) / IMAGELABEL_POS_TWEEN_DURATION, 0, 1)
 		local alphasine = math.sin(alpha * math.pi)
 		local alphaSubOne = alpha - 1
@@ -138,7 +140,7 @@ local function imageTweenEffect(img: ImageLabel, startY: number, endSizeY: numbe
 		local s = endSizeY * alphabounce
 
 		if alpha >= 1.0 then
-			if conn then conn:Disconnect() end
+			if conn then conn() end
 			img.Position = UDim2.fromScale(img.Position.X.Scale, startY)
 			img.Size = UDim2.fromScale(img.Size.X.Scale, endSizeY)
 		else
@@ -275,7 +277,7 @@ end
 local function unmountUI()
 	if not _state.mounted then return end
 
-	if _state.dotConn then _state.dotConn:Disconnect() end
+	if _state.dotConn then _state.dotConn() end
 	_state.dotConn = nil
 
 	if _state.UI then
@@ -364,7 +366,7 @@ function CityLoader.Show(opts: {delay: number?, message: string?}?): ()
 		-- "Loading..." dot‑dot‑dot
 		local dotTimer = 0.0
 		local dotCount = 3
-		_state.dotConn = RunService.Heartbeat:Connect(function()
+		_state.dotConn = RunServiceScheduler.onHeartbeat(function()
 			if os.clock() < dotTimer then return end
 			dotTimer = os.clock() + 0.2
 			dotCount += 1

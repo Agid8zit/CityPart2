@@ -28,6 +28,7 @@ local BusesFolder = CarsRoot:FindFirstChild("Buses") or CarsRoot:FindFirstChild(
 
 --=== Config ===========================================================
 local MAX_BUS_TIERS = 10                 -- schema supports up to 10
+local LEVELS_PER_TIER_UNLOCK = 3
 local SLOTS_TO_SHOW = 6                  -- placeholders named Tier1..Tier6
 local TIER_NAME_PATTERN = "^Tier(%d+)$"  -- fallback scanning
 local CLICK_NAME = "OpenBusDepotClick"
@@ -168,7 +169,7 @@ end
 -- Tier math (unlock/level)
 --=====================
 local function unlockedTiersFromUnlockValue(unlockNum: number): number
-	local t = math.floor(math.max(0, tonumber(unlockNum) or 0) / 10) + 1
+	local t = math.floor(math.max(0, tonumber(unlockNum) or 0) / LEVELS_PER_TIER_UNLOCK) + 1
 	return math.clamp(t, 1, MAX_BUS_TIERS)
 end
 

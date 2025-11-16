@@ -8,6 +8,8 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
 local TweenService = game:GetService("TweenService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
+local PlayerPlotsFolder = Workspace:WaitForChild("PlayerPlots")
 
 
 -- Dependencies
@@ -134,6 +136,16 @@ BF_GetHub.OnInvoke = function(majorName)
 	return nil
 end
 
+local function ensureDisableDeleteModeEvent(): BindableEvent
+	local evt = BE:FindFirstChild("DisableDeleteMode")
+	if not evt then
+		evt = Instance.new("BindableEvent")
+		evt.Name = "DisableDeleteMode"
+		evt.Parent = BE
+	end
+	return evt
+end
+
 -- === PULSE: token-safe UI pulse controller ===================================
 local _pulseTargets: {[string]: GuiObject?} = {}   -- key -> GuiObject
 
@@ -188,7 +200,7 @@ end
 -- [FIX] central arrow release so we can hide even if the GUI target is gone
 local function _releaseArrowIfOwner(key: string?)
 	if _obArrowOwnerKey and (_obArrowOwnerKey == key or key == nil) then
-		if _obArrowConn then _obArrowConn:Disconnect() end
+		if _obArrowConn then _obArrowConn() end
 		_obArrowConn = nil
 		_obArrowOwnerKey = nil
 		_obArrowToken += 1
@@ -217,7 +229,7 @@ local function _startPulseFor(gui: GuiObject?, key: string)
 
 	-- Position & show our local arrow over the pulsing button
 	if OBArrow and OBArrow:IsA("GuiObject") then
-		if _obArrowConn then _obArrowConn:Disconnect() end
+		if _obArrowConn then _obArrowConn() end
 		_obArrowToken += 1
 		_obArrowOwnerKey = key
 		OBArrow.Visible = true
@@ -227,7 +239,7 @@ local function _startPulseFor(gui: GuiObject?, key: string)
 		local myToken = _obArrowToken
 		local myKey = key
 
-		_obArrowConn = RunService.RenderStepped:Connect(function()
+		_obArrowConn = RunServiceScheduler.onRenderStepped(function()
 			-- Abort if ownership changed
 			if _obArrowToken ~= myToken then return end
 
@@ -785,7 +797,7 @@ local myPlot = nil
 local playerzones = nil
 local playerzonesVisible = false
 local pipesfolder = nil
-local pipesfoldervisible = true
+local pipesfoldervisible = false
 local waterpipeszones = nil
 local waterpipeszonesVisible = false
 local powerlineszones = nil
@@ -796,8 +808,94 @@ local buildingsNoQueryActive = false
 local metroTunnelsFolder = nil
 local metroTunnelsVisible = false
 
+local InfraVisibilityControllers: {[Instance]: {visible: boolean, conn: RBXScriptConnection?}} = {}
+local ForeignPlotChildConns: {[Instance]: RBXScriptConnection?} = {}
+local ForeignRangeVisualConns: {[Instance]: RBXScriptConnection?} = {}
+
+local function applyLocalTransparency(inst: Instance, visible: boolean)
+	if inst:IsA("BasePart") then
+		inst.LocalTransparencyModifier = visible and 0 or 1
+	end
+end
+
+local function ensureInfraController(folder: Instance)
+	local controller = InfraVisibilityControllers[folder]
+	if controller then
+		return controller
+	end
+
+	controller = {
+		visible = true,
+		conn = nil,
+	}
+
+	controller.conn = folder.DescendantAdded:Connect(function(inst)
+		applyLocalTransparency(inst, controller.visible)
+	end)
+
+	folder.Destroying:Connect(function()
+		local stored = InfraVisibilityControllers[folder]
+		if not stored then return end
+		if stored.conn then
+			stored.conn:Disconnect()
+		end
+		InfraVisibilityControllers[folder] = nil
+	end)
+
+	InfraVisibilityControllers[folder] = controller
+	return controller
+end
+
+local function setInfraFolderVisible(folder: Instance?, visible: boolean)
+	if not folder then return end
+	local controller = ensureInfraController(folder)
+	controller.visible = visible and true or false
+	for _, desc in ipairs(folder:GetDescendants()) do
+		applyLocalTransparency(desc, controller.visible)
+	end
+end
+
+local function hideForeignInfrastructure(plot: Instance)
+	if not plot or not plot:IsA("Model") then return end
+	local ownerId = tonumber((plot.Name or ""):match("^Plot_(%d+)$"))
+	if ownerId == nil or ownerId == LocalPlayer.UserId then
+		return
+	end
+	if ForeignPlotChildConns[plot] then
+		return
+	end
+
+	local function hideChild(child: Instance)
+		if not child then return end
+		local name = child.Name
+		if name == "Pipes" or name == "MetroTunnels" then
+			setInfraFolderVisible(child, false)
+		end
+	end
+
+	for _, child in ipairs(plot:GetChildren()) do
+		hideChild(child)
+	end
+
+	ForeignPlotChildConns[plot] = plot.ChildAdded:Connect(hideChild)
+	plot.Destroying:Connect(function()
+		local conn = ForeignPlotChildConns[plot]
+		if conn then
+			conn:Disconnect()
+		end
+		ForeignPlotChildConns[plot] = nil
+	end)
+end
+
+for _, plot in ipairs(PlayerPlotsFolder:GetChildren()) do
+	hideForeignInfrastructure(plot)
+end
+
+PlayerPlotsFolder.ChildAdded:Connect(function(child)
+	hideForeignInfrastructure(child)
+end)
+
 local ActiveRVCategory = nil
-local ClientRangeFolder = nil
 local ActiveRVs = {}            -- [Model] = RangeVisual BasePart
 local ActiveRVConns = {}        -- RBXScriptConnection[]
 
@@ -812,6 +910,46 @@ local function isRangeVisualPart(inst: Instance): boolean
 	local outter = inst:FindFirstChild("Outter") or inst:FindFirstChild("Outer")
 	return (inner and inner:IsA("SurfaceGui")) or (outter and outter:IsA("SurfaceGui"))
 end
+
+local function hideRangeVisualPartLocally(inst: Instance)
+	if isRangeVisualPart(inst) then
+		inst.LocalTransparencyModifier = 1
+	end
+end
+
+local function hideForeignRangeVisuals(plot: Instance)
+	if not plot or not plot:IsA("Model") then return end
+	local ownerId = tonumber((plot.Name or ""):match("^Plot_(%d+)$"))
+	if ownerId == nil or ownerId == LocalPlayer.UserId then
+		return
+	end
+	if ForeignRangeVisualConns[plot] then
+		return
+	end
+
+	for _, desc in ipairs(plot:GetDescendants()) do
+		hideRangeVisualPartLocally(desc)
+	end
+
+	ForeignRangeVisualConns[plot] = plot.DescendantAdded:Connect(function(inst)
+		hideRangeVisualPartLocally(inst)
+	end)
+
+	plot.Destroying:Connect(function()
+		local conn = ForeignRangeVisualConns[plot]
+		if conn then
+			conn:Disconnect()
+		end
+		ForeignRangeVisualConns[plot] = nil
+	end)
+end
+
+task.spawn(function()
+	for _, plot in ipairs(PlayerPlotsFolder:GetChildren()) do
+		hideForeignRangeVisuals(plot)
+	end
+	PlayerPlotsFolder.ChildAdded:Connect(hideForeignRangeVisuals)
+end)
 
 local function SetBuildingsTransparent(state: boolean)
 	if not buildings then return end
@@ -893,24 +1031,99 @@ local function SetBuildingsNoQuery(state: boolean)
 	end
 end
 
+local function zoneAlpha(visible: boolean): number
+	return visible and 0.75 or 1.0
+end
+
+local function applyZoneFolderVisibility(folder: Folder?, shouldShow: boolean)
+	if not folder then return end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("BasePart") and not isRangeVisualPart(child) then
+			child.Transparency = zoneAlpha(shouldShow)
+		end
+	end
+end
+
+local function playerZonesShouldRender(): boolean
+	return playerzonesVisible and (UI and UI.Enabled)
+end
+
+local function waterZonesShouldRender(): boolean
+	return waterpipeszonesVisible and (UI and UI.Enabled)
+end
+
+local function powerZonesShouldRender(): boolean
+	return powerlineszonesVisible and (UI and UI.Enabled)
+end
+
+local function applyPlayerZoneVisibility()
+	applyZoneFolderVisibility(playerzones, playerZonesShouldRender())
+end
+
+local function applyWaterZoneVisibility()
+	applyZoneFolderVisibility(waterpipeszones, waterZonesShouldRender())
+end
+
+local function applyPowerZoneVisibility()
+	applyZoneFolderVisibility(powerlineszones, powerZonesShouldRender())
+end
+
+local function applyAllZoneVisibilities()
+	applyPlayerZoneVisibility()
+	applyWaterZoneVisibility()
+	applyPowerZoneVisibility()
+end
+
+if UI and UI.GetPropertyChangedSignal then
+	UI:GetPropertyChangedSignal("Enabled"):Connect(applyAllZoneVisibilities)
+end
+
+local function ShowPipesModels(State: boolean)
+	pipesfoldervisible = State == true
+	if not pipesfolder then return end
+	if pipesfoldervisible and myPlot then
+		pipesfolder.Parent = myPlot
+	else
+		pipesfolder.Parent = nil
+	end
+end
+ShowPipesModels(false)
+
+local function ShowMetroModels(State: boolean)
+	metroTunnelsVisible = State == true
+	if not metroTunnelsFolder then return end
+	if metroTunnelsVisible and myPlot then
+		metroTunnelsFolder.Parent = myPlot
+	else
+		metroTunnelsFolder.Parent = nil
+	end
+end
+ShowMetroModels(false)
+
 task.spawn(function()
 	local player = Players.LocalPlayer
-	local plots = Workspace:WaitForChild("PlayerPlots")
+	local plots = PlayerPlotsFolder
 	myPlot = plots:WaitForChild("Plot_" .. player.UserId)
 	playerzones = myPlot:WaitForChild("PlayerZones")
 	waterpipeszones = myPlot:WaitForChild("WaterPipeZones")
 	powerlineszones = myPlot:WaitForChild("PowerLinesZones")
 	buildings = myPlot:WaitForChild("Buildings")
 	pipesfolder = myPlot:WaitForChild("Pipes")
+	ShowPipesModels(pipesfoldervisible)
 	metroTunnelsFolder = myPlot:WaitForChild("MetroTunnels", 3) or metroTunnelsFolder
-
-	if not metroTunnelsFolder then
-		myPlot.ChildAdded:Connect(function(child)
-			if child.Name == "MetroTunnels" and child:IsA("Folder") then
-				metroTunnelsFolder = child
-			end
-		end)
+	if metroTunnelsFolder then
+		ShowMetroModels(metroTunnelsVisible)
 	end
+
+	myPlot.ChildAdded:Connect(function(child)
+		if child.Name == "Pipes" and child:IsA("Folder") then
+			pipesfolder = child
+			ShowPipesModels(pipesfoldervisible)
+		elseif child.Name == "MetroTunnels" and child:IsA("Folder") then
+			metroTunnelsFolder = child
+			ShowMetroModels(metroTunnelsVisible)
+		end
+	end)
 
 	local function looksLikeRV(part: Instance): boolean
 		if not (part and part:IsA("BasePart")) then return false end
@@ -1003,18 +1216,20 @@ task.spawn(function()
 	playerzones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
-		Part.Transparency = playerzonesVisible and 0.75 or 1.0
+		Part.Transparency = zoneAlpha(playerZonesShouldRender())
 	end)
 	waterpipeszones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
-		Part.Transparency = waterpipeszonesVisible and 0.75 or 1.0
+		Part.Transparency = zoneAlpha(waterZonesShouldRender())
 	end)
 	powerlineszones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
-		Part.Transparency = powerlineszonesVisible and 0.75 or 1.0
+		Part.Transparency = zoneAlpha(powerZonesShouldRender())
 	end)
+
+	applyAllZoneVisibilities()
 end)
 
 local function findScreenGui(container, name)
@@ -1082,8 +1297,6 @@ local function ToggleAirportGUI(forceState)
 end
 
 -- ==== Bus Depot GUI helpers ====
-local PlayerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-local BUS_DEPOT_GUI_NAME = "BusDepot"
 
 local function OpenBusDepotGUI()
 	local gui = PlayerGui:FindFirstChild(BUS_DEPOT_GUI_NAME)
@@ -1132,57 +1345,19 @@ RE_ToggleAirportGui.OnClientEvent:Connect(function(forceState)
 end)
 
 local function SetPlayerZonesVisible(State: boolean)
-	if playerzones == nil then return end
-	if playerzonesVisible == State then return end
-	playerzonesVisible = State
-	for _, Child in playerzones:GetChildren() do
-		if not Child:IsA("BasePart") then continue end
-		if isRangeVisualPart(Child) then continue end
-		Child.Transparency = playerzonesVisible and 0.75 or 1.0
-	end
+	playerzonesVisible = State == true
+	applyPlayerZoneVisibility()
 end
 
 local function SetWaterPipesZonesVisible(State: boolean)
-	if waterpipeszones == nil then return end
-	if waterpipeszonesVisible == State then return end
-	waterpipeszonesVisible = State
-	for _, Child in waterpipeszones:GetChildren() do
-		if not Child:IsA("BasePart") then continue end
-		if isRangeVisualPart(Child) then continue end
-		Child.Transparency = waterpipeszonesVisible and 0.75 or 1.0
-	end
+	waterpipeszonesVisible = State == true
+	applyWaterZoneVisibility()
 end
 
 local function SetPowerLinesZonesVisible(State: boolean)
-	if powerlineszones == nil then return end
-	if powerlineszonesVisible == State then return end
-	powerlineszonesVisible = State
-	for _, Child in powerlineszones:GetChildren() do
-		if not Child:IsA("BasePart") then continue end
-		if isRangeVisualPart(Child) then continue end
-		Child.Transparency = powerlineszonesVisible and 0.75 or 1.0
-	end
+	powerlineszonesVisible = State == true
+	applyPowerZoneVisibility()
 end
-
-local function ShowPipesModels(State: boolean)
-	if not pipesfolder then return end
-	if State then
-		pipesfolder.Parent = myPlot
-	else
-		pipesfolder.Parent = nil
-	end
-end
-ShowPipesModels(false)
-
-local function ShowMetroModels(State: boolean)
-	if not metroTunnelsFolder then return end
-	if State then
-		metroTunnelsFolder.Parent = myPlot
-	else
-		metroTunnelsFolder.Parent = nil
-	end
-end
-ShowMetroModels(false)
 
 local function ShowBuildingModels(State: boolean)
 	if not buildings then return end
@@ -1386,7 +1561,7 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 
 	local ChoiceTemplate = UISection.Template
 	ChoiceTemplate.Visible = false
-	
+
 	local PrintedLangKeys = {}
 
 	for _, Data in Choices do
@@ -1511,11 +1686,11 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 		if Data.itemID then
 			FrameButtons[Data.itemID] = Choice
 			ItemToSection[Data.itemID] = SectionName
-			
+
 			if type(Data.itemID) == "string" and Data.itemID ~= "" then
 				_regTarget("BM_" .. Data.itemID, Choice)
 			end
-			
+
 			if PendingByItem[Data.itemID] then
 				dot.Visible = true
 				SectionHasPending[SectionName] = true
@@ -1676,10 +1851,12 @@ function BuildMenu.SetTab(TabName: string)
 	_updatePulses()
 end
 
-local BE_DisableBuildMode = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents"):WaitForChild("DisableBuildMode")
-
 function BuildMenu.OnShow()
 	if UI.Enabled then return end
+	local disableDeleteModeEvent = ensureDisableDeleteModeEvent()
+	if disableDeleteModeEvent then
+		disableDeleteModeEvent:Fire()
+	end
 	UI.Enabled = true
 	SetPlayerZonesVisible(true)
 	_activeCategory = nil
@@ -1692,7 +1869,10 @@ function BuildMenu.OnHide()
 	if not UI.Enabled then return end
 	UI.Enabled = false
 	_stopAllPulses()
-	BE_DisableBuildMode:Fire()
+	local disableBuildModeEvent = BE:FindFirstChild("DisableBuildMode")
+	if disableBuildModeEvent then
+		disableBuildModeEvent:Fire()
+	end
 	SetPlayerZonesVisible(false)
 	SetPowerLinesZonesVisible(false)
 	SetWaterPipesZonesVisible(false)
@@ -1814,9 +1994,7 @@ end
 RE_BusSupportStatus.OnClientEvent:Connect(function(isUnlocked: boolean)
 	HasBusDepot = isUnlocked
 	UpdateBusDepotButton()
-	if isUnlocked then
-		OpenBusDepotGUI()
-	else
+	if not isUnlocked then
 		CloseBusDepotGUI()
 	end
 end)
@@ -1883,7 +2061,7 @@ function BuildMenu.Init()
 		end
 	end)
 
-	RunService.Heartbeat:Connect(function(Step)
+	RunServiceScheduler.onHeartbeat(function(Step)
 		if not UI.Enabled then return end
 
 		local UISection = TabSections[CurrentTabName]
@@ -1972,10 +2150,10 @@ function BuildMenu.Init()
 			end,
 		},
 	})
-	
+
 	_refreshPulseTargets()
 	_updatePulses()
-	
+
 	-- Zones
 	CreateTabSection("Zones", {
 		{
@@ -2667,7 +2845,7 @@ function BuildMenu.Init()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.Toggle()
 	end)
-	
+
 	if UI.main and UI.main.tabs and UI.main.tabs.transport and UI.main.tabs.transport.Background then
 		UI.main.tabs.transport.Background.AncestryChanged:Connect(function()
 			task.defer(function()

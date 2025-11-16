@@ -9,6 +9,8 @@ local GridUtil      = require(Grid:WaitForChild("GridUtil"))  -- used for grid�
 
 local Events        = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents= Events:WaitForChild("BindableEvents")
+local RemoteEvents  = Events:WaitForChild("RemoteEvents")
+local PlayUISoundRE = RemoteEvents:FindFirstChild("PlayUISound")
 
 local S3            = game:GetService("ServerScriptService")
 local Build         = S3:WaitForChild("Build")
@@ -32,6 +34,28 @@ local GRID_SIZE: number = GridConfig.GRID_SIZE
 local _applyLock: { [Player]: { [string]: boolean } } = {}
 -- player -> zoneId -> "x|z" -> wealth ("Poor"|"Medium"|"Wealthy")
 local _pendingWealth: { [Player]: { [string]: { [string]: string } } } = {}
+-- player -> zoneId = awaiting first ZonePopulated
+local _pendingPopulate: { [Player]: { [string]: boolean } } = {}
+
+local function _markZonePending(player: Player, zoneId: string)
+	if not (player and typeof(zoneId) == "string") then return end
+	_pendingPopulate[player] = _pendingPopulate[player] or {}
+	_pendingPopulate[player][zoneId] = true
+end
+
+local function _clearZonePending(player: Player, zoneId: string)
+	local map = _pendingPopulate[player]
+	if not map then return end
+	map[zoneId] = nil
+	if not next(map) then
+		_pendingPopulate[player] = nil
+	end
+end
+
+local function _isZonePending(player: Player, zoneId: string): boolean
+	local map = _pendingPopulate[player]
+	return (map and map[zoneId]) or false
+end
 
 -- ==== Tunables / Guardrails ====
 local ADJACENCY_RADIUS = 5 -- interpreted as *diameter in cells*; the circular radius is floor(ADJACENCY_RADIUS/2)
@@ -148,7 +172,6 @@ local synergyMapping: { [string]: { [string]: number } } = {
 }
 
 
-
 -- ===== Debug flags & printers =====
 local DEBUG_UXP = false
 local DEBUG_SYNERGY = false
@@ -169,7 +192,9 @@ local _pollTickCursor: { [Player]: { [string]: number } } = {}
 local _refillLock: { [Player]: { [string]: boolean } } = {}
 -- pending format: _refillPending[player][zoneId][wealth]["x|z"] = true
 local _refillPending: { [Player]: { [string]: { [string]: { [string]: boolean } } } } = {}
+local _refillEpoch: { [Player]: { [string]: number } } = {}
 local _WEALTH_ORDER = { "Poor", "Medium", "Wealthy" }
+local RefillQueue = {}
 
 local function _isInLoad(player: Player): boolean
 	return _loadPhase[player] == true
@@ -218,6 +243,47 @@ local function getSynergyWidth(mode: string): number
 	if type(w) ~= "number" or w < 1 then w = ADJACENCY_RADIUS end
 	return math.max(1, math.floor(w))
 end
+
+local function _maxInfluenceRadius()
+	local maxR = ADJACENCY_RADIUS
+	for mode, _ in pairs(UXP_VALUES :: any) do
+		local r = getInfluenceWidth(mode)
+		if r > maxR then maxR = r end
+	end
+	return maxR
+end
+
+local function _buildSynergyRadiusMap()
+	local out = {}
+	for targetMode, row in pairs(synergyMapping) do
+		local maxR = ADJACENCY_RADIUS
+		for neighborMode, _ in pairs(row) do
+			local r = getSynergyWidth(neighborMode)
+			if r > maxR then maxR = r end
+		end
+		out[targetMode] = maxR
+	end
+	return out
+end
+
+local function _maxPositiveRadius()
+	local cfg = Interactions and Interactions.IncomeBonus
+	if not cfg then return ADJACENCY_RADIUS end
+	local maxR = ADJACENCY_RADIUS
+	for _, row in pairs(cfg) do
+		if type(row) == "table" then
+			for neighborMode, _ in pairs(row) do
+				local r = getSynergyWidth(neighborMode)
+				if r > maxR then maxR = r end
+			end
+		end
+	end
+	return maxR
+end
+
+local MAX_UXP_QUERY_RADIUS = _maxInfluenceRadius()
+local MAX_POSITIVE_QUERY_RADIUS = _maxPositiveRadius()
+local MAX_SYNERGY_RADIUS_BY_TARGET = _buildSynergyRadiusMap()
 
 local function _pollutionAllowed(targetMode: string, sourceMode: string): boolean
 	local pol = (Interactions and Interactions.Pollution and Interactions.Pollution.AllowedSources)
@@ -359,7 +425,7 @@ local function _clusterSeedCells(cells: { {x: number, z: number} }, cfg): { { {x
 	return clusters
 end
 
-local function _pendingAddCells(player: Player, zoneId: string, wealth: string, cells: { { x: number, z: number } }?)
+function RefillQueue.addCells(player: Player, zoneId: string, wealth: string, cells: { { x: number, z: number } }?)
 	if not cells or #cells == 0 then return end
 	_refillPending[player] = _refillPending[player] or {}
 	_refillPending[player][zoneId] = _refillPending[player][zoneId] or {}
@@ -372,7 +438,7 @@ local function _pendingAddCells(player: Player, zoneId: string, wealth: string, 
 	end
 end
 
-local function _pendingHasAny(player: Player, zoneId: string): boolean
+function RefillQueue.hasAny(player: Player, zoneId: string): boolean
 	local z = _refillPending[player] and _refillPending[player][zoneId]
 	if not z then return false end
 	for _, set in pairs(z) do
@@ -381,7 +447,7 @@ local function _pendingHasAny(player: Player, zoneId: string): boolean
 	return false
 end
 
-local function _pendingPopOne(player: Player, zoneId: string): (string?, { { x: number, z: number } }?)
+function RefillQueue.popOne(player: Player, zoneId: string): (string?, { { x: number, z: number } }?)
 	local z = _refillPending[player] and _refillPending[player][zoneId]
 	if not z then return nil, nil end
 	for _, wealth in ipairs(_WEALTH_ORDER) do
@@ -401,15 +467,53 @@ local function _pendingPopOne(player: Player, zoneId: string): (string?, { { x: 
 	return nil, nil
 end
 
-local function _unlockRefill(player: Player, zoneId: string)
+function RefillQueue.unlock(player: Player, zoneId: string)
 	if _refillLock[player] then
 		_refillLock[player][zoneId] = nil
 		if not next(_refillLock[player]) then _refillLock[player] = nil end
 	end
 	-- tidy pending table if empty
-	if _refillPending[player] and _refillPending[player][zoneId] and not _pendingHasAny(player, zoneId) then
+	if _refillPending[player] and _refillPending[player][zoneId] and not RefillQueue.hasAny(player, zoneId) then
 		_refillPending[player][zoneId] = nil
 		if not next(_refillPending[player]) then _refillPending[player] = nil end
+	end
+end
+
+function RefillQueue.getEpoch(player: Player, zoneId: string): number
+	local per = _refillEpoch[player]
+	if per then
+		return per[zoneId] or 0
+	end
+	return 0
+end
+
+function RefillQueue.bumpEpoch(player: Player, zoneId: string): number
+	if not (player and zoneId) then return 0 end
+	_refillEpoch[player] = _refillEpoch[player] or {}
+	local nextVal = (_refillEpoch[player][zoneId] or 0) + 1
+	_refillEpoch[player][zoneId] = nextVal
+	return nextVal
+end
+
+function RefillQueue.clearPending(player: Player, zoneId: string)
+	local per = _refillPending[player]
+	if per then
+		per[zoneId] = nil
+		if not next(per) then
+			_refillPending[player] = nil
+		end
+	end
+end
+
+function RefillQueue.cancel(player: Player, zoneId: string)
+	if not (player and zoneId) then return end
+	RefillQueue.bumpEpoch(player, zoneId)
+	RefillQueue.clearPending(player, zoneId)
+	if _refillLock[player] then
+		_refillLock[player][zoneId] = nil
+		if not next(_refillLock[player]) then
+			_refillLock[player] = nil
+		end
 	end
 end
 
@@ -427,10 +531,326 @@ local function _getZoneDataFromCache(player: Player, zoneId: string): ZoneData?
 	return nil
 end
 
+-- ===== Spatial index for fast neighborhood queries =====
+local SPATIAL_CELL_SIZE = 8
+
+type SpatialEntry = {
+	zone: ZoneData,
+	cells: { { x: number, z: number } },
+}
+
+local SpatialIndex = {}
+SpatialIndex.__index = SpatialIndex
+
+function SpatialIndex.new(cellSize)
+	return setmetatable({
+		cellSize = cellSize or SPATIAL_CELL_SIZE,
+		cells = {} :: { [number]: { [number]: { ZoneData } } },
+		byId = {} :: { [string]: SpatialEntry },
+	}, SpatialIndex)
+end
+
+function SpatialIndex:_cell(x: number, z: number): (number, number)
+	return math.floor(x / self.cellSize), math.floor(z / self.cellSize)
+end
+
+function SpatialIndex:_touchCell(cx: number, cz: number)
+	self.cells[cx] = self.cells[cx] or {}
+	self.cells[cx][cz] = self.cells[cx][cz] or {}
+	return self.cells[cx][cz]
+end
+
+function SpatialIndex:add(zone: ZoneData)
+	if not zone or not zone.boundingBox then return end
+	if self.byId[zone.zoneId] then
+		self:remove(zone.zoneId)
+	end
+
+	local bb = zone.boundingBox
+	local minCellX = math.floor(bb.minX / self.cellSize)
+	local maxCellX = math.floor(bb.maxX / self.cellSize)
+	local minCellZ = math.floor(bb.minZ / self.cellSize)
+	local maxCellZ = math.floor(bb.maxZ / self.cellSize)
+
+	local stamped = {}
+	for cx = minCellX, maxCellX do
+		for cz = minCellZ, maxCellZ do
+			local bucket = self:_touchCell(cx, cz)
+			table.insert(bucket, zone)
+			table.insert(stamped, { x = cx, z = cz })
+		end
+	end
+
+	self.byId[zone.zoneId] = { zone = zone, cells = stamped }
+end
+
+function SpatialIndex:remove(zoneId: string)
+	local entry = self.byId[zoneId]
+	if not entry then return end
+	for _, cell in ipairs(entry.cells or {}) do
+		local col = self.cells[cell.x]
+		if col and col[cell.z] then
+			for i = #col[cell.z], 1, -1 do
+				if col[cell.z][i].zoneId == zoneId then
+					table.remove(col[cell.z], i)
+				end
+			end
+			if #col[cell.z] == 0 then
+				col[cell.z] = nil
+			end
+		end
+		if col and next(col) == nil then
+			self.cells[cell.x] = nil
+		end
+	end
+	self.byId[zoneId] = nil
+end
+
+function SpatialIndex:update(zone: ZoneData)
+	if not zone then return end
+	self:remove(zone.zoneId)
+	self:add(zone)
+end
+
+local function _collectFromCells(cells: { [number]: { [number]: { ZoneData } } }, minCellX, maxCellX, minCellZ, maxCellZ)
+	local out = {}
+	local seen = {}
+	for cx = minCellX, maxCellX do
+		local col = cells[cx]
+		if col then
+			for cz = minCellZ, maxCellZ do
+				local bucket = col[cz]
+				if bucket then
+					for _, zone in ipairs(bucket) do
+						if not seen[zone.zoneId] then
+							seen[zone.zoneId] = true
+							table.insert(out, zone)
+						end
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+function SpatialIndex:queryAabb(bb: BoundingBox, expand: number?): { ZoneData }
+	if not bb then return {} end
+	local e = expand or 0
+	local minCellX = math.floor((bb.minX - e) / self.cellSize)
+	local maxCellX = math.floor((bb.maxX + e) / self.cellSize)
+	local minCellZ = math.floor((bb.minZ - e) / self.cellSize)
+	local maxCellZ = math.floor((bb.maxZ + e) / self.cellSize)
+	return _collectFromCells(self.cells, minCellX, maxCellX, minCellZ, maxCellZ)
+end
+
+function SpatialIndex:queryRadius(x: number, z: number, radius: number): { ZoneData }
+	radius = math.max(0, radius or 0)
+	local minCellX = math.floor((x - radius) / self.cellSize)
+	local maxCellX = math.floor((x + radius) / self.cellSize)
+	local minCellZ = math.floor((z - radius) / self.cellSize)
+	local maxCellZ = math.floor((z + radius) / self.cellSize)
+	return _collectFromCells(self.cells, minCellX, maxCellX, minCellZ, maxCellZ)
+end
+
+function SpatialIndex:clear()
+	self.cells = {}
+	self.byId = {}
+end
+
+local zoneSpatialIndexByPlayer: { [Player]: SpatialIndex } = {}
+
+local function _getSpatialIndex(player: Player, create: boolean?): SpatialIndex?
+	if not player then return nil end
+	local idx = zoneSpatialIndexByPlayer[player]
+	if not idx and create then
+		idx = SpatialIndex.new(SPATIAL_CELL_SIZE)
+		zoneSpatialIndexByPlayer[player] = idx
+		local cache = zoneCacheByPlayer[player]
+		if cache then
+			for _, zone in ipairs(cache) do
+				idx:add(zone)
+			end
+		end
+	end
+	return idx
+end
+
+-- ===== Positive income cache =====
+local _positiveBonusTiles: { [Player]: { [string]: { [string]: number } } } = {}
+local IncomeBonusCfg = Interactions and Interactions.IncomeBonus
+local POSITIVE_MAX_BONUS = (IncomeBonusCfg and tonumber(IncomeBonusCfg.MaxBonus)) or 0.30
+
+local function _setTilePositiveBonus(player: Player, zoneId: string, key: string, bonus: number)
+	_positiveBonusTiles[player] = _positiveBonusTiles[player] or {}
+	_positiveBonusTiles[player][zoneId] = _positiveBonusTiles[player][zoneId] or {}
+	_positiveBonusTiles[player][zoneId][key] = bonus
+end
+
+local function _clearZonePositiveBonus(player: Player, zoneId: string)
+	if _positiveBonusTiles[player] then
+		_positiveBonusTiles[player][zoneId] = nil
+		if not next(_positiveBonusTiles[player]) then
+			_positiveBonusTiles[player] = nil
+		end
+	end
+end
+
+local function _getTilePositiveBonus(player: Player, zoneId: string, key: string): number?
+	return _positiveBonusTiles[player]
+		and _positiveBonusTiles[player][zoneId]
+		and _positiveBonusTiles[player][zoneId][key]
+		or nil
+end
+
+local function _tileHasNeighborOfModeInRange(tile: GridTile, neighbor: ZoneData, width: number): boolean
+	-- Quick AABB gate
+	local bb = neighbor.boundingBox
+	if tile.x < bb.minX - width or tile.x > bb.maxX + width
+		or tile.z < bb.minZ - width or tile.z > bb.maxZ + width then
+		return false
+	end
+	-- Per-tile proximity check
+	for _, tB in ipairs(neighbor.gridList) do
+		if isNearby(tile, tB, width) then return true end
+	end
+	return false
+end
+
+local function _computeTilePositiveBonus(player: Player, zoneData: ZoneData, tile: GridTile): number
+	if not IncomeBonusCfg then return 0 end
+	local perTarget = IncomeBonusCfg[zoneData.mode]
+	if type(perTarget) ~= "table" then return 0 end
+
+	local total = 0
+	for neighborMode, bonus in pairs(perTarget) do
+		if type(bonus) == "number" and bonus > 0 then
+			local width = getSynergyWidth(neighborMode)
+			local candidates
+			local idx = _getSpatialIndex(player, false)
+			if idx then
+				candidates = idx:queryRadius(tile.x, tile.z, width)
+			else
+				candidates = zoneCacheByPlayer[player] or {}
+			end
+
+			for _, neighbor in ipairs(candidates) do
+				if neighbor.zoneId ~= zoneData.zoneId
+					and neighbor.mode == neighborMode
+					and _tileHasNeighborOfModeInRange(tile, neighbor, width)
+				then
+					total += bonus
+					break
+				end
+			end
+		end
+	end
+
+	if total > POSITIVE_MAX_BONUS then
+		total = POSITIVE_MAX_BONUS
+	elseif total < 0 then
+		total = 0
+	end
+	return total
+end
+
+-- Persist last per-tile UXP so we can detect up/down deltas
+local _lastTileUXP: { [Player]: { [string]: { [string]: number } } } = {}
+local function _tkey(x: number, z: number): string
+	return tostring(x).."|"..tostring(z)
+end
+
+--For Pollution/synnergy not UXP
+local function _tkey2(x: number, z: number): string
+	return tostring(x).."|"..tostring(z)
+end
+
+
+
+local function _refreshPositiveIncomeForZone(player: Player, zoneData: ZoneData)
+	if not player or not zoneData then return end
+	if not IncomeBonusCfg or not IncomeBonusCfg[zoneData.mode] then
+		_clearZonePositiveBonus(player, zoneData.zoneId)
+		return
+	end
+
+	local idx = _getSpatialIndex(player, false)
+	if not idx then
+		_clearZonePositiveBonus(player, zoneData.zoneId)
+		return
+	end
+
+	if not zoneData.gridList then
+		_clearZonePositiveBonus(player, zoneData.zoneId)
+		return
+	end
+
+	for _, tile in ipairs(zoneData.gridList) do
+		local key = _tkey(tile.x, tile.z)
+		local bonus = _computeTilePositiveBonus(player, zoneData, tile)
+		_setTilePositiveBonus(player, zoneData.zoneId, key, bonus)
+	end
+end
+
+local function _recalcPositiveBonusesAround(player: Player, pivot: ZoneData?, boundsOverride: BoundingBox?)
+	if not player then return end
+	local idx = _getSpatialIndex(player, false)
+	if not idx then return end
+
+	local visited = {}
+	local function touch(zone: ZoneData?)
+		if not zone or visited[zone.zoneId] then return end
+		visited[zone.zoneId] = true
+		_refreshPositiveIncomeForZone(player, zone)
+	end
+
+	if pivot then
+		touch(pivot)
+	end
+
+	local bb = boundsOverride or (pivot and pivot.boundingBox)
+	if not bb then return end
+
+	local influence = pivot and getSynergyWidth(pivot.mode) or MAX_POSITIVE_QUERY_RADIUS
+	local neighbors = idx:queryAabb(bb, influence)
+	for _, zone in ipairs(neighbors) do
+		touch(zone)
+	end
+end
+
+
 
 -- =========================================================================================
 -- UXP FLASH ALARM SYSTEM  (AlarmUpgrade / AlarmDowngrade / AlarmPolution [reserved])
 -- =========================================================================================
+
+local UXP_SOUND_COOLDOWN = 0.9 -- seconds between Upgrade/Downgrade SFX buckets per player
+local _uxpSoundLastAt: {[Player]: {[string]: number}} = {}
+
+local function playUxpSound(player: Player?, kind: "Upgrade" | "Downgrade")
+	if not player or not PlayUISoundRE then
+		return
+	end
+
+	local now = os.clock()
+	local perPlayer = _uxpSoundLastAt[player]
+	if not perPlayer then
+		perPlayer = {}
+		_uxpSoundLastAt[player] = perPlayer
+	end
+
+	local last = perPlayer[kind] or 0
+	if now - last < UXP_SOUND_COOLDOWN then
+		return
+	end
+
+	perPlayer[kind] = now
+	PlayUISoundRE:FireClient(player, "Misc", kind)
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+	_uxpSoundLastAt[plr] = nil
+end)
 
 -- FX behavior:
 --    fade-in → pulse (scale up/down smoothly) for N cycles → fade-out → return to pool
@@ -545,6 +965,34 @@ local function _getZoneModelFor(player: Player, zoneId: string): (Model?, Instan
 	return zoneModel, playerPlot
 end
 
+local function _zoneTrackerIsPopulated(player: Player, zoneId: string): boolean?
+	if not ZoneTracker then return nil end
+	local trackerAny = ZoneTracker :: any
+
+	if type(trackerAny.isZonePopulated) == "function" then
+		local ok, res = pcall(function()
+			return trackerAny.isZonePopulated(player, zoneId)
+		end)
+		if ok and type(res) == "boolean" then
+			return res
+		end
+	end
+
+	if type(trackerAny.getZoneById) == "function" then
+		local ok, zone = pcall(function()
+			return trackerAny.getZoneById(player, zoneId)
+		end)
+		if ok and type(zone) == "table" then
+			local req = zone.requirements
+			if req and type(req) == "table" and req.Populated ~= nil then
+				return req.Populated == true
+			end
+		end
+	end
+
+	return nil
+end
+
 -- ==== Upgrade batching / epoch de-dupe ====
 local _passEpoch: number = 0
 -- player → zoneId → tileKey ("x|z") → lastSeenEpoch
@@ -607,6 +1055,14 @@ local function _isStage3Populated(player: Player, zoneId: string): boolean
 			if a2 == true then return true elseif a2 == false then return false end
 			local bv2 = s3:FindFirstChild("populated")
 			if bv2 and bv2:IsA("BoolValue") then return bv2.Value end
+		end
+	end
+
+	-- ZoneTracker keeps authoritative requirement flags even if the workspace model isn't streamed in.
+	do
+		local trackerFlag = _zoneTrackerIsPopulated(player, zoneId)
+		if trackerFlag ~= nil then
+			return trackerFlag
 		end
 	end
 
@@ -1020,72 +1476,24 @@ function CityInteractions._clearUxpAlarmsForZone(player: Player, zoneId: string)
 	f:Destroy()
 end
 
--- Persist last per-tile UXP so we can detect up/down deltas
-local _lastTileUXP: { [Player]: { [string]: { [string]: number } } } = {}
-local function _tkey(x: number, z: number): string
-	return tostring(x).."|"..tostring(z)
-end
-
---For Pollution/synnergy not UXP
-local function _tkey2(x: number, z: number): string
-	return tostring(x).."|"..tostring(z)
-end
-
-local function _tileHasNeighborOfModeInRange(tile: GridTile, neighbor: ZoneData, width: number): boolean
-	-- Quick AABB gate
-	local bb = neighbor.boundingBox
-	if tile.x < bb.minX - width or tile.x > bb.maxX + width
-		or tile.z < bb.minZ - width or tile.z > bb.maxZ + width then
-		return false
-	end
-	-- Per-tile proximity check
-	for _, tB in ipairs(neighbor.gridList) do
-		if isNearby(tile, tB, width) then return true end
-	end
-	return false
-end
-
 local function _computeTileIncomePositiveBonus(player: Player, zoneId: string, x: number, z: number, targetMode: string): number
-	local cfg = (Interactions and Interactions.IncomeBonus) or nil
-	if not cfg then return 0 end
-	local perTarget = cfg[targetMode]; if not perTarget then return 0 end
-	local maxBonus  = tonumber(cfg.MaxBonus) or 0.30
-
-	-- find this zone + neighbors
 	local zdata = _getZoneDataFromCache(player, zoneId)
 	if not zdata then return 0 end
-	local neighbors = zoneCacheByPlayer[player] or {}
-
-	-- use the numeric grid coords (x, z) to build the tile
-	local tile = { x = x, z = z }
-
-	local total = 0
-	for neighborMode, bonus in pairs(perTarget) do
-		if type(bonus) == "number" and bonus > 0 then
-			local width = getSynergyWidth(neighborMode)
-			local present = false
-			for _, other in ipairs(neighbors) do
-				if other.zoneId ~= zoneId and other.mode == neighborMode then
-					if _tileHasNeighborOfModeInRange(tile, other, width) then
-						present = true; break
-					end
-				end
-			end
-			if present then total += bonus end
-		end
-	end
-
-	if total > maxBonus then total = maxBonus end
-	if total < 0 then total = 0 end
-	return total
+	return _computeTilePositiveBonus(player, zdata, { x = x, z = z })
 end
 
 -- Public: positive-income multiplier (1 + bonus)
 function CityInteractions.getTileIncomePositiveMultiplier(
 	player: Player, zoneId: string, x: number, z: number, targetMode: string
 ): number
-	local b = _computeTileIncomePositiveBonus(player, zoneId, x, z, targetMode)
-	return 1 + b
+	local key = _tkey(x, z)
+	local cached = _getTilePositiveBonus(player, zoneId, key)
+	if cached == nil then
+		local bonus = _computeTileIncomePositiveBonus(player, zoneId, x, z, targetMode)
+		_setTilePositiveBonus(player, zoneId, key, bonus)
+		cached = bonus
+	end
+	return 1 + cached
 end
 
 -- Public: convenience net multiplier = (1 - penalty) * (1 + bonus)
@@ -1253,6 +1661,13 @@ function CityInteractions.getTileIncomePollutionMultiplier(player: Player, zoneI
 end
 
 local function _isZonePopulating(player: Player, zoneId: string): boolean
+	if _isZonePending(player, zoneId) then
+		if _isStage3Populated(player, zoneId) then
+			_clearZonePending(player, zoneId)
+		else
+			return true
+		end
++	end
 	-- Prefer ZoneTracker API if available
 	if ZoneTracker and type((ZoneTracker :: any).isZonePopulating) == "function" then
 		local ok, res = pcall(function()
@@ -1372,18 +1787,28 @@ end
 -- ===== Cache maintenance =====
 function CityInteractions.rebuildCacheFromTracker(player: Player)
 	zoneCacheByPlayer[player] = {}
+	_positiveBonusTiles[player] = nil
 	local zonesAny: any = ZoneTracker.getAllZones(player)
+	local idx = _getSpatialIndex(player, true)
+	if idx then idx:clear() end
 	for _, z in pairs(zonesAny) do
 		local mode: string = z.mode
 		if not IGNORE_ZONE_TYPES[mode] then
 			local gridList: { GridTile } = z.gridList
-			table.insert(zoneCacheByPlayer[player], {
+			local entry = {
 				zoneId      = z.zoneId,
 				mode        = mode,
 				gridList    = gridList,
 				player      = player,
 				boundingBox = computeBoundingBox(gridList),
-			})
+			}
+			table.insert(zoneCacheByPlayer[player], entry)
+			if idx then idx:add(entry) end
+		end
+	end
+	if idx then
+		for _, entry in ipairs(zoneCacheByPlayer[player]) do
+			_refreshPositiveIncomeForZone(player, entry)
 		end
 	end
 end
@@ -1393,8 +1818,15 @@ local function computeAggregateSynergy(target: ZoneData, neighbors: { ZoneData }
 	if not VALID_ZONE_TYPES[target.mode] then return 0 end
 	local map = synergyMapping[target.mode]; if not map then return 0 end
 
+	local candidateList = neighbors
+	local idx = _getSpatialIndex(target.player, false)
+	if idx and target.boundingBox then
+		local radius = MAX_SYNERGY_RADIUS_BY_TARGET[target.mode] or ADJACENCY_RADIUS
+		candidateList = idx:queryAabb(target.boundingBox, radius)
+	end
+
 	local total = 0
-	for _, other in ipairs(neighbors) do
+	for _, other in ipairs(candidateList) do
 		if other.zoneId ~= target.zoneId and VALID_ZONE_TYPES[other.mode] and not IGNORE_ZONE_TYPES[other.mode] then
 			-- Use the *emitter's* synergy width for both AABB precheck and per-tile proximity
 			local w  = getSynergyWidth(other.mode)
@@ -1434,8 +1866,15 @@ local function computeAggregatePollution(target: ZoneData, neighbors: { ZoneData
 		print(("[PollutionAgg] Target %s (%s) tiles=%d"):format(target.zoneId, target.mode, #target.gridList))
 	end
 
+	local candidateList = neighbors
+	local idx = _getSpatialIndex(target.player, false)
+	if idx and target.boundingBox then
+		local radius = MAX_SYNERGY_RADIUS_BY_TARGET[target.mode] or ADJACENCY_RADIUS
+		candidateList = idx:queryAabb(target.boundingBox, radius)
+	end
+
 	local total = 0
-	for _, other in ipairs(neighbors) do
+	for _, other in ipairs(candidateList) do
 		if other.zoneId ~= target.zoneId
 			and VALID_ZONE_TYPES[other.mode]
 			and not IGNORE_ZONE_TYPES[other.mode]
@@ -1493,7 +1932,13 @@ local function computeTileNegativeSynergy(target: ZoneData, neighbors: { ZoneDat
 	local map = synergyMapping[target.mode]; if not map then return 0 end
 
 	local negSum = 0
-	for _, other in ipairs(neighbors) do
+	local candidateList = neighbors
+	local idx = _getSpatialIndex(target.player, false)
+	if idx then
+		local radius = MAX_SYNERGY_RADIUS_BY_TARGET[target.mode] or ADJACENCY_RADIUS
+		candidateList = idx:queryRadius(tile.x, tile.z, radius)
+	end
+	for _, other in ipairs(candidateList) do
 		if other.zoneId ~= target.zoneId
 			and VALID_ZONE_TYPES[other.mode]
 			and not IGNORE_ZONE_TYPES[other.mode]
@@ -1816,7 +2261,7 @@ function CityInteractions._fillZoneGapsAtWealth(
 )
 	-- Accumulate cells in the per-zone pending queue.
 	if gapCells and #gapCells > 0 then
-		_pendingAddCells(player, zoneId, wealth, gapCells)
+		RefillQueue.addCells(player, zoneId, wealth, gapCells)
 	else
 		-- No seeds were provided (legacy callers). We intentionally do nothing here to avoid whole-zone
 		-- sweeps from this path; CityInteractions only ever calls with seeds now.
@@ -1833,13 +2278,33 @@ function CityInteractions._fillZoneGapsAtWealth(
 	end
 	_refillLock[player][zoneId] = true
 
-	while _pendingHasAny(player, zoneId) do
-		local wealthToRun, cellsToRun = _pendingPopOne(player, zoneId)
+	local epochAtStart = RefillQueue.getEpoch(player, zoneId)
+	local function shouldRefillStop(): boolean
+		if RefillQueue.getEpoch(player, zoneId) ~= epochAtStart then
+			return true
+		end
+		if not ZoneTracker.getZoneById(player, zoneId) then
+			return true
+		end
+		return false
+	end
+
+	local aborted = false
+	while RefillQueue.hasAny(player, zoneId) do
+		if shouldRefillStop() then
+			aborted = true
+			break
+		end
+		local wealthToRun, cellsToRun = RefillQueue.popOne(player, zoneId)
 		if not wealthToRun or not cellsToRun or #cellsToRun == 0 then break end
 
 		-- NEW: cluster & cap batch size
 		local clusters = SEED_CLUSTERING.enabled and _clusterSeedCells(cellsToRun, SEED_CLUSTERING) or { cellsToRun }
 		for _, cluster in ipairs(clusters) do
+			if shouldRefillStop() then
+				aborted = true
+				break
+			end
 			if type((BuildingGeneratorModule :: any)._refillZoneGaps) == "function" then
 				(BuildingGeneratorModule :: any)._refillZoneGaps(
 					player, zoneId, mode, wealthToRun,
@@ -1848,11 +2313,19 @@ function CityInteractions._fillZoneGapsAtWealth(
 					cluster      -- ← seed whitelist (cluster)
 				)
 			end
+			if shouldRefillStop() then
+				aborted = true
+				break
+			end
 			-- polite yield to keep the server responsive
 			task.wait(SEED_CLUSTERING.yield_between or 0.02)
 		end
+		if aborted then break end
 	end
-	_unlockRefill(player, zoneId)
+	if aborted then
+		RefillQueue.clearPending(player, zoneId)
+	end
+	RefillQueue.unlock(player, zoneId)
 end
 
 -- Apply a batch of {x,z,wealth} intentions by:
@@ -1923,6 +2396,8 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 	_lastTileUXP[player] = _lastTileUXP[player] or {}
 	_lastTileUXP[player][zoneData.zoneId] = _lastTileUXP[player][zoneData.zoneId] or {}
 
+	local idx = _getSpatialIndex(player, true)
+
 	-- ===== NEW: batching + guards =====
 	-- Explicit “wealthed” guard (only such modes can change wealth tiers)
 	local allowWealthUpgrades = (WEALTHED_ZONES and WEALTHED_ZONES[zoneData.mode]) or (_WEALTHED_ZONES[zoneData.mode] == true)
@@ -1965,7 +2440,8 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 		local bestBuilding: { [string]: string } = {}
 		for categoryName, _ in pairs(CATEGORY :: any) do bestTierScore[categoryName] = 0 end
 
-		for _, otherZone in ipairs(allZones) do
+		local candidates = (idx and idx:queryRadius(currentTile.x, currentTile.z, MAX_UXP_QUERY_RADIUS)) or allZones
+		for _, otherZone in ipairs(candidates) do
 			if otherZone.zoneId ~= zoneData.zoneId
 				and (UXP_VALUES :: any)[otherZone.mode]
 				and not UXP_IGNORE_ZONE_TYPES[otherZone.mode]
@@ -2063,12 +2539,14 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 					dprintFX(string.format(" + UXP ↑ at %s (%d,%d) : %d→%d [prog=%.2f]",
 						zoneData.zoneId, currentTile.x, currentTile.z, prev, uxpTotal, progressUp))
 					_spawnUxpAlarm(player, zoneData.zoneId, currentTile.x, currentTile.z, "AlarmUpgrade", tintUp)
+					playUxpSound(player, "Upgrade")
 				elseif diff < 0 then
 					-- DOWNGRADE: dark orange → red, quantized by deficit below floor
 					local tintDn = CityInteractions._progressColorDown(progressDown)
 					dprintFX(string.format(" - UXP ↓ at %s (%d,%d) : %d→%d [def=%.2f]",
 						zoneData.zoneId, currentTile.x, currentTile.z, prev, uxpTotal, progressDown))
 					_spawnUxpAlarm(player, zoneData.zoneId, currentTile.x, currentTile.z, "AlarmDowngrade", tintDn)
+					playUxpSound(player, "Downgrade")
 				end
 			end
 		end
@@ -2125,7 +2603,7 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 		-- FIX 1: consistent bulk cutover (>= threshold, not >)
 		-- ==========================================================
 		if #batchChanges >= BULK_REBUILD_THRESHOLD then
-			dprintUXP(("   [bulk] %d changes meet/exceed threshold (%d) — running bulkWealthRebuild")
+			dprintUXP(("   [bulk] %d changes meet/exceed threshold (%d) – running bulkWealthRebuild")
 				:format(#batchChanges, BULK_REBUILD_THRESHOLD))
 
 			-- If zone is still populating, queue normal batch and exit; bulk will be run later.
@@ -2135,6 +2613,9 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 			else
 				-- Atomic: compute intents, remove all instances touching changed tiles, refill by wealth buckets.
 				CityInteractions.bulkWealthRebuild(player, zoneData.zoneId)
+				if batchXP > 0 then
+					XPManager.addXP(player, batchXP, zoneData.zoneId)
+				end
 			end
 			return
 		end
@@ -2224,6 +2705,11 @@ end
 function CityInteractions.onZoneCreated(player: Player, zoneId: string, mode: string, gridList: { GridTile })
 	if IGNORE_ZONE_TYPES[mode] then print("[CityInteractions] Skipping cache and logic for excluded type:", mode) return end
 	print("[CityInteractions] onZoneCreated:", zoneId, mode, player.Name)
+	RefillQueue.cancel(player, zoneId)
+
+	if VALID_ZONE_TYPES[mode] then
+		_markZonePending(player, zoneId)
+	end
 
 	local newZoneData: ZoneData = {
 		zoneId      = zoneId,
@@ -2235,6 +2721,9 @@ function CityInteractions.onZoneCreated(player: Player, zoneId: string, mode: st
 
 	if not zoneCacheByPlayer[player] then zoneCacheByPlayer[player] = {} end
 	table.insert(zoneCacheByPlayer[player], newZoneData)
+	local idx = _getSpatialIndex(player, true)
+	if idx then idx:add(newZoneData) end
+	_recalcPositiveBonusesAround(player, newZoneData)
 
 	if VALID_ZONE_TYPES[mode] then CityInteractions.calculateZoneSynergy(player, newZoneData) end
 
@@ -2253,6 +2742,11 @@ function CityInteractions.onZoneRecreated(player: Player, zoneId: string, mode: 
 		if DEBUG_SYNERGY then print("[CityInteractions] ZoneReCreated ignored for excluded type:", mode) end
 		return
 	end
+	RefillQueue.cancel(player, zoneId)
+
+	if VALID_ZONE_TYPES[mode] then
+		_markZonePending(player, zoneId)
+	end
 
 	-- Update cache entry for this zone (replace its grid & bbox)
 	local cache = zoneCacheByPlayer[player]
@@ -2261,6 +2755,7 @@ function CityInteractions.onZoneRecreated(player: Player, zoneId: string, mode: 
 	_pollTickCursor[player][zoneId] = 1
 	local bb = computeBoundingBox(gridList)
 	local found = false
+	local zdata: ZoneData? = nil
 	for i = 1, #cache do
 		if cache[i].zoneId == zoneId then
 			cache[i] = {
@@ -2270,18 +2765,21 @@ function CityInteractions.onZoneRecreated(player: Player, zoneId: string, mode: 
 				player      = player,
 				boundingBox = bb,
 			}
+			zdata = cache[i]
 			found = true
 			break
 		end
 	end
 	if not found then
-		table.insert(cache, {
+		local entry: ZoneData = {
 			zoneId      = zoneId,
 			mode        = mode,
 			gridList    = gridList,
 			player      = player,
 			boundingBox = bb,
-		})
+		}
+		table.insert(cache, entry)
+		zdata = entry
 	end
 
 	-- Clear any stale per-zone UXP visuals (they’ll be respawned if needed)
@@ -2289,18 +2787,21 @@ function CityInteractions.onZoneRecreated(player: Player, zoneId: string, mode: 
 
 	-- IMPORTANT ORDER: UXP first (zone + impacted), then pollution/synergy alarms
 	_beginPass()
-	-- Recompute UXP for the recreated zone
-	local zdata: ZoneData = {
-		zoneId = zoneId, mode = mode, gridList = gridList, player = player, boundingBox = bb
-	}
-	if not UXP_IGNORE_ZONE_TYPES[mode] then
-		CityInteractions.calculateGridUXP(player, zdata)
-		recalcUXPForImpactedZonesAround(player, zdata)
-	end
+	if zdata then
+		do
+			local idx = _getSpatialIndex(player, true)
+			if idx then idx:update(zdata) end
+		end
+		_recalcPositiveBonusesAround(player, zdata)
+		if not UXP_IGNORE_ZONE_TYPES[mode] then
+			CityInteractions.calculateGridUXP(player, zdata)
+			recalcUXPForImpactedZonesAround(player, zdata)
+		end
 
-	-- Now run pollution/synergy alarms for the updated geometry
-	if VALID_ZONE_TYPES[mode] then
-		CityInteractions.calculateZoneSynergy(player, zdata)
+		-- Now run pollution/synergy alarms for the updated geometry
+		if VALID_ZONE_TYPES[mode] then
+			CityInteractions.calculateZoneSynergy(player, zdata)
+		end
 	end
 	_endPass()
 end
@@ -2312,6 +2813,8 @@ function CityInteractions.onZoneRemoved(player: Player, zoneId: string, mode: st
 		return
 	end
 	print(string.format("[CityInteractions] onZoneRemoved: '%s' (%s)", zoneId, mode))
+	RefillQueue.cancel(player, zoneId)
+	_clearZonePending(player, zoneId)
 
 	-- Clear gentle pulse parts for this zone
 	CityInteractions._clearUxpAlarmsForZone(player, zoneId)
@@ -2357,6 +2860,18 @@ function CityInteractions.onZoneRemoved(player: Player, zoneId: string, mode: st
 		_pollTickCursor[player][zoneId] = nil
 		if not next(_pollTickCursor[player]) then _pollTickCursor[player] = nil end
 	end
+	do
+		local idx = _getSpatialIndex(player, false)
+		if idx then idx:remove(zoneId) end
+	end
+	_clearZonePositiveBonus(player, zoneId)
+	if _incomePollutionTiles[player] then
+		_incomePollutionTiles[player][zoneId] = nil
+		if not next(_incomePollutionTiles[player]) then
+			_incomePollutionTiles[player] = nil
+		end
+	end
+	_recalcPositiveBonusesAround(player, nil, removedZoneData.boundingBox)
 end
 
 -- ===== BindableEvents wiring =====
@@ -2367,6 +2882,7 @@ do
 	zonePopulatedEvent.Event:Connect(function(player: Player, zoneId: string, _placed: any)
 		-- 1) apply deferred wealth (from UXP computations)
 		CityInteractions._flushPendingWealthForZone(player, zoneId)
+		_clearZonePending(player, zoneId)
 
 		-- 2) safety: if the zone exists in cache, run pollution/synergy pass now that models are surely present
 		local z = _getZoneDataFromCache(player, zoneId)
@@ -2442,10 +2958,14 @@ Players.PlayerRemoving:Connect(function(plr: Player)
 	_pollutionClock[plr]   = nil
 	_refillLock[plr]       = nil
 	_refillPending[plr]    = nil
+	_refillEpoch[plr]      = nil
 	_pendingWealth[plr]    = nil
+	_pendingPopulate[plr]  = nil
 	_applyLock[plr]        = nil
 	_incomePollutionTiles[plr] = nil
 	_pollTickCursor[plr]   = nil
+	_positiveBonusTiles[plr] = nil
+	zoneSpatialIndexByPlayer[plr] = nil
 end)
 
 -- === INTENT-ONLY PASS: compute intended wealth for every tile (no side effects) ===

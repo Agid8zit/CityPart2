@@ -6,6 +6,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MarketplaceService = game:GetService("MarketplaceService")
 local ServerScriptService = game:GetService("ServerScriptService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Dependencies
 local Gamepasses = require(ReplicatedStorage.Scripts.Gamepasses)
@@ -301,7 +302,7 @@ do
 	
 	-- Check Failed DevProduct purchases
 	local CheckFailedDevproductTimer = 0
-	RunService.Heartbeat:Connect(function()
+	RunServiceScheduler.onHeartbeat(function()
 		-- Debounce Timer
 		if os.clock() < CheckFailedDevproductTimer then return end
 		CheckFailedDevproductTimer = os.clock() + 3

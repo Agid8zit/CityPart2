@@ -1,12 +1,9 @@
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
-local BadgeService = game:GetService("BadgeService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 
--- === CONFIG: set your real badge IDs here ===
-local ONBOARDING_COMPLETED_BADGE_ID = 0  -- TODO: set real ID
-local ONBOARDING_SKIPPED_BADGE_ID   = 0  -- TODO: set real ID
+local BadgeServiceModule = require(ServerScriptService.Services.BadgeService)
 
 -- --------------------------------------------------------------------------
 -- Server-safe module accessor + smart invoker (supports ":" and ".")
@@ -115,21 +112,20 @@ local function ensureOnboardingBlob(profile: table)
 	return ob
 end
 
--- Helpful internal: Badge award with debounce+pcall.
-local function safeUserHasBadgeAsync(userId: number, badgeId: number): boolean
-	if badgeId == 0 then return false end -- not configured
-	local ok, has = pcall(BadgeService.UserHasBadgeAsync, BadgeService, userId, badgeId)
-	return ok and has == true
+local function awardCompletionBadge(player: Player?, ob)
+	if not player or ob.completionAwarded then return end
+	local success = select(1, BadgeServiceModule.AwardOnboardingCompleted(player))
+	if success then
+		ob.completionAwarded = true
+	end
 end
 
-local function safeAwardBadge(userId: number, badgeId: number)
-	if badgeId == 0 then return end
-	-- Double-check before award, then award, then re-check guards on profile fields.
-	local has = safeUserHasBadgeAsync(userId, badgeId)
-	if has then return end
-	pcall(function()
-		BadgeService:AwardBadge(userId, badgeId)
-	end)
+local function awardSkipBadge(player: Player?, ob)
+	if not player or ob.skipAwarded then return end
+	local success = select(1, BadgeServiceModule.AwardOnboardingSkipped(player))
+	if success then
+		ob.skipAwarded = true
+	end
 end
 
 -- --------------------------------------------------------------------------
@@ -150,13 +146,8 @@ function OnboardingService.StartIfNeeded(player: Player)
 		record = AUDIT_STORE:GetAsync(key)
 	end)
 	if record and record.pendingSkip == true then
-		-- Historical "skip" – persist account‑wide facts
-		if not ob.skipAwarded then
-			if not safeUserHasBadgeAsync(player.UserId, ONBOARDING_SKIPPED_BADGE_ID) then
-				safeAwardBadge(player.UserId, ONBOARDING_SKIPPED_BADGE_ID)
-			end
-			ob.skipAwarded = true
-		end
+		-- Historical "skip" — persist account‐wide facts
+		awardSkipBadge(player, ob)
 		ob.state     = (ob.state == "Completed") and "Completed" or "Skipped"
 		ob.skippedAt = record.skipAt or os.time()
 
@@ -169,12 +160,7 @@ function OnboardingService.StartIfNeeded(player: Player)
 
 	-- 2) If already completed from a past run, ensure they get the completion badge
 	if ob.state == "Completed" then
-		if not ob.completionAwarded then
-			if not safeUserHasBadgeAsync(player.UserId, ONBOARDING_COMPLETED_BADGE_ID) then
-				safeAwardBadge(player.UserId, ONBOARDING_COMPLETED_BADGE_ID)
-			end
-			ob.completionAwarded = true
-		end
+		awardCompletionBadge(player, ob)
 		return
 	end
 
@@ -213,12 +199,7 @@ function OnboardingService.Complete(player: Player)
 		ob.progress.b2.lastSeenAt = os.time()
 	end
 
-	if not ob.completionAwarded then
-		if not safeUserHasBadgeAsync(player.UserId, ONBOARDING_COMPLETED_BADGE_ID) then
-			safeAwardBadge(player.UserId, ONBOARDING_COMPLETED_BADGE_ID)
-		end
-		ob.completionAwarded = true
-	end
+	awardCompletionBadge(player, ob)
 end
 
 -- Drive a logical step and notify the client (used by your bridge/server logic)
@@ -240,7 +221,7 @@ end
 
 -- Exactly when the player presses "Delete Save" WHILE onboarding is InProgress.
 -- Writes to an audit store not cleared by your per-save wipe.
-function OnboardingService.RecordDeletionDuringOnboarding(userId: number)
+function OnboardingService.RecordDeletionDuringOnboarding(userId: number, player: Player?)
 	local key = ("onboarding_audit:%d"):format(userId)
 	local now = os.time()
 	pcall(function()
@@ -249,6 +230,20 @@ function OnboardingService.RecordDeletionDuringOnboarding(userId: number)
 		current.skipAt = now
 		AUDIT_STORE:SetAsync(key, current)
 	end)
+
+	-- If the player is online, immediately reflect the skip locally so onboarding
+	-- stops gating this session instead of waiting for a reload/rejoin.
+	if player then
+		local profile = getProfile(player)
+		if profile then
+			local ob = ensureOnboardingBlob(profile)
+			if ob.state ~= "Completed" then
+				ob.state = "Skipped"
+				ob.skippedAt = now
+				awardSkipBadge(player, ob)
+			end
+		end
+	end
 end
 
 -- === Progress (Barrage 1 guard) ============================================

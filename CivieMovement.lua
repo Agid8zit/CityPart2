@@ -1,5 +1,7 @@
 local TweenService = game:GetService("TweenService")
 local RunService   = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 local CivilianMovement = {}
 
@@ -30,7 +32,7 @@ end
 
 -- ---------- Config ----------
 local CONFIG = {
-	DefaultWalkSpeed = 2,
+	DefaultWalkSpeed = 3.5,
 	FadeOutTime      = 1.25,
 	Debug            = false,
 
@@ -59,7 +61,94 @@ local CONFIG = {
 local function dprint(...) if CONFIG.Debug then print("[CivilianMovement]", ...) end end
 local function dwarn (...) if CONFIG.Debug then warn ("[CivilianMovement]", ...) end end
 
--- activeMoves[key] = { conns={}, cancelled, animTrack, tween, runConn, moveConn, hbConn }
+local approachMonitors = {}
+local approachConn = nil
+
+local function detachApproachConnection()
+	if approachConn then
+		disconnectHandle(approachConn)
+		approachConn = nil
+	end
+end
+
+local function removeApproachMonitor(key, info, restoreSpeed)
+	local monitor = approachMonitors[key]
+	if monitor then
+		if restoreSpeed and monitor.humanoid then
+			local base = monitor.baseWS or CONFIG.DefaultWalkSpeed
+			monitor.humanoid.WalkSpeed = base
+		end
+		approachMonitors[key] = nil
+	end
+	if info then
+		info.approachActive = nil
+	end
+	if approachConn and next(approachMonitors) == nil then
+		detachApproachConnection()
+	end
+end
+
+local function ensureApproachLoop()
+	if approachConn then return end
+	approachConn = RunServiceScheduler.onHeartbeat(function()
+		if not next(approachMonitors) then
+			detachApproachConnection()
+			return
+		end
+		for key, monitor in pairs(approachMonitors) do
+			local info = monitor.info
+			if not info or info.cancelled or not monitor.hrp or not monitor.hrp.Parent then
+				approachMonitors[key] = nil
+			else
+				local dist = (monitor.target - monitor.hrp.Position).Magnitude
+				if dist <= CONFIG.ApproachSlowRadius and not monitor.slowed then
+					monitor.slowed = true
+					pcall(function()
+						monitor.humanoid.WalkSpeed = math.max(0.1, monitor.baseWS * CONFIG.ApproachSpeedFactor)
+					end)
+					if monitor.track then
+						pcall(function() monitor.track:AdjustSpeed(0.85) end)
+					end
+				end
+				if dist <= 0.15 then
+					approachMonitors[key] = nil
+					info.approachActive = nil
+				end
+			end
+		end
+		if next(approachMonitors) == nil then
+			detachApproachConnection()
+		end
+	end)
+end
+
+local function addApproachMonitor(key, info, hum, hrp, target, baseWS, track)
+	approachMonitors[key] = {
+		info = info,
+		humanoid = hum,
+		hrp = hrp,
+		target = target,
+		baseWS = baseWS,
+		track = track,
+		slowed = false,
+	}
+	info.approachActive = true
+	ensureApproachLoop()
+end
+
+local function disconnectHandle(handle)
+	if not handle then return end
+	local handleType = typeof(handle)
+	if handleType == "RBXScriptConnection" then
+		local ok, err = pcall(function() handle:Disconnect() end)
+		if not ok then warn("[CivilianMovement] Failed to disconnect connection:", err) end
+	elseif handleType == "function" then
+		local ok, err = pcall(handle)
+		if not ok then warn("[CivilianMovement] Failed to run cleanup handler:", err) end
+	end
+end
+
+-- activeMoves[key] = { conns={}, cancelled, animTrack, tween, runConn, moveConn, approachActive }
 local activeMoves = {}
 
 -- ---------- Rig helpers ----------
@@ -239,10 +328,11 @@ function CivilianMovement.moveAlongPath(model, points, key, opts)
 	if not model or not points or #points < 1 then return end
 	activeMoves[key] = activeMoves[key] or {
 		conns = {}, cancelled = false, animTrack = nil, tween = nil,
-		runConn = nil, moveConn = nil, hbConn = nil
+		runConn = nil, moveConn = nil
 	}
 
 	local info = activeMoves[key]
+	info.key = key
 	local hrp = ensurePrimary(model)
 	if not hrp then
 		dwarn("Model has no PrimaryPart/HRP")
@@ -252,9 +342,13 @@ function CivilianMovement.moveAlongPath(model, points, key, opts)
 
 	local hum = getHumanoid(model)
 	if hum then
+		info.humanoid = hum
+		info.origWalkSpeed = hum.WalkSpeed
 		hum.WalkSpeed = math.max(0.1, tonumber(opts.WalkSpeed) or CONFIG.DefaultWalkSpeed)
 		hum.AutoRotate = true
 	else
+		info.humanoid = nil
+		info.origWalkSpeed = nil
 		dwarn("Model has no Humanoid; falling back to tween")
 	end
 
@@ -276,9 +370,17 @@ function CivilianMovement.moveAlongPath(model, points, key, opts)
 
 	local function finish()
 		-- clean monitors
-		if info.hbConn then pcall(function() info.hbConn:Disconnect() end); info.hbConn = nil end
+		if info.approachActive then
+			removeApproachMonitor(key, info, true)
+		end
 		if info.runConn then pcall(function() info.runConn:Disconnect() end); info.runConn = nil end
 		if info.moveConn then pcall(function() info.moveConn:Disconnect() end); info.moveConn = nil end
+
+		if info.humanoid and info.origWalkSpeed then
+			info.humanoid.WalkSpeed = info.origWalkSpeed
+		end
+		info.humanoid = nil
+		info.origWalkSpeed = nil
 
 		stopWalkAnimation(key)
 		if opts.DestroyAtEnd then
@@ -318,31 +420,16 @@ function CivilianMovement.moveAlongPath(model, points, key, opts)
 				-- 2) MOVE (approach easing)
 				if info.moveConn then pcall(function() info.moveConn:Disconnect() end); info.moveConn = nil end
 				if info.runConn  then pcall(function() info.runConn:Disconnect() end);  info.runConn  = nil end
-				if info.hbConn   then pcall(function() info.hbConn:Disconnect() end);   info.hbConn   = nil end
-
 				local baseWS = hum.WalkSpeed
-				local slowed = false
 
 				hum:MoveTo(target)
 				hum.AutoRotate = prevAuto
 
-				-- Distance-based approach slowdown near node
-				info.hbConn = RunService.Heartbeat:Connect(function()
-					if info.cancelled then return end
-					local dist = (target - hrp.Position).Magnitude
-					if dist <= CONFIG.ApproachSlowRadius and not slowed then
-						slowed = true
-						hum.WalkSpeed = math.max(0.1, baseWS * CONFIG.ApproachSpeedFactor)
-						if track then pcall(function() track:AdjustSpeed(0.85) end) end
-					end
-				end)
-				table.insert(info.conns, info.hbConn)
+				addApproachMonitor(key, info, hum, hrp, target, baseWS, track)
 
 				info.moveConn = hum.MoveToFinished:Connect(function(_reached)
-					-- restore speed/anim after the leg
-					if slowed then hum.WalkSpeed = baseWS end
+					removeApproachMonitor(key, info, true)
 					if track then pcall(function() track:AdjustSpeed(1.0) end) end
-					if info.hbConn then pcall(function() info.hbConn:Disconnect() end); info.hbConn = nil end
 					if not info.cancelled then gotoNext() end
 				end)
 				table.insert(info.conns, info.moveConn)
@@ -407,12 +494,20 @@ function CivilianMovement.stopMovesForKey(key)
 	if info.tween   then pcall(function() info.tween:Cancel() end);   info.tween   = nil end
 	if info.moveConn then pcall(function() info.moveConn:Disconnect() end); info.moveConn = nil end
 	if info.runConn  then pcall(function() info.runConn:Disconnect() end);  info.runConn  = nil end
-	if info.hbConn   then pcall(function() info.hbConn:Disconnect() end);   info.hbConn   = nil end
+	if info.approachActive then
+		removeApproachMonitor(key, info, true)
+	end
+
+	if info.humanoid and info.origWalkSpeed then
+		info.humanoid.WalkSpeed = info.origWalkSpeed
+	end
+	info.humanoid = nil
+	info.origWalkSpeed = nil
 
 	stopWalkAnimation(key)
 
 	for _, c in ipairs(info.conns) do
-		if typeof(c) == "RBXScriptConnection" then pcall(function() c:Disconnect() end) end
+		disconnectHandle(c)
 	end
 	activeMoves[key] = nil
 end

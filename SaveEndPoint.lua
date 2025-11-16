@@ -58,14 +58,31 @@ end
 
 local ManualSaveBE: BindableEvent           = ensureBE("ManualSave")
 local ReloadFromCurrentBE: BindableEvent    = ensureBE("RequestReloadFromCurrent")
+local ForceDisableOnboardingBE: BindableEvent = ensureBE("ForceDisableOnboarding")
 
 -- Deps
 local PlayerDataService: any = require(ServerScriptService.Services.PlayerDataService)
+local OnboardingService: any = require(ServerScriptService.Players.OnboardingService)
 local DefaultData: any       = PlayerDataService.GetDefaultData()
 
 -- Types
 type SaveLite = { id: string, cityName: string?, lastPlayed: number?, hasData: boolean? }
 type GetSaveSlotsResult = { current: string, slots: {SaveLite} }
+
+local function recordDeletionDuringOnboarding(player: Player)
+	if OnboardingService then
+		local okRecord, err = pcall(function()
+			OnboardingService.RecordDeletionDuringOnboarding(player.UserId, player)
+		end)
+		if not okRecord then
+			warn("[SaveEndpoints] RecordDeletionDuringOnboarding failed: ", err)
+		end
+	else
+		warn("[SaveEndpoints] OnboardingService missing; forcing disable only")
+	end
+
+	ForceDisableOnboardingBE:Fire(player)
+end
 
 -- Simple per-player mutex
 local busy: {[Player]: boolean} = {}
@@ -199,6 +216,7 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 			if type(k) == "string" and type(v) == "table" then count += 1 end
 		end
 		if count <= 1 then
+			recordDeletionDuringOnboarding(player)
 			local fresh = (DefaultData :: any).newSaveFile()
 			PlayerDataService.ModifyData(player, "savefiles/"..target, fresh)
 			task.defer(function()
@@ -211,6 +229,10 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 		print(("[SaveEndpoints] DeleteSaveFile slot=%s by %s"):format(target, player.Name))
 
 		local deletingCurrent = (pd.currentSaveFile == target)
+
+		if deletingCurrent then
+			recordDeletionDuringOnboarding(player)
+		end
 
 		PlayerDataService.ModifyData(player, "savefiles/"..target, nil)
 

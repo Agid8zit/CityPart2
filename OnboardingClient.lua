@@ -17,6 +17,18 @@ local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
 
 local currentGateId: string? = nil
 
+local function expectChild(parent: Instance, childName: string, className: string?, timeout: number?)
+	local inst = parent:FindFirstChild(childName)
+	if inst and (not className or inst:IsA(className)) then
+		return inst
+	end
+	local ok, result = pcall(parent.WaitForChild, parent, childName, timeout or 5)
+	if ok and result and (not className or result:IsA(className)) then
+		return result
+	end
+	error(string.format("OnboardingClient missing %s '%s' under %s", className or "Instance", childName, parent:GetFullName()))
+end
+
 ----------------
 -- Debugging  --
 ----------------
@@ -86,19 +98,10 @@ local UITargetRegistry = require(ReplicatedStorage.Scripts.UI.UITargetRegistry)
 ---------------
 -- Structure --
 ---------------
-local function ensureFolder(parent, name)
-	local f = parent:FindFirstChild(name)
-	if f and f:IsA("Folder") then return f end
-	local nf = Instance.new("Folder")
-	nf.Name = name
-	nf.Parent = parent
-	return nf
-end
-
-local Events  = ensureFolder(ReplicatedStorage, "Events")
-local RE      = ensureFolder(Events, "RemoteEvents")
-local BE      = ensureFolder(Events, "BindableEvents")
-local BFOLDER = ensureFolder(Events, "BindableFunctions")
+local Events  = expectChild(ReplicatedStorage, "Events", "Folder")
+local RE      = expectChild(Events, "RemoteEvents", "Folder")
+local BE      = expectChild(Events, "BindableEvents", "Folder")
+local BFOLDER = expectChild(Events, "BindableFunctions", "Folder")
 
 -- Remotes
 local RE_Toggle     = RE:WaitForChild("OnboardingToggle")
@@ -107,21 +110,16 @@ local StepCompleted = RE:WaitForChild("OnboardingStepCompleted")
 local DisplayGrid   = RE:WaitForChild("DisplayGrid")
 
 -- Bindables (owned here)
-local function ensureBindable(className, name)
-	local obj = BE:FindFirstChild(name)
-	if obj then return obj end
-	local inst = Instance.new(className)
-	inst.Name = name
-	inst.Parent = BE
-	return inst
+local function expectFromBE(name: string, className: string)
+	return expectChild(BE, name, className)
 end
 
-local BF_CheckItemAllowed = ensureBindable("BindableFunction", "OBCheckItemAllowed") -- kept in BE for backward compat
-local BE_PulseItem        = ensureBindable("BindableEvent", "OBPulseItem")
-local BE_StopPulseItem    = ensureBindable("BindableEvent", "OBStopPulseItem")
-local BE_GridGuard        = ensureBindable("BindableEvent", "OBGridGuard")
-local BE_GuardFB          = ensureBindable("BindableEvent", "OBGuardFeedback")
-local BE_Toggle           = ensureBindable("BindableEvent", "OnboardingToggle")
+local BF_CheckItemAllowed = expectFromBE("OBCheckItemAllowed", "BindableFunction") -- kept in BE for backward compat
+local BE_PulseItem        = expectFromBE("OBPulseItem", "BindableEvent")
+local BE_StopPulseItem    = expectFromBE("OBStopPulseItem", "BindableEvent")
+local BE_GridGuard        = expectFromBE("OBGridGuard", "BindableEvent")
+local BE_GuardFB          = expectFromBE("OBGuardFeedback", "BindableEvent")
+local BE_Toggle           = expectFromBE("OnboardingToggle", "BindableEvent")
 
 -- Bindables (owned by BuildMenu; optional)
 local BE_TabChanged = BE:FindFirstChild("OBBuildMenuTabChanged")
@@ -131,7 +129,15 @@ local BF_GetHub     = BFOLDER:FindFirstChild("OBBuildMenuGetHub")
 -----------------
 -- Notifications
 -----------------
-local NotificationGui do
+local NotificationGui = {
+	ShowArrowAt     = function() return false end,
+	HideArrow       = function() end,
+	ShowArrowBounce = function() return false end,
+	ShowSingleton   = function() end,
+	ClearSingleton  = function() end,
+}
+
+local function bootstrapNotificationGui()
 	local ok, mod = pcall(function()
 		local root  = PlayerGui:WaitForChild("Notifications", 3)
 		local logic = root and (root:FindFirstChild("Logic") or root:FindFirstChildOfClass("ModuleScript"))
@@ -147,7 +153,6 @@ local NotificationGui do
 			end
 		end
 
-		-- API compat: alias ClearSingleton if only ClearChannel exists.
 		if m and type(m) == "table" then
 			if type(m.ClearSingleton) ~= "function" and type(m.ClearChannel) == "function" then
 				m.ClearSingleton = m.ClearChannel
@@ -160,15 +165,11 @@ local NotificationGui do
 	if ok and type(mod) == "table" then
 		NotificationGui = mod
 	else
-		NotificationGui = {
-			ShowArrowAt     = function() return false end,
-			HideArrow       = function() end,
-			ShowArrowBounce = function() return false end,
-			ShowSingleton   = function() end,
-			ClearSingleton  = function() end,
-		}
+		warn("[Onboarding] Notifications GUI failed to initialize; using stub")
 	end
 end
+
+task.defer(bootstrapNotificationGui)
 
 -- ====== Localization keys & singleton channels ======
 local LANG = {
@@ -355,6 +356,7 @@ local MAJOR_KEY_CANDIDATES = {
 	Supply    = { "BM_Supply","BM_Tab_Supply","BMTabs_Supply","BMCategory_Supply","BM_SupplyTab","BMHub_Supply","BM_SupplyIcon" },
 	Services  = { "BM_Services","BM_Tab_Services","BMTabs_Services","BMCategory_Services","BM_ServicesTab","BMHub_Services","BM_ServicesIcon" },
 }
+
 local HUB_KEY_CANDIDATES = {
 	Supply = {
 		Power = { "BM_Power", "BM_Supply_Power", "BMSupply_Power", "BMHub_Power", "BM_PowerHub", "BM_Supply_PowerTab" },
@@ -394,11 +396,45 @@ local function getFlowItem()
 end
 
 local guardSeq, guardIdx, guardEver, activeSeq = {}, 0, false, nil
+
+-- Client-side kick helper: asks the server to (re)emit Barrage1 if nothing is running.
+local lastB1KickRequestAt = 0
+local function requestBarrage1Kick(reason: string?)
+	if not _G.OB_ENABLED then return end
+	if activeSeq and activeSeq ~= "barrage1" then return end
+	local flowState = getFlowState()
+	if flowState and flowState.running then return end
+	local now = os.clock()
+	if now - lastB1KickRequestAt < 1.0 then return end
+	lastB1KickRequestAt = now
+	dbg_route("request Barrage1 kick (reason=%s)", tostring(reason or "unspecified"))
+	pcall(function()
+		StepCompleted:FireServer("OB_ReemitStartWanted", { reason = reason })
+	end)
+end
+
 local function guardCurrentItem()
 	if guardIdx ~= 0 and guardSeq[guardIdx] then
 		return canonItem(guardSeq[guardIdx].mode or guardSeq[guardIdx].item)
 	end
 	return nil
+end
+
+local function isSecondBarrage3PipeStep(stepIndex)
+	if activeSeq ~= "barrage3" then return false end
+	if type(stepIndex) ~= "number" or stepIndex < 1 then return false end
+	local completed = guardSeq[stepIndex]
+	if not completed then return false end
+	if canonItem(completed.mode or completed.item) ~= "WaterPipe" then return false end
+
+	local seen = 0
+	for idx = 1, stepIndex do
+		local step = guardSeq[idx]
+		if step and canonItem(step.mode or step.item) == "WaterPipe" then
+			seen += 1
+		end
+	end
+	return seen == 2
 end
 
 -- global tool memory (avoids typed locals)
@@ -521,6 +557,72 @@ local function ShowArrowAtKeyTracked(key, offset)
 			conn:Disconnect()
 		end
 	end)
+end
+
+-- Click-listener helpers (used for Barrage1 tab confirmations)
+local clickWatchers = {
+	major = { key = nil, conn = nil },
+	hub   = { key = nil, conn = nil },
+}
+
+-- B2 Water step needs B1-style manual tab clicks/pulses
+local manualTabOverride = false
+local manualOverrideTarget = nil
+local manualTabOverrideChanged -- fwd decl
+local triggerManualOverrideReset -- fwd decl
+
+-- REVERTED: no forceReset plumbing; no re-arming reset
+local function setManualTabOverride(enabled, targetId)
+	local want = (enabled == true)
+	if manualTabOverride ~= want then
+		manualTabOverride = want
+		manualOverrideTarget = want and targetId or nil
+		dbg_bm("manualTabOverride -> %s target=%s", tostring(want), tostring(manualOverrideTarget))
+		if manualTabOverrideChanged then
+			manualTabOverrideChanged(want)
+		end
+	else
+		manualOverrideTarget = want and targetId or nil
+	end
+end
+
+local function disconnectClickWatcher(kind)
+	local slot = clickWatchers[kind]
+	if slot.conn then
+		slot.conn:Disconnect()
+		slot.conn = nil
+	end
+	slot.key = nil
+end
+
+local function findClickableButton(target)
+	if not target then return nil end
+	if target:IsA("GuiButton") then return target end
+	return target:FindFirstChildWhichIsA("GuiButton", true)
+end
+
+local function allowAutoCommit()
+	return (activeSeq ~= "barrage1") and (not manualTabOverride)
+end
+
+local function connectClickWatcher(kind, key, onClick)
+	if allowAutoCommit() then return false end
+	local target = getUITarget(key)
+	if not target then return false end
+	local button = findClickableButton(target)
+	if not button then return false end
+	disconnectClickWatcher(kind)
+	local slot = clickWatchers[kind]
+	slot.key = key
+	local signal = button.Activated or button.MouseButton1Click
+	if not signal then return false end
+	local conn
+	conn = signal:Connect(function(...)
+		disconnectClickWatcher(kind)
+		onClick(...)
+	end)
+	slot.conn = conn
+	return true
 end
 
 -------------------
@@ -724,6 +826,8 @@ local function clearAllUIPulses()
 	dbg_ui("clearAllUIPulses()")
 	for k in pairs(wantPulse) do UIPulse.stop(k) end
 	table.clear(wantPulse)
+	disconnectClickWatcher("major")
+	disconnectClickWatcher("hub")
 	if BM_LocalArrow.conn then BM_LocalArrow.conn:Disconnect() end
 	BM_LocalArrow.conn = nil
 	if BM_LocalArrow.gui then BM_LocalArrow.gui.Visible = false end
@@ -741,6 +845,31 @@ local function getBMLogic()
 	local ok, mod = pcall(function() return require(bm.Logic) end)
 	dbg_bm("getBMLogic ok=%s", bools(ok))
 	return ok and mod or nil
+end
+
+local function forceCloseBuildMenu(reason)
+	local bm = buildMenu()
+	if not (bm and bm.Enabled) then
+		dbg_bm("forceCloseBuildMenu(%s) -> already closed", tostring(reason))
+		return false
+	end
+
+	local mod = getBMLogic()
+	if mod and type(mod.OnHide) == "function" then
+		local ok, err = pcall(mod.OnHide)
+		dbg_bm("forceCloseBuildMenu(%s) via OnHide ok=%s", tostring(reason), bools(ok))
+		if ok then
+			return true
+		end
+		if err then warn(("[Onboarding] forceCloseBuildMenu OnHide failed: %s"):format(tostring(err))) end
+	end
+
+	local ok, err = pcall(function() bm.Enabled = false end)
+	dbg_bm("forceCloseBuildMenu(%s) fallback ok=%s", tostring(reason), bools(ok))
+	if not ok and err then
+		warn(("[Onboarding] forceCloseBuildMenu fallback failed: %s"):format(tostring(err)))
+	end
+	return ok == true
 end
 
 local function applyGate(allowedItemID)
@@ -798,19 +927,68 @@ end
 
 -- ===== Committed (click-confirmed) selection =====
 local committedMajor, committedHub = nil, nil
+local majorHoldUntil = 0
+local hubHoldUntil   = 0
+local ROUTE_MIN_HOLD = 0.65
+
+triggerManualOverrideReset = function()
+	committedMajor = nil
+	committedHub   = nil
+	majorHoldUntil = 0
+	hubHoldUntil   = 0
+	disconnectClickWatcher("major")
+	disconnectClickWatcher("hub")
+end
+
 local function setCommitted(major, hub)
 	if type(major) == "string" and major ~= "" then
 		committedMajor = major
+		majorHoldUntil = 0
 		dbg_bm("[COMMIT] major=%s", tostring(major))
 	end
 	if type(hub)   == "string" and hub   ~= "" then
 		committedHub   = hub
+		hubHoldUntil   = 0
 		dbg_bm("[COMMIT] hub=%s", tostring(hub))
 	end
 end
 
 local function getCommittedMajor() return committedMajor end
 local function getCommittedHub(_)  return committedHub  end
+
+local function scheduleHoldForItem(id, forceHold)
+	if not id then return end
+	if activeSeq ~= "barrage1" and not forceHold then return end
+	local deadline = os.clock() + ROUTE_MIN_HOLD
+	local major = majorForItem(id)
+	local hub   = hubForItem(id)
+	if major then majorHoldUntil = deadline end
+	if hub   then hubHoldUntil   = deadline end
+end
+
+manualTabOverrideChanged = function(enabled)
+	if enabled then
+		triggerManualOverrideReset()
+	end
+end
+
+local function shouldForceManualForItem(seq, id)
+	if not id then return false end
+	if id == "WaterPipe" and (seq == "barrage2" or seq == "barrage3") then return true end
+	if seq == "barrage3" and id == "PowerLines" then return true end
+	return false
+end
+
+-- REVERTED: no forceReset argument/behavior
+local function refreshManualTabGuidance()
+	local step = guardSeq and guardSeq[guardIdx]
+	local id = step and canonItem(step.mode or step.item)
+	local needManual = shouldForceManualForItem(activeSeq, id)
+	setManualTabOverride(needManual, needManual and id or nil)
+	if needManual then
+		scheduleHoldForItem(id, true)
+	end
+end
 
 -- FIX: resolve majors using broadened candidate keys
 local function resolveMajorKey(major)
@@ -836,9 +1014,11 @@ local function resolveHubKey(major, hub)
 end
 
 ---------------------------
--- Barrage‑1 route helper --
+-- Barrage-1 route helper --
 ---------------------------
 local arrowAndGateToCurrentStep -- fwd decl
+
+local ENABLE_BARRAGE1_SHOWCASE = false
 
 local BARRAGE1_ROUTE_STEPS = {
 	[3] = { -- WaterTower step itself: nudge to Supply→Water→(WaterTower) if needed
@@ -868,13 +1048,9 @@ local BARRAGE1_ROUTE_STEPS = {
 local ROUTE_STAGE_DURATION = 0.45
 local COMMIT_TIMEOUT       = 4.0
 local COMMIT_STABLE        = 0.18
-
 local barrage1RouteToken = 0
 local barrage1RouteActive = false
 local barrage1LastIndex = 0
-
--- ADD: one‑time showcase memory per Barrage‑1 step
-local barrage1Showcased = {} -- [stepIdx] = true once the showcase runs for that step
 
 local function cancelBarrage1Route()
 	if barrage1RouteActive then
@@ -903,7 +1079,8 @@ local function resolveRouteStageKey(stage, id, wantMajor, wantHub)
 	elseif stage.kind == "item" then
 		local itemId = stage.item and canonItem(stage.item) or id
 		if itemId then
-			return "BM_" .. itemId, stage.offset or UDim2.new(0,0,-0.18,0)
+			local key = "BM_" .. tostring(itemId) -- REVERT: direct item key
+			return key, stage.offset or UDim2.new(0,0,-0.18,0)
 		end
 	end
 	return nil, nil
@@ -921,9 +1098,6 @@ local function startBarrage1RouteSequence(idx, id, wantMajor, wantHub)
 	local myToken = barrage1RouteToken
 	barrage1RouteActive = true
 	barrage1LastIndex = idx
-
-	-- ADD: mark this step as having shown the showcase once
-	barrage1Showcased[idx] = true
 
 	dbg_route("start route idx=%d id=%s wantMajor=%s wantHub=%s", tonumber(idx or -1), tostring(id), tostring(wantMajor), tostring(wantHub))
 
@@ -944,10 +1118,9 @@ local function startBarrage1RouteSequence(idx, id, wantMajor, wantHub)
 		barrage1RouteActive = false
 		clearBuildMenuPulsesExcept(nil)
 		dbg_route("route finished; hand back to orchestrator")
-		-- Keep the orchestrator in charge after the showcase; avoid immediately starting the route again.
 		task.defer(function()
 			if arrowAndGateToCurrentStep then
-				arrowAndGateToCurrentStep(true) -- keep this 'true' here to prevent a route loop
+				arrowAndGateToCurrentStep(true)
 			end
 		end)
 	end)
@@ -984,9 +1157,10 @@ local function repulseSameToolIfNeeded(id)
 	local bm = buildMenu()
 	if bm and bm.Enabled and _G.OB_CurrentTool == id then
 		dbg_ui("RepulseSameTool id=%s (already selected)", tostring(id))
-		UIPulse.stop("BM_"..id)
-		requestPulseAndArrow("BM_"..id, UDim2.new(0,0,-0.18,0))
-		clearBuildMenuPulsesExcept("BM_"..id)
+		local key = "BM_" .. tostring(id) -- REVERT: direct item key
+		UIPulse.stop(key)
+		requestPulseAndArrow(key, UDim2.new(0,0,-0.18,0))
+		clearBuildMenuPulsesExcept(key)
 	end
 end
 
@@ -1048,6 +1222,7 @@ local function GuardStart(seq, resumeAt)
 			guardPulseItem = id
 		end
 	end
+	refreshManualTabGuidance()
 end
 
 local function GuardAdvance()
@@ -1058,11 +1233,13 @@ local function GuardAdvance()
 	else
 		BE_GridGuard:Fire("stop"); guardSeq = {}; guardIdx = 0
 	end
+	refreshManualTabGuidance()
 end
 
 local function GuardCancel()
 	if guardIdx ~= 0 then BE_GridGuard:Fire("stop") end
 	guardSeq = {}; guardIdx = 0
+	refreshManualTabGuidance()
 end
 
 -------------------------------
@@ -1103,7 +1280,7 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	dbg_route("orchestrate (skipRoute=%s) activeSeq=%s owner=%s lastKey=%s",
 		tostring(skipRoute), tostring(activeSeq), tostring(arrowOwner), tostring(lastArrowKey))
 
-	-- If asked, cancel any in‑progress route (showcase)
+	-- If asked, cancel any in-progress route (showcase)
 	if skipRoute == true and barrage1RouteActive then
 		cancelBarrage1Route()
 	end
@@ -1125,10 +1302,23 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	end
 
 	applyGate(id)
+	local manualForId = shouldForceManualForItem(activeSeq, id)
+	setManualTabOverride(manualForId, manualForId and id or nil)
+	if manualForId then
+		scheduleHoldForItem(id, true)
+	end
 
 	if activeSeq ~= "barrage1" then
 		barrage1LastIndex = 0
+		majorHoldUntil = 0
+		hubHoldUntil   = 0
 	end
+
+	local now = os.clock()
+	local holdMajor = math.max(0, majorHoldUntil - now)
+	if holdMajor <= 0 then majorHoldUntil = 0 end
+	local holdHub = math.max(0, hubHoldUntil - now)
+	if holdHub <= 0 then hubHoldUntil = 0 end
 
 	-- If user already has the correct tool selected
 	if _G.OB_CurrentTool == id then
@@ -1159,31 +1349,34 @@ arrowAndGateToCurrentStep = function(skipRoute)
 
 	local wantMajor = majorForItem(id)
 	local wantHub   = hubForItem(id)
-	local curMajor  = getCommittedMajor()
-	local curHub    = getCommittedHub(curMajor)
+	local committedMajorState = getCommittedMajor()
+	local curMajor  = committedMajorState or getCurrentMajor(true)
+	local committedHubState   = getCommittedHub(curMajor)
+	local curHub    = committedHubState or getCurrentHub(curMajor, true)
 	dbg_route("routing id=%s wantMajor=%s wantHub=%s curMajor=%s curHub=%s",
 		tostring(id), tostring(wantMajor), tostring(wantHub), tostring(curMajor), tostring(curHub))
 
-	-- In B1, run a short showcase route ONCE per step if allowed
-	if activeSeq == "barrage1" then
-		local running = flowState and flowState.running == true
-		if not skipBarrageRoute and running then
+	-- In B1, run a short showcase route if allowed (no one-time gating)
+	if activeSeq == "barrage1" and ENABLE_BARRAGE1_SHOWCASE then
+		local running = (flowState and flowState.running == true)
+		if running then
 			local idx = tonumber(flowState.index)
-			if idx and idx >= 1 then
-				if BARRAGE1_ROUTE_STEPS[idx] and not barrage1Showcased[idx] then
-					dbg_route("B1 showcase route idx=%d (first time for this step)", idx)
-					startBarrage1RouteSequence(idx, id, wantMajor, wantHub)
-				else
-					dbg_route("B1 showcase suppressed for idx=%d (already shown or no route)", tonumber(idx or -1))
-					barrage1LastIndex = idx
-					cancelBarrage1Route()
-				end
+			if (not skipBarrageRoute)
+				and idx and idx >= 1
+				and BARRAGE1_ROUTE_STEPS[idx]
+			then
+				dbg_route("B1 showcase route idx=%d", idx)
+				startBarrage1RouteSequence(idx, id, wantMajor, wantHub)
+			else
+				barrage1LastIndex = idx or 0
+				cancelBarrage1Route()
+				dbg_route("B1 showcase suppressed (skip=%s running=%s idx=%s)",
+					tostring(skipBarrageRoute), tostring(running), tostring(idx))
 			end
 		else
-			if not running then
-				barrage1LastIndex = 0
-				cancelBarrage1Route()
-			end
+			barrage1LastIndex = 0
+			cancelBarrage1Route()
+			dbg_route("B1 flow not running; cancel route")
 		end
 	else
 		cancelBarrage1Route()
@@ -1196,45 +1389,97 @@ arrowAndGateToCurrentStep = function(skipRoute)
 
 	-- Target appropriate UI (major → hub → item)
 	local targetKey
-	if (not wantMajor) or (curMajor ~= wantMajor) then
-		targetKey = resolveMajorKey(wantMajor or "Transport")
-		dbg_route("target major key=%s", tostring(targetKey))
-		requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.12,0))
-
-		-- Watch for stable commit into the correct major
-		hubWatchToken += 1
-		local my = hubWatchToken
-		local want = wantMajor
-		task.spawn(function()
-			if my ~= hubWatchToken then return end
-			local ok = pollCommittedEquality(function() return getCurrentMajor(true) end, want, COMMIT_TIMEOUT, COMMIT_STABLE)
-			if ok and my == hubWatchToken then
-				setCommitted(want, nil)
-				arrowAndGateToCurrentStep(true)
-			end
-		end)
+	if not wantMajor then
+		majorHoldUntil = 0
+		disconnectClickWatcher("major")
 	else
-		if wantHub and curHub ~= wantHub then
-			targetKey = resolveHubKey(wantMajor, wantHub) or resolveMajorKey("Supply")
-			dbg_route("target hub key=%s", tostring(targetKey))
+		local needMajor
+		if manualTabOverride then
+			needMajor = committedMajorState ~= wantMajor
+		else
+			needMajor = (curMajor ~= wantMajor) or (holdMajor > 0)
+		end
+		if needMajor then
+			targetKey = resolveMajorKey(wantMajor or "Transport")
+			dbg_route("target major key=%s hold=%.2f", tostring(targetKey), holdMajor)
 			requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.12,0))
 
+			local clickArmed = connectClickWatcher("major", targetKey, function()
+				setCommitted(wantMajor, nil)
+				arrowAndGateToCurrentStep(true)
+			end)
+
+			if allowAutoCommit() or not clickArmed then
+				-- Watch for stable commit into the correct major (fallback when BuildMenu doesn't emit tab events)
+				hubWatchToken += 1
+				local my = hubWatchToken
+				local want = wantMajor
+				local stableWindow = math.max(COMMIT_STABLE, holdMajor)
+				task.spawn(function()
+					if my ~= hubWatchToken then return end
+					local ok = pollCommittedEquality(function() return getCurrentMajor(true) end, want, COMMIT_TIMEOUT, stableWindow)
+					if ok and my == hubWatchToken then
+						setCommitted(want, nil)
+						arrowAndGateToCurrentStep(true)
+					end
+				end)
+			end
+
+			clearBuildMenuPulsesExcept(targetKey)
+			return
+		else
+			disconnectClickWatcher("major")
+			majorHoldUntil = 0
+		end
+	end
+
+	local needHub = false
+	if wantHub then
+		if manualTabOverride then
+			needHub = committedHubState ~= wantHub
+		else
+			needHub = (curHub ~= wantHub) or (holdHub > 0)
+		end
+	end
+
+	if wantHub and needHub then
+		targetKey = resolveHubKey(wantMajor, wantHub) or resolveMajorKey("Supply")
+		dbg_route("target hub key=%s hold=%.2f", tostring(targetKey), holdHub)
+		requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.12,0))
+
+		local clickArmed = connectClickWatcher("hub", targetKey, function()
+			setCommitted(nil, wantHub)
+			arrowAndGateToCurrentStep(true)
+		end)
+
+		if allowAutoCommit() or not clickArmed then
 			-- Watch for stable commit into the correct hub
 			hubWatchToken += 1
 			local my = hubWatchToken
+			local wantHubTarget = wantHub
+			local stableWindow = math.max(COMMIT_STABLE, holdHub)
 			task.spawn(function()
 				if my ~= hubWatchToken then return end
-				local ok = pollCommittedEquality(function() return getCurrentHub(wantMajor, true) end, wantHub, COMMIT_TIMEOUT, COMMIT_STABLE)
+				local ok = pollCommittedEquality(function() return getCurrentHub(wantMajor, true) end, wantHubTarget, COMMIT_TIMEOUT, stableWindow)
 				if ok and my == hubWatchToken then
-					setCommitted(nil, wantHub)
+					setCommitted(nil, wantHubTarget)
 					arrowAndGateToCurrentStep(true)
 				end
 			end)
-		else
-			targetKey = "BM_" .. id
-			dbg_route("target item key=%s", tostring(targetKey))
-			requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.18,0))
 		end
+
+		clearBuildMenuPulsesExcept(targetKey)
+		return
+	else
+		disconnectClickWatcher("hub")
+		if wantHub == nil then
+			hubHoldUntil = 0
+		elseif holdHub <= 0 and curHub == wantHub then
+			hubHoldUntil = 0
+		end
+		targetKey = "BM_" .. tostring(id) -- REVERT: direct item key
+		dbg_route("target item key=%s", tostring(targetKey))
+		requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.18,0))
 	end
 
 	clearBuildMenuPulsesExcept(targetKey)
@@ -1244,10 +1489,14 @@ local function clearArrowAndGate()
 	dbg_route("clearArrowAndGate()")
 	applyGate(nil)
 	cancelBarrage1Route()
+	disconnectClickWatcher("major")
+	disconnectClickWatcher("hub")
 	if activeSeq == "barrage1" then
 		barrage1LastIndex = 0
 	end
 	if lastArrowKey then clearPulseAndArrow(lastArrowKey) end
+	majorHoldUntil = 0
+	hubHoldUntil   = 0
 	HideArrow("clearArrowAndGate")
 end
 
@@ -1267,74 +1516,72 @@ end)
 ------------------------------
 local bmOpenHintShown = false
 
-local _bmFlipAt = nil
-local _bmHoldSeconds = 0.30
-local function _bmStable()
-	return (not _bmFlipAt) or ((os.clock() - _bmFlipAt) > _bmHoldSeconds)
-end
+local buildMenuWatcher = {
+	gui = nil,
+	conn = nil,
+	busy = false,
+}
 
-task.defer(function()
-	local bm = buildMenu() or PlayerGui:WaitForChild("BuildMenu")
-	if not (bm and bm:IsA("ScreenGui")) then dbg_bm("BuildMenu not found; abort hook"); return end
+local function handleBuildMenuStateChange()
+	local bm = buildMenuWatcher.gui
+	if not bm then return end
+	if buildMenuWatcher.busy then
+		dbg_bm("handleBuildMenuStateChange ignored (busy)")
+		return
+	end
+	buildMenuWatcher.busy = true
 
-	-- Prevent re-entrancy if Enabled flips rapidly
-	local applyBusy = false
-	local function apply()
-		if applyBusy then dbg_bm("apply() ignored (busy)"); return end
-		applyBusy = true
+	dbg_bm("BM state -> Enabled=%s OB_ENABLED=%s", tostring(bm.Enabled), bools(_G.OB_ENABLED))
 
-		dbg_bm("apply() BM.Enabled=%s OB_ENABLED=%s", tostring(bm.Enabled), bools(_G.OB_ENABLED))
-
-		-- If onboarding is disabled, hard-clear any UI artifacts and bail
-		if not _G.OB_ENABLED then
-			dbg_bm("OB disabled → clear all UI traces")
-			clearAllUIPulses()
-			clearArrowAndGate()
-			HideArrow("OB-disabled")
-			applyBusy = false
-			return
-		end
-
-		if bm.Enabled then
-			dbg_bm("BM OPEN: clear BuildButton nudge, snapshot commits, applyGate(%s), then orchestrate", tostring(currentGateId))
-			-- Menu just opened: remove the BuildButton nudge and re-apply visual gate
-			bmOpenHintShown = false
-			clearPulseAndArrow("BuildButton")
-
-			-- Snapshot whatever BM currently considers selected as a committed baseline
-			setCommitted(getCurrentMajor(), getCurrentHub(getCurrentMajor()))
-
-			-- Visual-only: highlight/lock allowed button without mutating tab/hub
-			if currentGateId then
-				applyGate(currentGateId)
-			end
-
-			-- Defer routing until BuildMenu has fully realized its layout
-			task.defer(function()
-				-- IMPORTANT: skip showcase route on open
-				arrowAndGateToCurrentStep(true)
-			end)
-		else
-			dbg_bm("BM CLOSE: request BuildButton arrow + hint")
-			-- Menu closed: nudge user to open it
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-			if not bmOpenHintShown then
-				showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-				bmOpenHintShown = true
-			end
-			clearBuildMenuPulsesExcept("BuildButton")
-		end
-
-		applyBusy = false
+	if not _G.OB_ENABLED then
+		clearAllUIPulses()
+		clearArrowAndGate()
+		HideArrow("OB-disabled")
+		buildMenuWatcher.busy = false
+		return
 	end
 
-	bm:GetPropertyChangedSignal("Enabled"):Connect(function()
-		_bmFlipAt = os.clock()               -- ← add this line
-		dbg_bm("BM.Enabled changed -> %s", tostring(bm.Enabled))
-		apply()
+	if bm.Enabled then
+		bmOpenHintShown = false
+		clearPulseAndArrow("BuildButton")
+		if currentGateId then
+			applyGate(currentGateId)
+		end
+		requestBarrage1Kick("BuildMenuOpened")
+		task.defer(function()
+			arrowAndGateToCurrentStep() -- REVERT: do not suppress showcase on open
+		end)
+	else
+		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+		if not bmOpenHintShown then
+			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
+			bmOpenHintShown = true
+		end
+		disconnectClickWatcher("major")
+		disconnectClickWatcher("hub")
+		clearBuildMenuPulsesExcept("BuildButton")
+		committedMajor = nil
+		committedHub   = nil
+		majorHoldUntil = 0
+		hubHoldUntil   = 0
+	end
+
+	buildMenuWatcher.busy = false
+end
+
+local function ensureBuildMenuHook()
+	if buildMenuWatcher.gui then return end
+	local ok, gui = pcall(function()
+		return PlayerGui:WaitForChild("BuildMenu", 5)
 	end)
-	apply()
-end)
+	if not ok or not (gui and gui:IsA("ScreenGui")) then
+		dbg_bm("BuildMenu not available yet; hook deferred")
+		return
+	end
+	buildMenuWatcher.gui = gui
+	buildMenuWatcher.conn = gui:GetPropertyChangedSignal("Enabled"):Connect(handleBuildMenuStateChange)
+	handleBuildMenuStateChange()
+end
 
 ----------------------------
 -- Global toggle handling  --
@@ -1350,9 +1597,10 @@ local function applyToggle(enabled)
 		clearArrowAndGate()
 		clearB2()
 		clearB3()
-		-- reset one-time showcases when disabling
-		barrage1Showcased = {}
+		majorHoldUntil = 0
+		hubHoldUntil   = 0
 	else
+		ensureBuildMenuHook()
 		local id = guardCurrentItem() or getFlowItem()
 		if id then
 			Pulse(id)      -- pulse on enable
@@ -1360,7 +1608,8 @@ local function applyToggle(enabled)
 		end
 		local bm = buildMenu()
 		if bm and bm.Enabled then
-			arrowAndGateToCurrentStep()
+			-- Prevent the arrow from auto-routing while the menu is already open.
+			arrowAndGateToCurrentStep() -- REVERT: do not suppress showcase here
 		else
 			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
 			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
@@ -1442,40 +1691,53 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				local id = reportedItem or (st and st.expected and canonItem(st.expected)) or prevExpected
 				if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
 
+				-- Decide next-step routing before we orchestrate arrows so holds apply immediately
+				local nextHintKey, nextId, showComplete = nil, nil, false
+				if st and st.running and st.current and activeSeq == "barrage1" then
+					local nextIdx = math.min(st.index, #OB1_STEP_HINT_KEYS)
+					nextHintKey = OB1_STEP_HINT_KEYS[nextIdx]
+					nextId = canonItem(st.current.mode or st.current.item)
+					if nextId then
+						scheduleHoldForItem(nextId)
+					end
+				elseif activeSeq == "barrage1" then
+					showComplete = true
+				end
+
 				-- Keep routing fresh: cancel any old showcase and allow a new Supply→Water→Item chain
 				clearBuildMenuPulsesExcept(nil)
 				cancelBarrage1Route()
+				committedMajor = nil
+				committedHub   = nil
 				local bm = buildMenu()
 				if bm and bm.Enabled then
-					arrowAndGateToCurrentStep() -- NOTE: allow the route to run
+					-- Keep the gate active but stop auto-routing; wait for explicit player clicks.
+					arrowAndGateToCurrentStep(true)
 				else
 					requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
 					showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
 				end
 
-				-- Next step hint + re‑pulse next expected item (persists until the next step)
-				if st and st.running and st.current and activeSeq == "barrage1" then
-					local nextIdx = math.min(st.index, #OB1_STEP_HINT_KEYS)
-					local hintKey = OB1_STEP_HINT_KEYS[nextIdx]
-					if hintKey then showOB1(hintKey, DUR.HINT) end
-					local nextId = canonItem(st.current.mode or st.current.item)
-					if nextId then
-						showRoutingHintsForItemId(nextId)
-						task.defer(function()
-							Pulse(nextId)
-							guardPulseItem = nextId
-							-- If same tool remains selected, visibly repulse the tile again
-							repulseSameToolIfNeeded(nextId)
-						end)
-					end
-				elseif activeSeq == "barrage1" then
+				-- Next step hint + re-pulse next expected item (persists until the next step)
+				if nextHintKey then
+					showOB1(nextHintKey, DUR.HINT)
+				end
+				if nextId then
+					showRoutingHintsForItemId(nextId)
+					task.defer(function()
+						Pulse(nextId)
+						guardPulseItem = nextId
+						-- If same tool remains selected, visibly repulse the tile again
+						repulseSameToolIfNeeded(nextId)
+					end)
+				elseif showComplete then
 					showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
 				end
 			end)
 			return
 		end
 
-		-- ===== Legacy / local guard driver path (B2/B3 or pre‑Flow) =====
+		-- ===== Legacy / local guard driver path (B2/B3 or pre-Flow) =====
 		local justDone = math.max(guardIdx, 1)
 		dbg_fb("legacy done justDone=%d", justDone)
 
@@ -1502,6 +1764,10 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			})
 		end)
 
+		if isSecondBarrage3PipeStep(justDone) then
+			forceCloseBuildMenu("B3Pipe2")
+		end
+
 		local id = fbItem or expected
 		if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
 
@@ -1515,7 +1781,35 @@ BE_GuardFB.Event:Connect(function(tag, info)
 		end
 		GuardAdvance()
 
+		local nextGuard = guardSeq[guardIdx]
+		local nextHintKey, nextB2Hint, nextId, legacyShowComplete = nil, nil, nil, false
+		if nextGuard then
+			if activeSeq == "barrage1" then
+				nextHintKey = OB1_STEP_HINT_KEYS[guardIdx]
+				nextId = canonItem(nextGuard.mode or nextGuard.item)
+				if nextId then
+					scheduleHoldForItem(nextId)
+				end
+			elseif activeSeq == "barrage2" then
+				local nid = canonItem(nextGuard.mode or nextGuard.item)
+				if nid == "PowerLines" then
+					nextB2Hint = LANG.OB2_CONNECT_POWER
+				elseif nid == "WaterPipe" then
+					nextB2Hint = LANG.OB2_CONNECT_WATER
+				end
+				nextId = nid
+			else
+				nextId = canonItem(nextGuard.mode or nextGuard.item)
+			end
+		else
+			if activeSeq == "barrage1" then
+				legacyShowComplete = true
+			end
+		end
+
 		clearBuildMenuPulsesExcept(nil)
+		committedMajor = nil
+		committedHub   = nil
 		local bm = buildMenu()
 		if bm and bm.Enabled then
 			arrowAndGateToCurrentStep()
@@ -1524,28 +1818,22 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
 		end
 
-		if guardSeq[guardIdx] then
-			if activeSeq == "barrage1" then
-				local hintKey = OB1_STEP_HINT_KEYS[guardIdx]
-				if hintKey then showOB1(hintKey, DUR.HINT) end
-			elseif activeSeq == "barrage2" then
-				local nid = canonItem(guardSeq[guardIdx].mode or guardSeq[guardIdx].item)
-				if nid == "PowerLines" then
-					showB2(LANG.OB2_CONNECT_POWER, DUR.HINT)
-				elseif nid == "WaterPipe" then
-					showB2(LANG.OB2_CONNECT_WATER, DUR.HINT)
-				end
+		if nextGuard then
+			if activeSeq == "barrage1" and nextHintKey then
+				showOB1(nextHintKey, DUR.HINT)
+			elseif activeSeq == "barrage2" and nextB2Hint then
+				showB2(nextB2Hint, DUR.HINT)
 			end
-			local nextId = canonItem(guardSeq[guardIdx].mode or guardSeq[guardIdx].item)
 			if nextId then
 				showRoutingHintsForItemId(nextId)
 				Pulse(nextId)
 				guardPulseItem = nextId
+				if activeSeq == "barrage3" then
+					repulseSameToolIfNeeded(nextId)
+				end
 			end
-		else
-			if activeSeq == "barrage1" then
-				showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
-			end
+		elseif legacyShowComplete then
+			showOB1(LANG.OB1_COMPLETE, DUR.COMPLETE)
 		end
 
 		-- ===== CANCELED =====
@@ -1646,14 +1934,14 @@ local function bmGateOnly(id, offset)
 	local bm = buildMenu()
 	if not (bm and bm.Enabled) then
 		dbg_bm("bmGateOnly(%s) while BM closed → orchestrate()", tostring(id))
-		-- IMPORTANT: skip showcase route if BM is closed
-		arrowAndGateToCurrentStep(true)
+		-- IMPORTANT: do not suppress showcase based on BM state
+		arrowAndGateToCurrentStep() -- REVERT
 		return
 	end
 
 	local wantMajor, wantHub = majorForItem(id), hubForItem(id)
-	local curMajor = getCommittedMajor()
-	local curHub   = getCommittedHub(curMajor)
+	local curMajor = getCommittedMajor() or getCurrentMajor(true)
+	local curHub   = getCommittedHub(curMajor) or getCurrentHub(curMajor, true)
 	dbg_bm("bmGateOnly id=%s wantMajor=%s wantHub=%s curMajor=%s curHub=%s", tostring(id), tostring(wantMajor), tostring(wantHub), tostring(curMajor), tostring(curHub))
 
 	-- If already on the item, gentle BM repulse in B1 to reaffirm the step
@@ -1675,37 +1963,55 @@ local function bmGateOnly(id, offset)
 		dbg_bm("bmGateOnly target major key=%s", tostring(key))
 		requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.12,0))
 
-		-- Always watch for stable commit
-		hubWatchToken += 1
-		local my = hubWatchToken
-		local want = wantMajor
-		task.spawn(function()
-			if my ~= hubWatchToken then return end
-			local ok = pollCommittedEquality(function() return getCurrentMajor(true) end, want, COMMIT_TIMEOUT, COMMIT_STABLE)
-			if ok and my == hubWatchToken then
-				setCommitted(want, nil)
-				bmGateOnly(id, offset)
-			end
+		local clickArmed = connectClickWatcher("major", key, function()
+			setCommitted(wantMajor, nil)
+			bmGateOnly(id, offset)
 		end)
 
+		if allowAutoCommit() or not clickArmed then
+			-- Always watch for stable commit
+			hubWatchToken += 1
+			local my = hubWatchToken
+			local want = wantMajor
+			task.spawn(function()
+				if my ~= hubWatchToken then return end
+				local ok = pollCommittedEquality(function() return getCurrentMajor(true) end, want, COMMIT_TIMEOUT, COMMIT_STABLE)
+				if ok and my == hubWatchToken then
+					setCommitted(want, nil)
+					bmGateOnly(id, offset)
+				end
+			end)
+		end
+
 	else
+		disconnectClickWatcher("major")
 		if wantHub and (curHub ~= wantHub) then
 			key = resolveHubKey(wantMajor or "Supply", wantHub) or resolveMajorKey("Supply")
 			dbg_bm("bmGateOnly target hub key=%s", tostring(key))
 			requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.12,0))
 
-			hubWatchToken += 1
-			local my = hubWatchToken
-			task.spawn(function()
-				if my ~= hubWatchToken then return end
-				local ok = pollCommittedEquality(function() return getCurrentHub(wantMajor) end, wantHub, COMMIT_TIMEOUT, COMMIT_STABLE)
-				if ok and my == hubWatchToken then
-					setCommitted(nil, wantHub)
-					bmGateOnly(id, offset)
-				end
+			local clickArmed = connectClickWatcher("hub", key, function()
+				setCommitted(nil, wantHub)
+				bmGateOnly(id, offset)
 			end)
+
+			if allowAutoCommit() or not clickArmed then
+				hubWatchToken += 1
+				local my = hubWatchToken
+				task.spawn(function()
+					if my ~= hubWatchToken then return end
+					local ok = pollCommittedEquality(function() return getCurrentHub(wantMajor) end, wantHub, COMMIT_TIMEOUT, COMMIT_STABLE)
+					if ok and my == hubWatchToken then
+						setCommitted(nil, wantHub)
+						bmGateOnly(id, offset)
+					end
+				end)
+			end
 		else
-			key = "BM_"..id
+			if not wantHub then
+				disconnectClickWatcher("hub")
+			end
+			key = "BM_" .. tostring(id) -- REVERT: direct item key
 			dbg_bm("bmGateOnly target item key=%s", tostring(key))
 			requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.18,0))
 		end
@@ -1719,6 +2025,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		if not _G.OB_ENABLED then applyToggle(true) end
 		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
 		showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
+		requestBarrage1Kick("ShowArrow_BuildMenu")
 		return
 	end
 	if stepName == "UIPulse_Start" and typeof(payload)=="table" and type(payload.key)=="string" then
@@ -1783,27 +2090,23 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		-- Begin banner only on a true start (not resume)
 		if resumeAt <= 1 then showOB1(LANG.OB1_BEGIN, DUR.BEGIN) end
 
-		-- ADD: reset one-time showcases on fresh start
-		if resumeAt <= 1 then
-			barrage1Showcased = {}
-		end
-
 		-- Pulse & route to the current expected tool.
 		local st = (Flow and type(Flow.GetState)=="function") and Flow.GetState() or nil
 		local cur = st and st.current
 		if cur then
 			local id = canonItem(cur.mode or cur.item)
 			if id then
+				scheduleHoldForItem(id)
 				Pulse(id)
 				guardPulseItem = id
 			end
 		end
 
-		-- Only run the showcase automatically on a true start; skip when resuming
+		-- Auto-run showcase on true start; suppress on resume
 		if resumeAt <= 1 then
-			arrowAndGateToCurrentStep()
+			arrowAndGateToCurrentStep()       -- allow showcase route
 		else
-			arrowAndGateToCurrentStep(true)
+			arrowAndGateToCurrentStep(true)   -- suppress showcase on resume
 		end
 		return
 	end
@@ -1907,6 +2210,13 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		local function barrage3()
 			return {
 				{ item="Industrial", mode="Industrial", kind="rect", from=from, to=to, requireExactEnd=true },
+				{ item="Road",       mode="DirtRoad",   kind="line", from={x=-4, z=6},  to={x=-4, z=15}, requireExactEnd=true },
+				{ item="Road",       mode="DirtRoad",   kind="line", from={x=0,  z=11}, to={x=-4, z=11}, requireExactEnd=true },
+				{ item="WaterPipe",  mode="WaterPipe",  kind="line", from={x=-7, z=6},  to={x=-7, z=15}, requireExactEnd=true },
+				{ item="WaterPipe",  mode="WaterPipe",  kind="line", from={x=3,  z=11}, to={x=-8, z=11}, requireExactEnd=true },
+				{ item="PowerLines", mode="PowerLines", kind="line", from={x=2,  z=0},  to={x=-6, z=0},  requireExactEnd=true },
+				{ item="PowerLines", mode="PowerLines", kind="line", from={x=-6, z=0}, to={x=-6, z=15}, requireExactEnd=true },
+				{ item="SolarPanels",mode="SolarPanels",kind="point",from={x=-7, z=6}, requireExactEnd=true },
 			}
 		end
 		GuardStart(barrage3(), 1)
@@ -1945,7 +2255,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 end)
 
 ---------------------
--- Self‑nudge seed --
+-- Self-nudge seed --
 ---------------------
 task.delay(0.40, function()
 	if _G.OB_ENABLED then

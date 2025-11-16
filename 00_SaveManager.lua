@@ -10,6 +10,18 @@ local function LOG(...)
 end
 LOG("==== INIT SaveManager script ====")
 
+local function expectChild(parent: Instance, childName: string, className: string, timeout: number?)
+	local inst = parent:FindFirstChild(childName)
+	if inst and inst:IsA(className) then
+		return inst
+	end
+	local ok, result = pcall(parent.WaitForChild, parent, childName, timeout or 5)
+	if ok and result and result:IsA(className) then
+		return result
+	end
+	error(string.format("SaveManager missing %s '%s' under %s", className, childName, parent:GetFullName()))
+end
+
 ----------------------------------------------------------------
 --  Core services
 ----------------------------------------------------------------
@@ -18,6 +30,7 @@ local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local Workspace          = game:GetService("Workspace")
 local HttpService        = game:GetService("HttpService")
 local RunService         = game:GetService("RunService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 local EventsFolder    = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents  = EventsFolder:WaitForChild("BindableEvents")
@@ -32,44 +45,12 @@ local NetworksPostLoad0 = BindableEvents:FindFirstChild("NetworksPostLoad")
 -- External (from UnlockManager.server.lua)
 local GetUnlocksForPlayer = BindableEvents:WaitForChild("GetUnlocksForPlayer") -- BindableFunction
 
--- Local/internal safety helpers to ensure events exist
-local function ensureBindableEvent(folder: Instance, name: string): BindableEvent
-	local ev = folder:FindFirstChild(name)
-	if not ev then
-		ev = Instance.new("BindableEvent")
-		ev.Name = name
-		ev.Parent = folder
-	end
-	return ev :: BindableEvent
-end
-
-local function ensureFolder(parent: Instance, name: string): Instance
-	local f = parent:FindFirstChild(name)
-	if not f then
-		f = Instance.new("Folder")
-		f.Name = name
-		f.Parent = parent
-	end
-	return f
-end
-
-local function ensureRemoteEvent(eventsRoot: Instance, sub: string, name: string): RemoteEvent
-	local folder = ensureFolder(eventsRoot, sub)
-	local ev = folder:FindFirstChild(name)
-	if not ev then
-		ev = Instance.new("RemoteEvent")
-		ev.Name = name
-		ev.Parent = folder
-	end
-	return ev :: RemoteEvent
-end
-
 -- Internal stage notifications to listeners (suspend/resume consumers)
-local WorldReloadBeginBE = ensureBindableEvent(BindableEvents, "WorldReloadBegin")
-local WorldReloadEndBE   = ensureBindableEvent(BindableEvents, "WorldReloadEnd")
+local WorldReloadBeginBE = expectChild(BindableEvents, "WorldReloadBegin", "BindableEvent")
+local WorldReloadEndBE   = expectChild(BindableEvents, "WorldReloadEnd", "BindableEvent")
 
 -- Remote to relay world reload + progress to client
-local WorldReloadRE = ensureRemoteEvent(EventsFolder, "RemoteEvents", "WorldReload")
+local WorldReloadRE = expectChild(RemoteEvents, "WorldReload", "RemoteEvent")
 
 ----------------------------------------------------------------
 --  Dependencies
@@ -85,6 +66,9 @@ local ZoneTracker         = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local ZoneRequirementsCheck = require(ZoneMgr:WaitForChild("ZoneRequirementsCheck"))
 local EconomyService      = require(ZoneMgr:WaitForChild("EconomyService"))
 local CityInteractions    = require(ZoneMgr:WaitForChild("CityInteraction"))
+local CoreConcepts        = Zones:WaitForChild("CoreConcepts")
+local PowerGenFolder      = CoreConcepts:WaitForChild("PowerGen")
+local PowerGeneratorModule = require(PowerGenFolder:WaitForChild("PowerGenerator"))
 
 local Transport           = Bld:WaitForChild("Transport")
 local Roads               = Transport:WaitForChild("Roads")
@@ -127,13 +111,31 @@ local function count(tbl)
 end
 
 local function waitForPlotName(player: Player, timeoutSec: number?): string?
-	local t0, T = os.clock(), (timeoutSec or 5)
 	local name = player:GetAttribute("PlotName")
-	while not name and os.clock() - t0 < T do
-		task.wait(0.1)
-		name = player:GetAttribute("PlotName")
+	if name then
+		return name
 	end
-	return name
+
+	local deadline = os.clock() + (timeoutSec or 5)
+	local signal = player:GetAttributeChangedSignal("PlotName")
+	local conn
+
+	conn = signal:Connect(function()
+		local current = player:GetAttribute("PlotName")
+		if current then
+			name = current
+		end
+	end)
+
+	while not name and os.clock() < deadline do
+		RunService.Heartbeat:Wait()
+	end
+
+	if conn then
+		conn:Disconnect()
+	end
+
+	return name or player:GetAttribute("PlotName")
 end
 
 local function safeB64(s: string?): string
@@ -578,7 +580,7 @@ _connectIfBE("BuildingsPlaced", function(player: Player, zoneId: string, _count:
 end)
 
 -- **Call this when a bucket/cluster finishes** (recommended).
-local ZoneBlueprintChangedBE = ensureBindableEvent(BindableEvents, "ZoneBlueprintChanged")
+local ZoneBlueprintChangedBE = expectChild(BindableEvents, "ZoneBlueprintChanged", "BindableEvent")
 ZoneBlueprintChangedBE.Event:Connect(function(player: Player, zoneId: string, opts: any)
 	_refreshZoneBlueprintAndMaybeSave(player, zoneId, (opts and opts.reason) or "ZoneBlueprintChanged")
 end)
@@ -759,7 +761,7 @@ end)
 ----------------------------------------------------------------
 --  HARD WIPE before LOAD (critical for slot switching)
 ----------------------------------------------------------------
-local ZoneRemovedBE = ensureBindableEvent(BindableEvents, "ZoneRemoved")
+local ZoneRemovedBE = expectChild(BindableEvents, "ZoneRemoved", "BindableEvent")
 
 -- [NEW] Per-player coalescer for saves triggered by zone deletions
 local _zoneDeleteSaveCoalesce : { [Player]: boolean } = {}
@@ -854,8 +856,8 @@ local function isNetworkRow(r)
 end
 
 -- Remote for early UI handoff (+ ack)
-local PlotAssignedEvent = ensureRemoteEvent(EventsFolder, "RemoteEvents", "PlotAssigned")
-local PlotAssignedAck   = ensureRemoteEvent(EventsFolder, "RemoteEvents", "PlotAssignedAck")
+local PlotAssignedEvent = expectChild(RemoteEvents, "PlotAssigned", "RemoteEvent")
+local PlotAssignedAck   = expectChild(RemoteEvents, "PlotAssignedAck", "RemoteEvent")
 local function sendPlotAssignedWithAck(plr: Player, plotName: string, unlocks: table)
 	local gotAck = false
 	local conn : RBXScriptConnection? = nil
@@ -1291,16 +1293,13 @@ local function runLoadSlice(state, budgetMs)
 		-- Top off to 100% and "Finalizing"
 		_sendProgress(state, PHASE_RANGES.F.max, PHASE_RANGES.F.key)
 
-		local NetworksPostLoadBE = ensureBindableEvent(BindableEvents, "NetworksPostLoad")
+		local NetworksPostLoadBE = expectChild(BindableEvents, "NetworksPostLoad", "BindableEvent")
 		NetworksPostLoadBE:Fire(player)
 
-		local okPower, PowerGeneratorModule2 = pcall(function()
-			local CC = Zones:WaitForChild("CoreConcepts")
-			local PG = CC:FindFirstChild("PowerGen")
-			return PG and require(PG:WaitForChild("PowerGenerator"))
-		end)
-		if okPower and PowerGeneratorModule2 and typeof(PowerGeneratorModule2.rebuildRopesForAll) == "function" then
-			pcall(function() PowerGeneratorModule2.rebuildRopesForAll(player) end)
+		if typeof(PowerGeneratorModule.rebuildRopesForAll) == "function" then
+			pcall(function()
+				PowerGeneratorModule.rebuildRopesForAll(player)
+			end)
 		end
 
 		-- [ADD] One-time, full-plot intersection/deco rebuild only for old saves with no deco snapshot
@@ -1710,7 +1709,7 @@ end
 ----------------------------------------------------------------
 --  Global scheduler (LOAD + SAVE wheels)
 ----------------------------------------------------------------
-RunService.Heartbeat:Connect(function(_dt)
+RunServiceScheduler.onHeartbeat(function(_dt)
 	-- LOAD wheel (existing)
 	_wheelIndex = (_wheelIndex % LOAD_WHEEL_DIV) + 1
 	local budgetMsLoad = LOAD_BUDGET_MS_PER_SLICE
@@ -1790,7 +1789,7 @@ end
 ----------------------------------------------------------------
 --  NEW: external reload hook used by SwitchToSlot
 ----------------------------------------------------------------
-local RequestReloadFromCurrent = ensureBindableEvent(BindableEvents, "RequestReloadFromCurrent")
+local RequestReloadFromCurrent = expectChild(BindableEvents, "RequestReloadFromCurrent", "BindableEvent")
 
 RequestReloadFromCurrent.Event:Connect(function(plr: Player)
 	LOG("ReloadFromCurrent requested for", plr and plr.Name or "<nil>")

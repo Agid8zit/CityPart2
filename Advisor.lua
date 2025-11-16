@@ -45,6 +45,7 @@ local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local RunService          = game:GetService("RunService")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 local ZoneTracker = require(ServerScriptService.Build.Zones.ZoneManager.ZoneTracker)
 
@@ -68,6 +69,33 @@ local DevProductsModule do
 	end)
 	DevProductsModule = ok and mod or nil
 end
+
+-- Cache the explicit level-0 unlock list from Balance so we can spot devproducts even if the module fails.
+local LEVEL0_UNLOCKS: { [string]: boolean } = {}
+do
+	local cfg = Balance and Balance.ProgressionConfig
+	local lvl0 = cfg and cfg.unlocksByLevel and cfg.unlocksByLevel[0]
+	if type(lvl0) == "table" then
+		for _, feature in ipairs(lvl0) do
+			if type(feature) == "string" then
+				LEVEL0_UNLOCKS[feature] = true
+			end
+		end
+	end
+end
+
+-- Some level-0 items are core gameplay (not devproducts) and must never be flagged.
+local LEVEL0_WHITELIST = {
+	Residential   = true,
+	Commercial    = true,
+	Industrial    = true,
+	DirtRoad      = true,
+	WaterTower    = true,
+	WaterPipe     = true,
+	WindTurbine   = true,
+	PowerLines    = true,
+	Flags         = true,
+}
 
 local Events         = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents = Events:WaitForChild("BindableEvents")
@@ -287,9 +315,19 @@ end
 -- NEW HELPERS FOR DEVPRODUCT GATING
 ----------------------------------------------------------------
 local function isDevProductFeature(featureName: string): boolean
-	return DevProductsModule ~= nil
-		and DevProductsModule.Has ~= nil
-		and DevProductsModule.Has(featureName) == true
+	if DevProductsModule ~= nil and DevProductsModule.Has ~= nil then
+		local ok, result = pcall(DevProductsModule.Has, featureName)
+		if ok and result == true then
+			return true
+		end
+	end
+
+	-- Fallback: treat explicit level-0 Balance unlocks (excluding whitelisted basics) as devproducts.
+	if LEVEL0_UNLOCKS[featureName] and not LEVEL0_WHITELIST[featureName] then
+		return true
+	end
+
+	return false
 end
 
 local function playerHasBuiltFeature(player: Player, featureName: string): boolean
@@ -297,6 +335,16 @@ local function playerHasBuiltFeature(player: Player, featureName: string): boole
 	if not zones then return false end
 	for zid, z in pairs(zones) do
 		if z.mode == featureName and isZonePopulated(player, zid) then
+			return true
+		end
+	end
+	return false
+end
+
+local function playerHasDevProductPlacement(player: Player, categoryName: string): boolean
+	local bag = CATEGORY[categoryName]; if type(bag) ~= "table" then return false end
+	for featureName in pairs(bag) do
+		if isDevProductFeature(featureName) and playerHasBuiltFeature(player, featureName) then
 			return true
 		end
 	end
@@ -321,6 +369,32 @@ local function bestUnlockedProgressionFeature(player: Player, categoryName: stri
 		end
 	end
 	return bestFeat
+end
+
+-- Absolute top-tier non-dev progression feature for this category (independent of player unlocks).
+local _topProgressionCache: { [string]: string | false } = {}
+local function topProgressionFeature(categoryName: string): string?
+	if _topProgressionCache[categoryName] ~= nil then
+		return _topProgressionCache[categoryName] or nil
+	end
+
+	local bag = CATEGORY[categoryName]
+	local bestName, bestScore = nil, -math.huge
+	if type(bag) == "table" then
+		for featureName in pairs(bag) do
+			if not isDevProductFeature(featureName) then
+				local tier = (UXP_TIER :: any)[featureName]
+				local score = (type(tier) == "number" and tier) or (Progression and Progression.getRequiredLevel and Progression.getRequiredLevel(featureName)) or 0
+				if score > bestScore then
+					bestScore = score
+					bestName = featureName
+				end
+			end
+		end
+	end
+
+	_topProgressionCache[categoryName] = bestName or false
+	return bestName
 end
 
 ----------------------------------------------------------------
@@ -480,21 +554,12 @@ local function isCategoryUnlocked(player: Player, categoryName: string): boolean
 	--    We only allow a DP to make the category "advisable" if BOTH:
 	--       (a) the player has at least one devproduct instance in this category placed, AND
 	--       (b) the current max progression tier for this category is already PRESENT (built) in the city.
-	if DevProductsModule then
-		local hasAnyDPPlaced = false
-		for featureName, _ in pairs(bag) do
-			if isDevProductFeature(featureName) and playerHasBuiltFeature(player, featureName) then
-				hasAnyDPPlaced = true
-				break
-			end
-		end
-		if hasAnyDPPlaced then
-			-- Must also have the highest available progression tier already present (built).
-			-- If there is no progression tier unlocked yet, or it's not placed, we keep the category locked.
-			local highestPlacedProg = bestUnlockedProgressionFeature(player, categoryName)
-			if highestPlacedProg and playerHasBuiltFeature(player, highestPlacedProg) then
-				return true
-			end
+	local hasAnyDPPlaced = playerHasDevProductPlacement(player, categoryName)
+	if hasAnyDPPlaced then
+		-- Require the absolute top non-dev progression feature (from Balance) to be present in the city.
+		local topFeat = topProgressionFeature(categoryName)
+		if topFeat and playerHasBuiltFeature(player, topFeat) then
+			return true
 		end
 	end
 
@@ -567,7 +632,7 @@ end
 local function startHeartbeat()
 	if heartbeatConn then return end
 	local t = 0
-	heartbeatConn = RunService.Heartbeat:Connect(function(dt)
+	heartbeatConn = RunServiceScheduler.onHeartbeat(function(dt)
 		t += dt
 		for inst, info in pairs(ActiveReq) do
 			if inst.Parent then
@@ -594,7 +659,10 @@ local function startHeartbeat()
 				ActiveReq[inst] = nil
 			end
 		end
-		if next(ActiveReq) == nil then heartbeatConn:Disconnect(); heartbeatConn=nil end
+		if next(ActiveReq) == nil and heartbeatConn then
+			heartbeatConn()
+			heartbeatConn = nil
+		end
 	end)
 end
 

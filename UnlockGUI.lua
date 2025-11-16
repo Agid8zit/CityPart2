@@ -6,6 +6,7 @@ local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
 local UserInputService  = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
 
 -- Root & deps
 local UI = script.Parent :: ScreenGui
@@ -19,7 +20,7 @@ local SPIN_B_DPS        = 50
 
 -- State
 local OpenTime          = 0
-local SpinConn          : RBXScriptConnection? = nil
+local SpinConn          : (() -> ())? = nil
 local ResizeConn        : RBXScriptConnection? = nil
 local InputConn         : RBXScriptConnection? = nil
 local TempFrames        : {Instance} = {}
@@ -73,7 +74,7 @@ local function destroyTempFrames()
 end
 
 local function disconnectSignals()
-	if SpinConn then SpinConn:Disconnect(); SpinConn = nil end
+	if SpinConn then SpinConn(); SpinConn = nil end
 	if InputConn then InputConn:Disconnect(); InputConn = nil end
 	-- Keep ResizeConn alive after Init (one shared listener), don’t kill it in OnHide.
 end
@@ -240,7 +241,7 @@ function UnlockGui._present(UnlockName: string, Description: string, Entries: {a
 
 	-- Spin
 	if not SpinConn and (UI_SpinA or UI_SpinB) then
-		SpinConn = RunService.Heartbeat:Connect(function(dt)
+		SpinConn = RunServiceScheduler.onHeartbeat(function(dt)
 			if UI_SpinA then UI_SpinA.Rotation += SPIN_A_DPS * dt end
 			if UI_SpinB then UI_SpinB.Rotation += SPIN_B_DPS * dt end
 		end)

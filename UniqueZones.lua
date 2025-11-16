@@ -26,17 +26,24 @@ local function ensureBindableEvent(container: Instance, name: string): BindableE
 	return ev
 end
 
+-- Unlock events (created if missing) 
+local FireSupportUnlocked   = ensureBindableEvent(BindableEvents, "FireSupportUnlocked")
+local PoliceSupportUnlocked = ensureBindableEvent(BindableEvents, "PoliceSupportUnlocked")
+local HealthSupportUnlocked = ensureBindableEvent(BindableEvents, "HealthSupportUnlocked")
+local TrashSupportUnlocked  = ensureBindableEvent(BindableEvents, "TrashSupportUnlocked")
+local BusSupportUnlocked    = ensureBindableEvent(BindableEvents, "BusSupportUnlocked")
+local AirSupportUnlocked    = ensureBindableEvent(BindableEvents, "AirSupportUnlocked")
+
 -- External interaction handlers 
 local UniqueZoneInteractions = script:WaitForChild("UniqueZoneInteractions")
 local FireHandler    = require(UniqueZoneInteractions:WaitForChild("Fire"))
+local PoliceHandler  = require(UniqueZoneInteractions:WaitForChild("Police"))
+local HealthHandler  = require(UniqueZoneInteractions:WaitForChild("Health"))
+local TrashHandler   = require(UniqueZoneInteractions:WaitForChild("Trash"))
 local BusHandler     = require(UniqueZoneInteractions:WaitForChild("Bus"))
 local AirportHandler = require(UniqueZoneInteractions:WaitForChild("Airport"))
 
 -- Unlock events (created if missing) 
-local FireSupportUnlocked = ensureBindableEvent(BindableEvents, "FireSupportUnlocked")
-local BusSupportUnlocked  = ensureBindableEvent(BindableEvents, "BusSupportUnlocked")
-local AirSupportUnlocked  = ensureBindableEvent(BindableEvents, "AirSupportUnlocked")
-
 -- NEW: Revocation events for Bus/Air
 local BusSupportRevoked = ensureBindableEvent(BindableEvents, "BusSupportRevoked")
 local AirSupportRevoked = ensureBindableEvent(BindableEvents, "AirSupportRevoked")
@@ -46,17 +53,23 @@ local RE_MetroSupportStatus = RE.MetroSupportStatus
 
 -- Per-player unlock caches (prevents double-firing) 
 local unlockedCache = {
-	Fire = {}, -- remains unlock-only
-	Bus  = {}, -- boolean flag per UserId when unlocked
-	Air  = {}, -- boolean flag per UserId when unlocked
+	Fire   = {}, -- remains unlock-only
+	Police = {},
+	Health = {},
+	Trash  = {},
+	Bus    = {}, -- boolean flag per UserId when unlocked
+	Air    = {}, -- boolean flag per UserId when unlocked
 	Metro = {},
 }
 
 -- Zone type groups (edit to taste) 
 local GROUPS = {
-	Fire = { "FireDept", "FirePrecinct", "FireStation" },
-	Bus  = { "BusDepot" },
-	Air  = { "Airport" },
+	Fire   = { "FireDept", "FirePrecinct", "FireStation" },
+	Police = { "PoliceDept", "PolicePrecinct", "PoliceStation" },
+	Health = { "SmallClinic", "LocalHospital", "CityHospital", "MajorHospital" },
+	Trash  = { "Industrial", "IndusDense" },
+	Bus    = { "BusDepot" },
+	Air    = { "Airport" },
 	Metro = { "MetroEntrance" },
 }
 
@@ -72,6 +85,20 @@ local function anyTypeOwned(player, typesList: {string})
 		end
 	end
 	return false
+end
+
+local function unlockSupportOnce(player, cacheKey: string, label: string, event: BindableEvent?, handler)
+	local hasAny = anyTypeOwned(player, GROUPS[cacheKey])
+	dprint(("Has %s Support: %s"):format(label, hasAny and "Yes" or "No"))
+	if hasAny and not unlockedCache[cacheKey][player.UserId] then
+		unlockedCache[cacheKey][player.UserId] = true
+		if event then event:Fire(player) end
+		dprint(string.format("[UniqueZones] Fired %sSupportUnlocked for %s", label, player.Name))
+		if handler and handler.onSupportUnlocked then
+			handler.onSupportUnlocked(player)
+		end
+	end
+	return hasAny
 end
 
 -- Internal: reevaluate with unlock + revoke (Bus/Air only) 
@@ -145,17 +172,11 @@ function UniqueZones.printZoneTypeCounts(player)
 	local uniqueCount = ZoneTracker.getUniqueZoneTypeCount(player)
 	dprint("Unique Zone Types:", uniqueCount)
 
-	-- === Fire support (unlock-only; no revoke) ===
-	local hasFire = anyTypeOwned(player, GROUPS.Fire)
-	dprint("Has Fire Support:", hasFire and "Yes" or "No")
-	if hasFire and not unlockedCache.Fire[player.UserId] then
-		unlockedCache.Fire[player.UserId] = true
-		FireSupportUnlocked:Fire(player)
-		dprint("[UniqueZones] Fired FireSupportUnlocked for", player.Name)
-		if FireHandler and FireHandler.onSupportUnlocked then
-			FireHandler.onSupportUnlocked(player)
-		end
-	end
+	-- === Fire / Police / Health / Trash support (unlock-only; no revoke) ===
+	unlockSupportOnce(player, "Fire", "Fire", FireSupportUnlocked, FireHandler)
+	unlockSupportOnce(player, "Police", "Police", PoliceSupportUnlocked, PoliceHandler)
+	unlockSupportOnce(player, "Health", "Health", HealthSupportUnlocked, HealthHandler)
+	unlockSupportOnce(player, "Trash", "Trash", TrashSupportUnlocked, TrashHandler)
 
 	-- === Bus support (unlock + revoke) ===
 	dprint("Has Bus Support:", anyTypeOwned(player, GROUPS.Bus) and "Yes" or "No")
@@ -224,6 +245,7 @@ game:GetService("Players").PlayerAdded:Connect(function(plr)
 		local hasMetro = counts and (counts.MetroEntrance or 0) > 0
 		if hasMetro then unlockedCache.Metro[plr.UserId] = true end
 		if RE_MetroSupportStatus then RE_MetroSupportStatus:FireClient(plr, hasMetro) end
+
 	end)
 end)
 

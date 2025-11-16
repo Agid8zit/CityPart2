@@ -13,6 +13,8 @@ local WORDS_PER_MINUTE = 230
 local MIN_HOLD_SECONDS = 2.5          -- floor so short lines don't vanish
 local FADE_IN_SECONDS  = 0.25
 local FADE_OUT_SECONDS = 0.35
+local MAX_ACTIVE_BUBBLES = 1          -- concurrent bubbles allowed (<=0 disables limit)
+local GLOBAL_BUBBLE_COOLDOWN = 3.0    -- seconds between bubbles once the prior one fades
 
 ---------------------------------------------------------------------
 -- Template lookup (error fast if missing)
@@ -221,6 +223,42 @@ end
 ---------------------------------------------------------------------
 -- Per-model sequence number so a newer line cancels older animations.
 local ActiveSeq = setmetatable({}, { __mode = "k" }) -- weak keys so models can GC
+local bubbleTokens = setmetatable({}, { __mode = "k" })
+local activeBubbleCount = 0
+local lastBubbleReleasedAt = 0
+
+local function tryAcquireBubbleSlot(model)
+	if not model then return nil end
+	local token = {}
+	if bubbleTokens[model] then
+		bubbleTokens[model] = token
+		return token
+	end
+	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 then
+		if activeBubbleCount >= MAX_ACTIVE_BUBBLES then
+			return nil
+		end
+		if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and activeBubbleCount == 0 then
+			local since = os.clock() - lastBubbleReleasedAt
+			if since < GLOBAL_BUBBLE_COOLDOWN then
+				return nil
+			end
+		end
+		activeBubbleCount += 1
+	end
+	bubbleTokens[model] = token
+	return token
+end
+
+local function releaseBubbleSlot(model, token)
+	if not model then return end
+	if bubbleTokens[model] ~= token then return end
+	bubbleTokens[model] = nil
+	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 and activeBubbleCount > 0 then
+		activeBubbleCount -= 1
+		lastBubbleReleasedAt = os.clock()
+	end
+end
 
 local function words_in(s: string): number
 	local n = 0
@@ -242,11 +280,15 @@ local function show_then_fade(model: Model, root: Instance, text: string)
 
 	-- Collect gui objects for fading
 	local guiList = collectGuiObjectsForFade(root)
+	local slotToken = tryAcquireBubbleSlot(model)
+	if not slotToken then
+		return
+	end
 	-- Start hidden
 	setGuiAlpha(guiList, 1.0)
 
 	-- Fade in
-	local fadeInTweens = tweenGuiAlpha(guiList, 1.0, 0.0, FADE_IN_SECONDS)
+	tweenGuiAlpha(guiList, 1.0, 0.0, FADE_IN_SECONDS)
 
 	-- Hold for reading time
 	local holdSeconds = compute_hold_seconds(text)
@@ -255,9 +297,14 @@ local function show_then_fade(model: Model, root: Instance, text: string)
 		-- Wait fade in + hold
 		task.wait(FADE_IN_SECONDS + holdSeconds)
 		-- If a newer line arrived, abort
-		if ActiveSeq[model] ~= seq then return end
+		if ActiveSeq[model] ~= seq then
+			releaseBubbleSlot(model, slotToken)
+			return
+		end
 		-- Fade out
 		tweenGuiAlpha(guiList, 0.0, 1.0, FADE_OUT_SECONDS)
+		task.wait(FADE_OUT_SECONDS)
+		releaseBubbleSlot(model, slotToken)
 	end)
 end
 

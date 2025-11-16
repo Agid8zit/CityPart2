@@ -102,7 +102,7 @@ local function teleportPlayerToPlot(player, plot)
 		warn(string.format("Teleport: Player '%s' is missing Humanoid or HumanoidRootPart.", player.Name))
 		return
 	end
-	
+
 	-- Wait until the character is fully loaded and alive
 	if humanoid.Health <= 0 then
 		humanoid.Died:Wait()
@@ -119,7 +119,7 @@ local function teleportPlayerToPlot(player, plot)
 	-- Calculate spawn position relative to the plot's PrimaryPart
 	local spawnOffset = Vector3.new(0, 5, 0)  -- Adjust Y as needed
 	local targetCFrame = plot.PrimaryPart.CFrame * CFrame.new(spawnOffset)
-	
+
 	-- Teleport the character
 	character:PivotTo(targetCFrame)
 	--humanoidRootPart.CFrame = targetCFrame
@@ -199,6 +199,29 @@ local function disableQueryingInPlot(plotModel)
 	end
 end
 
+local function setPlotOddEvenAttributes(plotModel: Model?)
+	if not plotModel then
+		return
+	end
+
+	local primaryPart = plotModel.PrimaryPart
+	if not primaryPart then
+		return
+	end
+
+	local orientationY = primaryPart.Orientation.Y % 360
+	if orientationY < 0 then
+		orientationY += 360
+	end
+
+	local tolerance = 1e-3
+	local isOddOrientation = (orientationY <= tolerance) or (orientationY >= (360 - tolerance))
+	local isEvenOrientation = math.abs(orientationY - 180) <= tolerance
+
+	plotModel:SetAttribute("Odd", isOddOrientation)
+	plotModel:SetAttribute("Even", isEvenOrientation)
+end
+
 assert(ServerStorage.PlotTemplates.TestTerrain.PrimaryPart, "Missing PrimaryPart for ServerStorage/PlotTemplates/TestTerrain")
 
 -- Event: Player Added
@@ -218,29 +241,48 @@ Players.PlayerAdded:Connect(function(player)
 	local playerPlot = plotTemplate:Clone()
 	disableQueryingInPlot(playerPlot)
 	playerPlot.Name = "Plot_" .. player.UserId
+	playerPlot:SetAttribute("IsPlayerPlot", true)
+	playerPlot:SetAttribute("PlotOwnerId", player.UserId)
 	playerPlot.OwnerSign.SurfaceGui.TextLabel.Text = player.Name.."'s Plot"
 	playerPlot.Parent = plotsFolder
-	
+
+	-- Determine mirrored orientation: odd-numbered placeholders flip the grid axes
+	local placeholderNumber = tonumber(placeholder.Name:match("Plot(%d+)")) or 0
+	local axisDirX = placeholder:GetAttribute("GridAxisDirX")
+	if axisDirX ~= 1 and axisDirX ~= -1 then
+		axisDirX = 1
+	end
+
+	local axisDirZ = placeholder:GetAttribute("GridAxisDirZ")
+	if axisDirZ ~= 1 and axisDirZ ~= -1 then
+		local isOddPlot = (placeholderNumber % 2 == 1)
+		axisDirZ = isOddPlot and -1 or 1
+	end
+
+	playerPlot:SetAttribute("GridAxisDirX", axisDirX)
+	playerPlot:SetAttribute("GridAxisDirZ", axisDirZ)
+	GridConfig.setAxisDirectionsForPlot(playerPlot, axisDirX, axisDirZ)
+
 	local buildingsFolder = Instance.new("Folder")
 	buildingsFolder.Name = "Buildings"
 	buildingsFolder.Parent = playerPlot
-	
+
 	local PipesFolder = Instance.new("Folder")
 	PipesFolder.Name = "Pipes"
 	PipesFolder.Parent = playerPlot
-	
+
 	local zoneFolder = Instance.new("Folder")
 	zoneFolder.Name = "PlayerZones"
 	zoneFolder.Parent = playerPlot
-	
+
 	local WaterPipeZonesFolder = Instance.new("Folder")
 	WaterPipeZonesFolder.Name = "WaterPipeZones"
 	WaterPipeZonesFolder.Parent = playerPlot
-	
+
 	local PowerLinesZonesFolder = Instance.new("Folder")
 	PowerLinesZonesFolder.Name = "PowerLinesZones"
 	PowerLinesZonesFolder.Parent = playerPlot
-	
+
 	-- Ensure the template has a PrimaryPart set
 	--if not playerPlot.PrimaryPart then
 	--	local firstPart = playerPlot:FindFirstChildWhichIsA("BasePart", true)
@@ -253,49 +295,49 @@ Players.PlayerAdded:Connect(function(player)
 	--		return
 	--	end
 	--end
-	
-	
-	
+
+
+
 	local function disableQueryingInPlot(plotModel)
-	-- Set CanQuery = false on the model itself if applicable
-	if plotModel:IsA("BasePart") then
-		plotModel.CanQuery = false
-	end
-
-	-- Set CanQuery = false for all BaseParts in the model
-	for _, descendant in ipairs(plotModel:GetDescendants()) do
-		if descendant:IsA("BasePart") then
-			descendant.CanQuery = false
+		-- Set CanQuery = false on the model itself if applicable
+		if plotModel:IsA("BasePart") then
+			plotModel.CanQuery = false
 		end
-	end
 
-	-- Specifically disable CanQuery in NatureZones
-	local natureZones = plotModel:FindFirstChild("NatureZones")
-	if natureZones then
-		for _, obj in ipairs(natureZones:GetDescendants()) do
-			if obj:IsA("BasePart") then
-				obj.CanQuery = false
+		-- Set CanQuery = false for all BaseParts in the model
+		for _, descendant in ipairs(plotModel:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				descendant.CanQuery = false
 			end
 		end
-	end
 
-	-- Disable CanQuery in Unlocks > Unlock# > Segment#
-	local unlocksFolder = plotModel:FindFirstChild("Unlocks")
-	if unlocksFolder then
-		for _, unlock in ipairs(unlocksFolder:GetChildren()) do
-			if unlock:IsA("Model") then
-				for _, segment in ipairs(unlock:GetChildren()) do
-					if segment:IsA("Model") then
-						for _, part in ipairs(segment:GetDescendants()) do
-							if part:IsA("BasePart") then
-								part.CanQuery = false
+		-- Specifically disable CanQuery in NatureZones
+		local natureZones = plotModel:FindFirstChild("NatureZones")
+		if natureZones then
+			for _, obj in ipairs(natureZones:GetDescendants()) do
+				if obj:IsA("BasePart") then
+					obj.CanQuery = false
+				end
+			end
+		end
+
+		-- Disable CanQuery in Unlocks > Unlock# > Segment#
+		local unlocksFolder = plotModel:FindFirstChild("Unlocks")
+		if unlocksFolder then
+			for _, unlock in ipairs(unlocksFolder:GetChildren()) do
+				if unlock:IsA("Model") then
+					for _, segment in ipairs(unlock:GetChildren()) do
+						if segment:IsA("Model") then
+							for _, part in ipairs(segment:GetDescendants()) do
+								if part:IsA("BasePart") then
+									part.CanQuery = false
+								end
 							end
 						end
 					end
 				end
 			end
 		end
-	end
 	end
 
 
@@ -305,7 +347,8 @@ Players.PlayerAdded:Connect(function(player)
 
 	-- Position the plot at the placeholder's position
 	playerPlot:PivotTo(placeholder.PrimaryPart.CFrame)
-	
+	setPlotOddEvenAttributes(playerPlot)
+
 	local GridConfigServer = require(ReplicatedStorage.Scripts.Grid.GridConfig)
 
 	local roadStart = playerPlot:WaitForChild("RoadStart", 2)
@@ -314,7 +357,7 @@ Players.PlayerAdded:Connect(function(player)
 	else
 		warn("PlotAssigner: RoadStart missing on "..playerPlot.Name)
 	end
-	
+
 	--playerPlot:SetPrimaryPartCFrame(placeholder.PrimaryPart.CFrame)
 	print(string.format("Assigned plot '%s' to placeholder '%s'.", playerPlot.Name, placeholder.Name))
 
@@ -331,7 +374,7 @@ Players.PlayerAdded:Connect(function(player)
 
 	-- Function to handle teleportation when the character is added
 	local function onCharacterAdded(character)
-		
+
 		local Timeout = os.time() + 10
 		while not character.PrimaryPart
 			and not character:FindFirstChildWhichIsA("Humanoid")
@@ -340,11 +383,11 @@ Players.PlayerAdded:Connect(function(player)
 			if os.time() > Timeout then return end
 			task.wait()
 		end
-		
+
 		game:GetService("RunService").Stepped:Wait()
-		
+
 		teleportPlayerToPlot(player, playerPlot)
-		
+
 		--print(string.format("CharacterAdded: '%s' character spawned.", player.Name))
 		-- Use a coroutine to ensure teleportation happens after a short delay
 		--coroutine.wrap(function()
@@ -357,7 +400,7 @@ Players.PlayerAdded:Connect(function(player)
 	-- Connect CharacterAdded before checking if player.Character exists
 	player.CharacterAdded:Connect(onCharacterAdded)
 	player.CharacterAppearanceLoaded:Connect(onCharacterAdded)
-	
+
 	-- If the character already exists, teleport them immediately
 	if player.Character then
 		onCharacterAdded(player.Character)

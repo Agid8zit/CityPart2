@@ -191,7 +191,7 @@ local ZoneCategories = {
 	Fire                   = { FireDept=true, FirePrecinct=true, FireStation=true },
 	Education              = { MiddleSchool=true, Museum=true, NewsStation=true, PrivateSchool=true },
 	Health                 = { CityHospital=true, LocalHospital=true, MajorHospital=true, SmallClinic=true },
-	Landmark               = { Bank=true, CNTower=true, EiffelTower=true, EmpireStateBuilding=true,
+	Landmarks              = { Bank=true, CNTower=true, EiffelTower=true, EmpireStateBuilding=true,
 		FerrisWheel=true, GasStation=true, ModernSkyscraper=true, NationalCapital=true,
 		Obelisk=true, SpaceNeedle=true, StatueOfLiberty=true, TechOffice=true, WorldTradeCenter=true },
 	Leisure                = { Church=true, Hotel=true, Mosque=true, MovieTheater=true, ShintoTemple=true, BuddhaStatue=true, HinduTemple=true },

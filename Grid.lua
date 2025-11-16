@@ -5,25 +5,128 @@ GridConfig.__index = GridConfig
 GridConfig.GRID_SIZE = 4
 GridConfig.Y_OFFSET = 0.4
 
--- We track two bounding boxes:
--- 1) stableMinX/stableMinZ -> stableMaxX/stableMaxZ
---    - This is used for converting world positions into gridX, gridZ
---    - We never shift stableMinX/stableMinZ after the first time, so old zones don't move.
--- 2) absoluteMinX/absoluteMinZ
---    - The actual farthest-left/bottom discovered. Might be < stableMinX/stableMinZ,
---      in which case newly unlocked left terrain has negative grid coords.
+-- Each plot needs its own set of cached bounds so multiplayer players
+-- never stomp each other.  We store those bounds keyed by the plot model.
+local function newContext()
+	return {
+		stableMinX = nil,
+		stableMinZ = nil,
+		stableMaxX = nil,
+		stableMaxZ = nil,
+		absoluteMinX = nil,
+		absoluteMinZ = nil,
+		axisDirX    = 1,
+		axisDirZ    = 1,
+	}
+end
 
-local stableMinX, stableMinZ = nil, nil
-local stableMaxX, stableMaxZ = nil, nil
-local absoluteMinX, absoluteMinZ = nil, nil
+local plotContexts = setmetatable({}, { __mode = "k" })
+local defaultContext = newContext()
+
+local function isPlayerPlot(model)
+	if not (model and model:IsA("Model")) then
+		return false
+	end
+
+	if model:GetAttribute("IsPlayerPlot") == true then
+		return true
+	end
+
+	local parent = model.Parent
+	if parent and parent.Name == "PlayerPlots" then
+		return true
+	end
+
+	local name = model.Name
+	return typeof(name) == "string" and string.sub(name, 1, 5) == "Plot_"
+end
+
+local function findPlotAncestor(instance)
+	local current = instance
+	while current do
+		if isPlayerPlot(current) then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function getContextForPlot(plot)
+	if plot then
+		local ctx = plotContexts[plot]
+		if not ctx then
+			ctx = newContext()
+			plotContexts[plot] = ctx
+		end
+		return ctx
+	end
+	return defaultContext
+end
+
+local function getContextFromInstance(instance)
+	return getContextForPlot(findPlotAncestor(instance))
+end
+
+local function getContextFromTerrains(terrains)
+	if type(terrains) ~= "table" then
+		return defaultContext
+	end
+
+	for _, inst in ipairs(terrains) do
+		if typeof(inst) == "Instance" then
+			local plot = findPlotAncestor(inst)
+			if plot then
+				return getContextForPlot(plot)
+			end
+		end
+	end
+
+	return defaultContext
+end
+
+local function normalizeAxisDir(value)
+	if value == -1 then
+		return -1
+	end
+	return 1
+end
+
+function GridConfig.setAxisDirectionsForPlot(plot, axisDirX, axisDirZ)
+	if not plot then
+		return
+	end
+
+	local ctx = getContextForPlot(plot)
+	ctx.axisDirX = normalizeAxisDir(axisDirX)
+	ctx.axisDirZ = normalizeAxisDir(axisDirZ)
+end
+
+function GridConfig.getAxisDirectionsForPlot(plot)
+	local ctx = getContextForPlot(plot)
+	return ctx.axisDirX or 1, ctx.axisDirZ or 1
+end
+
+function GridConfig.getAxisDirectionsForInstance(instance)
+	local ctx = getContextFromInstance(instance)
+	return ctx.axisDirX or 1, ctx.axisDirZ or 1
+end
 
 function GridConfig.setStableAnchorFromPart(part)
-	--if stableMinX then return end                     -- only first time
-	stableMinX = part.Position.X - GridConfig.GRID_SIZE * 0.5
-	stableMinZ = part.Position.Z - GridConfig.GRID_SIZE * 0.5
+	if not part then
+		return
+	end
 
-	stableMaxX, stableMaxZ = stableMinX, stableMinZ
-	absoluteMinX, absoluteMinZ = stableMinX, stableMinZ
+	local ctx = getContextFromInstance(part)
+	local anchorX = part.Position.X - GridConfig.GRID_SIZE * 0.5
+	local anchorZ = part.Position.Z - GridConfig.GRID_SIZE * 0.5
+
+	ctx.stableMinX = anchorX
+	ctx.stableMinZ = anchorZ
+	ctx.stableMaxX = anchorX
+	ctx.stableMaxZ = anchorZ
+	ctx.absoluteMinX = anchorX
+	ctx.absoluteMinZ = anchorZ
 end
 
 
@@ -43,6 +146,8 @@ end
 --  - Returns table with stableMin/Max + absoluteMin + gridSize
 
 function GridConfig.calculateGlobalBounds(terrains)
+	local ctx = getContextFromTerrains(terrains)
+
 	-- Step 1: find local bounding box from these terrains
 	local localMinX = math.huge
 	local localMinZ = math.huge
@@ -66,34 +171,41 @@ function GridConfig.calculateGlobalBounds(terrains)
 		if maxZ > localMaxZ then localMaxZ = maxZ end
 	end
 
-	-- Step 2: merge local bounding box with the stable bounding box
-	if stableMinX == nil then
-		-- First time: set stable to local
-		stableMinX = localMinX
-		stableMinZ = localMinZ
-		stableMaxX = localMaxX
-		stableMaxZ = localMaxZ
+	if localMinX == math.huge then
+		-- No terrains provided; fall back to whatever the context already knows.
+		localMinX = ctx.stableMinX or 0
+		localMinZ = ctx.stableMinZ or 0
+		localMaxX = ctx.stableMaxX or localMinX
+		localMaxZ = ctx.stableMaxZ or localMinZ
+	end
 
-		absoluteMinX = localMinX
-		absoluteMinZ = localMinZ
+	-- Step 2: merge local bounding box with the stable bounding box
+	if ctx.stableMinX == nil then
+		ctx.stableMinX = localMinX
+		ctx.stableMinZ = localMinZ
+		ctx.stableMaxX = localMaxX
+		ctx.stableMaxZ = localMaxZ
+
+		ctx.absoluteMinX = localMinX
+		ctx.absoluteMinZ = localMinZ
 	else
 		-- Keep stableMinX/stableMinZ where they are, so old zones don't shift
-		-- but if the new localMin is even smaller, we record it in absoluteMinX
-		if localMinX < absoluteMinX then
-			absoluteMinX = localMinX
-		end
-		if localMinZ < absoluteMinZ then
-			absoluteMinZ = localMinZ
-		end
+		ctx.absoluteMinX = math.min(ctx.absoluteMinX or localMinX, localMinX)
+		ctx.absoluteMinZ = math.min(ctx.absoluteMinZ or localMinZ, localMinZ)
 
 		-- stableMaxX and stableMaxZ can grow if new terrain extends the map
-		if localMaxX > stableMaxX then
-			stableMaxX = localMaxX
+		if localMaxX > ctx.stableMaxX then
+			ctx.stableMaxX = localMaxX
 		end
-		if localMaxZ > stableMaxZ then
-			stableMaxZ = localMaxZ
+		if localMaxZ > ctx.stableMaxZ then
+			ctx.stableMaxZ = localMaxZ
 		end
 	end
+
+	local stableMinX = ctx.stableMinX
+	local stableMinZ = ctx.stableMinZ
+	local stableMaxX = ctx.stableMaxX
+	local stableMaxZ = ctx.stableMaxZ
 
 	-- Step 3: compute the stable bounding box's grid size
 	local gridSizeX = math.ceil((stableMaxX - stableMinX) / GridConfig.GRID_SIZE)
@@ -122,8 +234,8 @@ function GridConfig.calculateGlobalBounds(terrains)
 		maxZ = stableMaxZ,
 
 		-- The actual farthest-left/bottom discovered (could be < stableMin)
-		absMinX = absoluteMinX,
-		absMinZ = absoluteMinZ,
+		absMinX = ctx.absoluteMinX or stableMinX,
+		absMinZ = ctx.absoluteMinZ or stableMinZ,
 
 		-- The stable bounding box's grid dimension
 		gridSizeX = gridSizeX,
@@ -134,10 +246,14 @@ end
 
 -- Reset if you ever need a brand-new anchor
 
-function GridConfig.resetStableBounds()
-	stableMinX, stableMinZ = nil, nil
-	stableMaxX, stableMaxZ = nil, nil
-	absoluteMinX, absoluteMinZ = nil, nil
+function GridConfig.resetStableBounds(plot)
+	if plot then
+		plotContexts[plot] = nil
+		return
+	end
+
+	plotContexts = setmetatable({}, { __mode = "k" })
+	defaultContext = newContext()
 end
 
 return GridConfig
