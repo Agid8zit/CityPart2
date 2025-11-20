@@ -204,23 +204,12 @@ local function setPlotOddEvenAttributes(plotModel: Model?)
 	local primaryPart = plotModel.PrimaryPart
 	if not primaryPart then return end
 
-	-- Normalize 0..360
 	local orientationY = primaryPart.Orientation.Y % 360
-	if orientationY < 0 then
-		orientationY += 360
-	end
+	if orientationY < 0 then orientationY += 360 end
 
-	-- Helper: shortest angular distance on a circle
-	local function isAngle(a: number, target: number, tol: number)
-		local d = (a - target) % 360
-		d = math.min(d, 360 - d)
-		return d <= tol
-	end
-
-	local tolerance = 0.1 -- you had 1e-3; 0.1° is friendlier to float jitter
-
-	local isOddOrientation  = isAngle(orientationY, 180, tolerance) -- 180° ⇒ ODD
-	local isEvenOrientation = isAngle(orientationY,   0, tolerance) --   0° ⇒ EVEN (also 360°)
+	local tolerance = 1e-3
+	local isOddOrientation  = math.abs(orientationY - 180) <= tolerance
+	local isEvenOrientation = (orientationY <= tolerance) or (orientationY >= (360 - tolerance))
 
 	plotModel:SetAttribute("Odd",  isOddOrientation)
 	plotModel:SetAttribute("Even", isEvenOrientation)
@@ -249,23 +238,6 @@ Players.PlayerAdded:Connect(function(player)
 	playerPlot:SetAttribute("PlotOwnerId", player.UserId)
 	playerPlot.OwnerSign.SurfaceGui.TextLabel.Text = player.Name.."'s Plot"
 	playerPlot.Parent = plotsFolder
-
-	-- Determine mirrored orientation: odd-numbered placeholders flip the grid axes
-	local placeholderNumber = tonumber(placeholder.Name:match("Plot(%d+)")) or 0
-	local axisDirX = placeholder:GetAttribute("GridAxisDirX")
-	if axisDirX ~= 1 and axisDirX ~= -1 then
-		axisDirX = 1
-	end
-
-	local axisDirZ = placeholder:GetAttribute("GridAxisDirZ")
-	if axisDirZ ~= 1 and axisDirZ ~= -1 then
-		local isOddPlot = (placeholderNumber % 2 == 1)
-		axisDirZ = isOddPlot and -1 or 1
-	end
-
-	playerPlot:SetAttribute("GridAxisDirX", axisDirX)
-	playerPlot:SetAttribute("GridAxisDirZ", axisDirZ)
-	GridConfig.setAxisDirectionsForPlot(playerPlot, axisDirX, axisDirZ)
 
 	local buildingsFolder = Instance.new("Folder")
 	buildingsFolder.Name = "Buildings"
@@ -352,6 +324,23 @@ Players.PlayerAdded:Connect(function(player)
 	-- Position the plot at the placeholder's position
 	playerPlot:PivotTo(placeholder.PrimaryPart.CFrame)
 	setPlotOddEvenAttributes(playerPlot)
+
+	-- Determine axis directions based on actual orientation so Odd is canonical (+1,+1)
+	local isOddOrientation = playerPlot:GetAttribute("Odd") == true
+
+	local axisDirX = placeholder:GetAttribute("GridAxisDirX")
+	if axisDirX ~= 1 and axisDirX ~= -1 then
+		axisDirX = isOddOrientation and 1 or -1
+	end
+
+	local axisDirZ = placeholder:GetAttribute("GridAxisDirZ")
+	if axisDirZ ~= 1 and axisDirZ ~= -1 then
+		axisDirZ = isOddOrientation and 1 or -1
+	end
+
+	playerPlot:SetAttribute("GridAxisDirX", axisDirX)
+	playerPlot:SetAttribute("GridAxisDirZ", axisDirZ)
+	GridConfig.setAxisDirectionsForPlot(playerPlot, axisDirX, axisDirZ)
 
 	local GridConfigServer = require(ReplicatedStorage.Scripts.Grid.GridConfig)
 

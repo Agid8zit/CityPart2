@@ -36,6 +36,8 @@ local _applyLock: { [Player]: { [string]: boolean } } = {}
 local _pendingWealth: { [Player]: { [string]: { [string]: string } } } = {}
 -- player -> zoneId = awaiting first ZonePopulated
 local _pendingPopulate: { [Player]: { [string]: boolean } } = {}
+-- player -> zoneId queued for a deferred bulk rebuild (zone still populating)
+local _pendingBulkRebuild: { [Player]: { [string]: boolean } } = {}
 
 local function _markZonePending(player: Player, zoneId: string)
 	if not (player and typeof(zoneId) == "string") then return end
@@ -55,6 +57,29 @@ end
 local function _isZonePending(player: Player, zoneId: string): boolean
 	local map = _pendingPopulate[player]
 	return (map and map[zoneId]) or false
+end
+
+local function _queueBulkRebuild(player: Player, zoneId: string)
+	if not (player and typeof(zoneId) == "string") then return end
+	_pendingBulkRebuild[player] = _pendingBulkRebuild[player] or {}
+	_pendingBulkRebuild[player][zoneId] = true
+end
+
+local function _drainBulkRebuild(player: Player, zoneId: string)
+	local map = _pendingBulkRebuild[player]
+	if not (map and map[zoneId]) then return end
+	map[zoneId] = nil
+	if not next(map) then
+		_pendingBulkRebuild[player] = nil
+	end
+	task.defer(function()
+		-- guard again in case the zone went back into populate mode mid-yield
+		if not _shouldDeferWealthChanges(player, zoneId) then
+			CityInteractions.bulkWealthRebuild(player, zoneId)
+		else
+			_queueBulkRebuild(player, zoneId)
+		end
+	end)
 end
 
 -- ==== Tunables / Guardrails ====
@@ -1667,7 +1692,7 @@ local function _isZonePopulating(player: Player, zoneId: string): boolean
 		else
 			return true
 		end
-+	end
+	end
 	-- Prefer ZoneTracker API if available
 	if ZoneTracker and type((ZoneTracker :: any).isZonePopulating) == "function" then
 		local ok, res = pcall(function()
@@ -1690,6 +1715,45 @@ local function _queueWealthChanges(
 	_pendingWealth[player][zoneId] = _pendingWealth[player][zoneId] or {}
 	for _, ch in ipairs(changes) do
 		_pendingWealth[player][zoneId][_tkey(ch.x, ch.z)] = ch.wealth
+	end
+end
+
+local function _augmentBucketsWithModelMismatches(
+	player: Player,
+	zoneId: string,
+	zoneData: ZoneData?,
+	intents: { [string]: string },
+	changedSet: { [string]: boolean },
+	buckets: { [string]: { { x: number, z: number } } }
+)
+	if next(changedSet) then return end
+	if not (zoneData and zoneData.gridList and #zoneData.gridList > 0) then return end
+	if not (BuildingGeneratorModule and BuildingGeneratorModule.collectInstancesTouchingTiles) then return end
+
+	local tileSet = {}
+	for _, coord in ipairs(zoneData.gridList) do
+		tileSet[_tkey(coord.x, coord.z)] = true
+	end
+
+	local touching = BuildingGeneratorModule.collectInstancesTouchingTiles(player, zoneId, tileSet)
+	if typeof(touching) ~= "table" then return end
+
+	for _, rec in ipairs(touching) do
+		local key = _tkey(rec.originGX, rec.originGZ)
+		local intended = intents[key]
+		if intended then
+			local inst = rec.inst
+			local current = (inst and inst:GetAttribute("WealthState"))
+				or ZoneTracker.getGridWealth(player, zoneId, rec.originGX, rec.originGZ)
+				or "Poor"
+			if current ~= intended then
+				if not changedSet[key] then
+					changedSet[key] = true
+					buckets[intended] = buckets[intended] or {}
+					table.insert(buckets[intended], { x = rec.originGX, z = rec.originGZ })
+				end
+			end
+		end
 	end
 end
 
@@ -2883,6 +2947,7 @@ do
 		-- 1) apply deferred wealth (from UXP computations)
 		CityInteractions._flushPendingWealthForZone(player, zoneId)
 		_clearZonePending(player, zoneId)
+		_drainBulkRebuild(player, zoneId)
 
 		-- 2) safety: if the zone exists in cache, run pollution/synergy pass now that models are surely present
 		local z = _getZoneDataFromCache(player, zoneId)
@@ -3051,7 +3116,8 @@ function CityInteractions.bulkWealthRebuild(player: Player, zoneId: string)
 
 	-- Defer if the zone is currently populating
 	if _shouldDeferWealthChanges(player, zoneId) then
-		warn("[bulkWealthRebuild] zone is populating; try again after ZonePopulated")
+		warn("[bulkWealthRebuild] zone is populating; queuing rebuild for later")
+		_queueBulkRebuild(player, zoneId)
 		return
 	end
 
@@ -3072,6 +3138,9 @@ function CityInteractions.bulkWealthRebuild(player: Player, zoneId: string)
 			end
 		end
 	end
+
+	_augmentBucketsWithModelMismatches(player, zoneId, z, intents, changedSet, buckets)
+
 	if not next(changedSet) then
 		return -- nothing to do
 	end

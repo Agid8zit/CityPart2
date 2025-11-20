@@ -1,0 +1,141 @@
+00_SaveManager.lua:1697:		-- Coalesced DataStore write (non-flush)
+codex_save_load_hardening_spec.md:9:- Universe uses multiple DataStores, including (examples):  
+codex_save_load_hardening_spec.md:10:  `OnboardingAudit_v1`, `PlayerCities`, `PlayerData_PublicTest1..4`, `PlayerData_Release..6`, `PlayerData_Studio, Studio2..16`, `PlayerData_Test1..9`, `PlayerSesionLock`, `UnlockDataStore`, `ZoneDataV1`.
+codex_save_load_hardening_spec.md:29:- With `APPLY_CHANGES = false` (default), **no DataStore mutations** happen. Auditor runs and prints a compact summary per store + a perGÇæuser/slot table of what would be deleted.
+codex_save_load_hardening_spec.md:126:		"OnboardingAudit_v1","PlayerCities","ZoneDataV1","PlayerSesionLock","UnlockDataStore",
+codex_save_load_hardening_spec.md:161:local DataStoreService = game:GetService("DataStoreService")
+codex_save_load_hardening_spec.md:167:	return DataStoreService:GetDataStore(SavePolicy.INDEX_STORE)
+codex_save_load_hardening_spec.md:236:-- Enumerates configured DataStores, samples/reads values, sizes them, and prints a report.
+codex_save_load_hardening_spec.md:237:local DataStoreService = game:GetService("DataStoreService")
+codex_save_load_hardening_spec.md:244:	local ds = DataStoreService:GetDataStore(storeName)
+codex_save_load_hardening_spec.md:347:local DataStoreService = game:GetService("DataStoreService")
+codex_save_load_hardening_spec.md:365:	local ds = DataStoreService:GetDataStore(storeName)
+codex_save_load_hardening_spec.md:382:	local ds = DataStoreService:GetDataStore(storeName)
+codex_save_load_hardening_spec.md:463:		local ds = DataStoreService:GetDataStore(p.store)
+codex_save_load_hardening_spec.md:490:local DataStoreService = game:GetService("DataStoreService")
+codex_save_load_hardening_spec.md:510:	local store = DataStoreService:GetDataStore(playerStoreName)
+codex_save_load_hardening_spec.md:606:- Existing DataStore names (use wrappers & indexing instead).
+DataStoreClass.lua:1:local DataStoreClass = {}
+DataStoreClass.lua:2:DataStoreClass.__index = DataStoreClass
+DataStoreClass.lua:5:local DataStoreService = game:GetService("DataStoreService")
+DataStoreClass.lua:8:local function WaitForBudget(BudgetType: Enum.DataStoreRequestType): boolean
+DataStoreClass.lua:15:			return DataStoreService:GetRequestBudgetForRequestType(BudgetType)
+DataStoreClass.lua:29:function DataStoreClass.new(DataStoreName: string, ScopeName: string?)
+DataStoreClass.lua:31:	local DataStore = nil;
+DataStoreClass.lua:33:		DataStore = DataStoreService:GetDataStore(DataStoreName, ScopeName)
+DataStoreClass.lua:41:		DataStoreName = DataStoreName,
+DataStoreClass.lua:43:		DataStore = DataStore,
+DataStoreClass.lua:45:	setmetatable(Data, DataStoreClass)
+DataStoreClass.lua:49:function DataStoreClass:_SafelyCallAsync(AsyncFunction: () -> (), Key: string, FunctionName: string)
+DataStoreClass.lua:66:			warn("Failed to call ("..FunctionName..") ["..self.DataStoreName.."]["..self.ScopeName.."]")
+DataStoreClass.lua:74:function DataStoreClass:GetAsync(Key: string) : (any?, boolean)
+DataStoreClass.lua:75:	if not WaitForBudget(Enum.DataStoreRequestType.GetAsync) then
+DataStoreClass.lua:79:		return self.DataStore:GetAsync(Key)
+DataStoreClass.lua:83:function DataStoreClass:SetAsync(Key: string, Value: any) : (any?, boolean)
+DataStoreClass.lua:84:	if not WaitForBudget(Enum.DataStoreRequestType.SetIncrementAsync) then
+DataStoreClass.lua:88:		return self.DataStore:SetAsync(Key, Value)
+DataStoreClass.lua:92:function DataStoreClass:IncrementAsync(Key: string, Delta: number?) : (any?, boolean)
+DataStoreClass.lua:94:		return self.DataStore:IncrementAsync(Key, Delta)
+DataStoreClass.lua:98:function DataStoreClass:RemoveAsync(Key: string) : (any?, boolean)
+DataStoreClass.lua:100:		return self.DataStore:RemoveAsync(Key)
+DataStoreClass.lua:104:function DataStoreClass:UpdateAsync(Key: string, Value: any, TransformFunction: (OriginalValue: any?, Value: any) -> ())
+DataStoreClass.lua:105:	if not WaitForBudget(Enum.DataStoreRequestType.UpdateAsync) then
+DataStoreClass.lua:109:		return self.DataStore:UpdateAsync(Key, function(OriginalValue)
+DataStoreClass.lua:115:return DataStoreClass
+OnboardingService.lua:2:local DataStoreService = game:GetService("DataStoreService")
+OnboardingService.lua:69:local AUDIT_STORE = DataStoreService:GetDataStore("OnboardingAudit_v1")
+OrderedDataStoreClass.lua:1:local OrderedDataStoreClass = {}
+OrderedDataStoreClass.lua:2:OrderedDataStoreClass.__index = OrderedDataStoreClass
+OrderedDataStoreClass.lua:5:local DataStoreService = game:GetService("DataStoreService")
+OrderedDataStoreClass.lua:8:local function WaitForBudget(BudgetType: Enum.DataStoreRequestType): boolean
+OrderedDataStoreClass.lua:15:			return DataStoreService:GetRequestBudgetForRequestType(BudgetType)
+OrderedDataStoreClass.lua:29:function OrderedDataStoreClass.new(DataStoreName: string, ScopeName: string)
+OrderedDataStoreClass.lua:31:	local DataStore = nil;
+OrderedDataStoreClass.lua:33:		DataStore = DataStoreService:GetOrderedDataStore(DataStoreName, ScopeName)
+OrderedDataStoreClass.lua:41:		DataStoreName = DataStoreName,
+OrderedDataStoreClass.lua:43:		DataStore = DataStore,
+OrderedDataStoreClass.lua:45:	setmetatable(Data, OrderedDataStoreClass)
+OrderedDataStoreClass.lua:49:function OrderedDataStoreClass:_SafelyCallAsync(AsyncFunction: () -> (), Key: string, FunctionName: string)
+OrderedDataStoreClass.lua:66:			warn("Failed to call ("..FunctionName..") ["..self.DataStoreName.."]["..self.ScopeName.."]")
+OrderedDataStoreClass.lua:74:function OrderedDataStoreClass:GetAsync(Key: string) : (any?, boolean)
+OrderedDataStoreClass.lua:75:	-- Ask DataStore if can request it, if not, try to wait for it
+OrderedDataStoreClass.lua:76:	if not WaitForBudget(Enum.DataStoreRequestType.GetAsync) then
+OrderedDataStoreClass.lua:81:		return self.DataStore:GetAsync(Key)
+OrderedDataStoreClass.lua:85:function OrderedDataStoreClass:SetAsync(Key: string, Integer: any) : (any?, boolean)
+OrderedDataStoreClass.lua:87:	if not WaitForBudget(Enum.DataStoreRequestType.GetAsync) then
+OrderedDataStoreClass.lua:91:		return self.DataStore:SetAsync(Key, Integer)
+OrderedDataStoreClass.lua:95:function OrderedDataStoreClass:IncrementAsync(Key: string, Delta: number?) : (any?, boolean)
+OrderedDataStoreClass.lua:97:		return self.DataStore:IncrementAsync(Key, Delta)
+OrderedDataStoreClass.lua:101:function OrderedDataStoreClass:RemoveAsync(Key: string) : (any?, boolean)
+OrderedDataStoreClass.lua:103:		return self.DataStore:RemoveAsync(Key)
+OrderedDataStoreClass.lua:107:function OrderedDataStoreClass:UpdateAsync(Key: string, Value: any, TransformFunction: (OriginalValue: any?, Value: any) -> ()) : (any?, boolean)
+OrderedDataStoreClass.lua:108:	-- Ask DataStore if can request it, if not, try to wait for it
+OrderedDataStoreClass.lua:109:	if not WaitForBudget(Enum.DataStoreRequestType.UpdateAsync) then
+OrderedDataStoreClass.lua:114:		return self.DataStore:UpdateAsync(Key, function(OriginalValue)
+OrderedDataStoreClass.lua:120:function OrderedDataStoreClass:GetSortedPagesAsync(Ascending: boolean, PageSize: number, DefaultPagesToLoad: number, MinValue: any?, MaxValue: any?): any?
+OrderedDataStoreClass.lua:121:	assert(PageSize >= 1 and PageSize <= 100, "[OrderdDataStore] Page Size must be between 1 and 100")
+OrderedDataStoreClass.lua:123:	-- Ask DataStore if can request it, if not, try to wait for it
+OrderedDataStoreClass.lua:124:	if not WaitForBudget(Enum.DataStoreRequestType.GetSortedAsync) then
+OrderedDataStoreClass.lua:129:		return self.DataStore:GetSortedAsync(Ascending, PageSize, MinValue, MaxValue)
+OrderedDataStoreClass.lua:203:return OrderedDataStoreClass
+PlayerDataService.lua:12:local DataStoreClass = require(ServerScriptService.DataStore.DataStoreClass)
+PlayerDataService.lua:13:local VersionedDataStoreClass = require(ServerScriptService.DataStore.VersionedDataStoreClass)
+PlayerDataService.lua:45:local VersionDataStores = {} -- [Player] = VersionedDataStoreObject
+PlayerDataService.lua:46:local VersionDataStoreLoading = {} -- Set<Player>
+PlayerDataService.lua:47:local SessionLocking = nil -- DataStoreObject
+PlayerDataService.lua:288:local function CreateSessionLockingDataStoreIfNoneExists()
+PlayerDataService.lua:294:	SessionLocking = DataStoreClass.new("PlayerSesionLock")
+PlayerDataService.lua:300:local function CreatePlayerDataDataStoreIfNoneExists(Player: Player): boolean
+PlayerDataService.lua:301:	if VersionDataStores[Player] ~= nil then return true end
+PlayerDataService.lua:302:	if VersionDataStoreLoading[Player] then return true end
+PlayerDataService.lua:303:	VersionDataStoreLoading[Player] = true
+PlayerDataService.lua:304:	VersionDataStores[Player] = VersionedDataStoreClass.new(PLAYERDATA_DATASTORE, tostring(Player.UserId))
+PlayerDataService.lua:305:	VersionDataStoreLoading[Player] = false
+PlayerDataService.lua:306:	return VersionDataStores[Player] ~= nil
+PlayerDataService.lua:311:		or VersionDataStores[Player] == nil
+PlayerDataService.lua:390:		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
+PlayerDataService.lua:391:			warn("[!] Cannot Load PlayerData because their VersionedDataStore has not been loaded")
+PlayerDataService.lua:401:	if not CreateSessionLockingDataStoreIfNoneExists() then
+PlayerDataService.lua:406:		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
+PlayerDataService.lua:407:			warn("[!] Cannot Load PlayerData because their VersionedDataStore has not been loaded")
+PlayerDataService.lua:419:		local LoadedData, Success, TimeStamp = VersionDataStores[Player]:GetAsync()
+PlayerDataService.lua:471:		local Success = VersionDataStores[Player]:SetAsync_NewSave(DataToSave, TimeStamp)
+PlayerDataService.lua:489:	if not CreateSessionLockingDataStoreIfNoneExists() then
+PlayerDataService.lua:494:		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
+PlayerDataService.lua:495:			warn("[!] Cannot Save PlayerData because their VersionedDataStore has not been loaded")
+PlayerDataService.lua:562:		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
+PlayerDataService.lua:563:			warn("[!] Cannot Load PlayerData because their VersionedDataStore has not been loaded")
+PlayerDataService.lua:589:	VersionDataStores[Player] = nil
+PlayerDataService.lua:590:	VersionDataStoreLoading[Player] = nil
+PlayerDataService.lua:608:	CreateSessionLockingDataStoreIfNoneExists()
+PurchasesService.lua:208:		SavedReceipts_DS = require(ServerScriptService.DataStore.DataStoreClass).new("SavedReceipts")
+PurchasesService.lua:285:				print("[!] Saved DevProduct Purchase in DataStore")
+VersionedDataStoreClass.lua:1:local VersionedDataStoreClass = {}
+VersionedDataStoreClass.lua:2:VersionedDataStoreClass.__index = VersionedDataStoreClass
+VersionedDataStoreClass.lua:5:local DataStoreClass = require(game.ServerScriptService.DataStore.DataStoreClass)
+VersionedDataStoreClass.lua:6:local OrderedDataStoreClass = require(game.ServerScriptService.DataStore.OrderedDataStoreClass)
+VersionedDataStoreClass.lua:9:function VersionedDataStoreClass.new(DataStoreName: string, ScopeName: string)
+VersionedDataStoreClass.lua:11:	local DataStore = DataStoreClass.new(DataStoreName, ScopeName)
+VersionedDataStoreClass.lua:12:	local OrderedDataStore = OrderedDataStoreClass.new(DataStoreName, ScopeName)
+VersionedDataStoreClass.lua:14:	if not DataStore or not OrderedDataStore then return nil end
+VersionedDataStoreClass.lua:17:		DataStoreName = DataStoreName,
+VersionedDataStoreClass.lua:19:		DataStore = DataStore,
+VersionedDataStoreClass.lua:20:		OrderedDataStore = OrderedDataStore,
+VersionedDataStoreClass.lua:22:	setmetatable(Data, VersionedDataStoreClass)
+VersionedDataStoreClass.lua:26:function VersionedDataStoreClass:GetLatestTimeStamp(): (number?, boolean)
+VersionedDataStoreClass.lua:28:	local Pages = self.OrderedDataStore:GetSortedPagesAsync(false, 1, 1)
+VersionedDataStoreClass.lua:43:function VersionedDataStoreClass:GetAsync() : (any?, boolean, number?)
+VersionedDataStoreClass.lua:47:	local NewValue, Success2 = self.DataStore:GetAsync(tostring(TimeStamp))
+VersionedDataStoreClass.lua:50:function VersionedDataStoreClass:SetAsync_OverwriteLatest(NewData: boolean): (any?, boolean)
+VersionedDataStoreClass.lua:54:	local _, Success = self.DataStore:SetAsync(tostring(TimeStamp), NewData)
+VersionedDataStoreClass.lua:56:		warn("(Failed to Overwrite VersionDataStore)")
+VersionedDataStoreClass.lua:62:function VersionedDataStoreClass:SetAsync_NewSave(NewData, TimeStamp: number): boolean
+VersionedDataStoreClass.lua:64:	local _, Success = self.DataStore:SetAsync(tostring(TimeStamp), NewData)
+VersionedDataStoreClass.lua:66:		warn("(Failed to Save VersionDataStore - Core)")
+VersionedDataStoreClass.lua:67:		self.DataStore:RemoveAsync(tostring(TimeStamp))
+VersionedDataStoreClass.lua:72:	local _, Success2 = self.OrderedDataStore:SetAsync(tostring(TimeStamp), TimeStamp)
+VersionedDataStoreClass.lua:74:		warn("(Failed to Save VersionDataStore - Time)")
+VersionedDataStoreClass.lua:75:		self.DataStore:RemoveAsync(tostring(TimeStamp))
+VersionedDataStoreClass.lua:82:function VersionedDataStoreClass:RollbackToTimeStamp(GivenTimeStamp: number)
+VersionedDataStoreClass.lua:93:return VersionedDataStoreClass
+XPmanager.lua:8:local DS             = S3:WaitForChild("DataStore")          -- PlayerGÇæside data table

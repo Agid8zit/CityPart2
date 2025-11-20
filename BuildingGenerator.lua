@@ -890,7 +890,22 @@ local function removeAndArchiveUnderlyingBuildings(player, zoneId, gridX, gridZ,
 		end
 	end
 
-	return impactedZones
+return impactedZones
+end
+
+local function footprintHasBlockingOccupant(player, zoneId, startX, startZ, width, depth)
+	if not player then return false end
+	for x = startX, startX + width - 1 do
+		for z = startZ, startZ + depth - 1 do
+			if ZoneTrackerModule.isGridOccupied(player, x, z, {
+				excludeOccupantId = zoneId,
+				excludeOccupantType = "zone",
+			}) then
+				return true
+			end
+		end
+	end
+	return false
 end
 
 -- Helper: Check 2D AABB u (only X and Z axes)
@@ -1631,22 +1646,27 @@ function BuildingGeneratorModule.generateBuilding(
 	----------------------------------------------------------------------
 	local ok, err = xpcall(function()
 
-		-- Compute building's world position
+		-- Compute building's world position (axis-aware for odd plots)
 		local cellCenterX, _, cellCenterZ =
 			GridUtils.globalGridToWorldPosition(gridCoord.x, gridCoord.z, gBounds, gTerrains)
 
-		local topLeftWorldX = cellCenterX - (GRID_SIZE / 2)
-		local topLeftWorldZ = cellCenterZ - (GRID_SIZE / 2)
+		local axisDirX, axisDirZ = 1, 1
+		if type(gTerrains) == "table" then
+			for _, inst in ipairs(gTerrains) do
+				if typeof(inst) == "Instance" then
+					axisDirX, axisDirZ = GridConfig.getAxisDirectionsForInstance(inst)
+					break
+				end
+			end
+		end
 
-		local buildingWidthWorld  = rotatedWidth * GRID_SIZE
-		local buildingDepthWorld  = rotatedDepth * GRID_SIZE
-		local halfWidthWorld      = buildingWidthWorld * 0.5
-		local halfDepthWorld      = buildingDepthWorld * 0.5
+		local offsetX = axisDirX * ((rotatedWidth - 1) * GRID_SIZE * 0.5)
+		local offsetZ = axisDirZ * ((rotatedDepth - 1) * GRID_SIZE * 0.5)
 
 		local finalPosition = Vector3.new(
-			topLeftWorldX + halfWidthWorld,
+			cellCenterX + offsetX,
 			terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
-			topLeftWorldZ + halfDepthWorld
+			cellCenterZ + offsetZ
 		)
 
 		-- Helper to place a stage at the correct position/rotation
@@ -1837,6 +1857,30 @@ function BuildingGeneratorModule.generateBuilding(
 			height = rotatedDepth,
 			buildingId = zoneId .. "_" .. gridCoord.x .. "_" .. gridCoord.z
 		}
+		-- Overlay zones can arrive without a clean reservation/clear, so run an explicit guard.
+		if OverlayZoneTypes[mode] and impactedZones and next(impactedZones) then
+			local function _footprintBlocked()
+				return footprintHasBlockingOccupant(player, zoneId, gridCoord.x, gridCoord.z, rotatedWidth, rotatedDepth)
+			end
+			if _footprintBlocked() then
+				-- Best-effort second sweep: something reoccupied the footprint between removal/reservation.
+				local extraImpact = removeAndArchiveUnderlyingBuildings(
+					player, zoneId, gridCoord.x, gridCoord.z, rotatedWidth, rotatedDepth
+				)
+				if extraImpact and next(extraImpact) then
+					impactedZones = impactedZones or {}
+					for originalZoneId in pairs(extraImpact) do
+						impactedZones[originalZoneId] = true
+					end
+				end
+			end
+			if _footprintBlocked() then
+				if finalStageClone and finalStageClone.Parent then
+					finalStageClone:Destroy()
+				end
+				return _abortEarly("footprint occupied before placement")
+			end
+		end
 		QuadtreeService:insert(buildingObject)
 
 		-- Abort check before marking occupancy

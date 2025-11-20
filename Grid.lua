@@ -140,6 +140,22 @@ function GridConfig.calculateCoords(terrain)
 	return minX, minZ
 end
 
+function GridConfig.worldCoordToGridIndex(worldCoord, axisMin, axisMax, axisDir)
+	local gridSize = GridConfig.GRID_SIZE or 1
+	if axisDir == -1 then
+		return (axisMax - worldCoord) / gridSize
+	end
+	return (worldCoord - axisMin) / gridSize
+end
+
+function GridConfig.gridIndexToWorldCoord(gridIndex, axisMin, axisMax, axisDir)
+	local gridSize = GridConfig.GRID_SIZE or 1
+	if axisDir == -1 then
+		return axisMax - (gridIndex + 0.5) * gridSize
+	end
+	return axisMin + (gridIndex + 0.5) * gridSize
+end
+
 
 -- Main: calculateGlobalBounds
 --  - Merges newly discovered terrain with stable bounding box

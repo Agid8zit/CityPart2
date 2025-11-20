@@ -356,6 +356,7 @@ local function makeZoneRows(player: Player): ({any}, { [string]: boolean })
 			mode      = z.mode,
 			coords    = z.gridList,
 			flags     = z.requirements,
+			createdAt = z.createdAt or os.time(),
 			wealth    = wealthArr,
 			tileFlags = reqArr,
 			buildings = buildingsJSON,
@@ -1139,7 +1140,7 @@ local function runLoadSlice(state, budgetMs)
 	if state.phase == "B" then
 		while state.idxSkeleton <= #state.zoneRows do
 			local r = state.zoneRows[state.idxSkeleton]
-			ZoneTracker.addZone(player, r.id, r.mode, r.coords)
+			ZoneTracker.addZone(player, r.id, r.mode, r.coords, { createdAt = r.createdAt })
 
 			-- track contiguous numbering
 			local idx = tonumber(r.id and r.id:match("(%d+)$"))

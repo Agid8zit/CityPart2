@@ -196,7 +196,7 @@ function ZoneTrackerModule.isZonePopulated(player, zoneId)
 	return z and z.requirements.Populated or false
 end
 
-function ZoneTrackerModule.addZone(player, zoneId, mode, gridList)
+function ZoneTrackerModule.addZone(player, zoneId, mode, gridList, props)
 	if DEBUG then
 		warn(("[ZT] addZone %s (%s)  call-site:\n%s")
 			:format(zoneId, tostring(player), debug.traceback("", 2)))
@@ -221,6 +221,10 @@ function ZoneTrackerModule.addZone(player, zoneId, mode, gridList)
 	end
 
 	-- Build full zone record once (includes createdAt for refund/undo windows)
+	local createdAt = os.time()
+	if props and typeof(props.createdAt) == "number" and props.createdAt > 0 then
+		createdAt = props.createdAt
+	end
 	local zoneData = {
 		zoneId       = zoneId,
 		player       = player,
@@ -228,7 +232,7 @@ function ZoneTrackerModule.addZone(player, zoneId, mode, gridList)
 		gridList     = gridList,
 		requirements = { Road = false, Water = false, Power = false, Populated = false },
 		wealth       = {},
-		createdAt    = os.time(),
+		createdAt    = createdAt,
 		isPopulating = false,
 	}
 

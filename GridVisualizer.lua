@@ -75,6 +75,14 @@ local cardinalGridParts = {}
 local metroEntranceCells = {}
 local metroTunnelCells = {}
 
+local ZERO_EPSILON = 1e-6
+local function normalizeGridIndex(value)
+	if math.abs(value) < ZERO_EPSILON then
+		return 0
+	end
+	return value
+end
+
 local function _countKeys(t)
 	local c = 0
 	for _ in pairs(t) do c += 1 end
@@ -645,8 +653,9 @@ local function startGhostMovement()
 
 					local w, d = getBuildingFootprint(ghostModel, buildingRotation)
 					local x, y, z = GridUtil.globalGridToWorldPosition(gx, gz, globalBounds, terrains)
-					local offX = (w - 1) * GRID_SIZE * 0.5
-					local offZ = (d - 1) * GRID_SIZE * 0.5
+					local ax, az = GridConfig.getAxisDirectionsForPlot(playerPlot)
+					local offX = ax * (w - 1) * GRID_SIZE * 0.5
+					local offZ = az * (d - 1) * GRID_SIZE * 0.5
 					local pivotOffset = CFrame.new(offX, 0, offZ)
 
 					ghostModel:SetPrimaryPartCFrame(
@@ -761,14 +770,23 @@ local function createGrid(mode)
 	local displayGridSizeZ = math.ceil(totalWidthZ / step)
 
 	local gridFolder = workspace.PlayerPlots.GridParts
+	-- Logical axis for this plot
+	local ax, az = GridConfig.getAxisDirectionsForPlot(playerPlot)
 
 	for i = 0, displayGridSizeX - 1 do
 		for j = 0, displayGridSizeZ - 1 do
 			local worldX = absMinX + (i + 0.5) * step
 			local worldZ = absMinZ + (j + 0.5) * step
 
-			local gridX = math.floor((worldX - anchorMinX) / step)
-			local gridZ = math.floor((worldZ - anchorMinZ) / step)
+			-- Raw indices relative to the stable anchor
+			local rawGX = math.floor((worldX - anchorMinX) / step)
+			local rawGZ = math.floor((worldZ - anchorMinZ) / step)
+
+			-- Logical, parity-aligned indices exposed to UI/placement
+			local gridX = rawGX * (ax or 1)
+			local gridZ = rawGZ * (az or 1)
+			gridX = normalizeGridIndex(gridX)
+			gridZ = normalizeGridIndex(gridZ)
 
 			local finalWorldX, finalWorldY, finalWorldZ =
 				GridUtil.globalGridToWorldPosition(gridX, gridZ, globalBounds, terrains)
@@ -837,6 +855,7 @@ local function showCardinalGrids(startCoord)
 	local maxGridX = math.floor((globalBounds.maxX - globalBounds.minX) / step)
 	local minGridZ = math.floor((globalBounds.absMinZ - globalBounds.minZ) / step)
 	local maxGridZ = math.floor((globalBounds.maxZ - globalBounds.minZ) / step)
+	local ax, az = GridConfig.getAxisDirectionsForPlot(playerPlot)
 
 	local directions = {
 		{1, 0},   -- East
@@ -883,7 +902,9 @@ local function showCardinalGrids(startCoord)
 				break
 			end
 
-			if x < minGridX or x > maxGridX or z < minGridZ or z > maxGridZ then
+			local rx = x * (ax or 1)
+			local rz = z * (az or 1)
+			if rx < minGridX or rx > maxGridX or rz < minGridZ or rz > maxGridZ then
 				break
 			end
 
@@ -900,8 +921,8 @@ local function showCardinalGrids(startCoord)
 			gridPart.Material = Enum.Material.Neon
 			gridPart.Name = "CardinalGridSquare"
 
-			gridPart:SetAttribute("GridX", x)
-			gridPart:SetAttribute("GridZ", z)
+			gridPart:SetAttribute("GridX", normalizeGridIndex(x))
+			gridPart:SetAttribute("GridZ", normalizeGridIndex(z))
 			gridPart.Parent = cardinalFolder
 			table.insert(cardinalGridParts, gridPart)
 		end
@@ -1333,6 +1354,11 @@ plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
 	playerPlot = plot
 	print("GridVisualizer: Found plot", playerPlot.Name)
 	findMetroEntrances()
+
+	-- Seed per-plot axis (Odd = +1,+1, Even = -1,-1)
+	local ax = playerPlot:GetAttribute("GridAxisDirX") or 1
+	local az = playerPlot:GetAttribute("GridAxisDirZ") or 1
+	GridConfig.setAxisDirectionsForPlot(playerPlot, ax, az)
 
 	local roadStart = playerPlot:WaitForChild("RoadStart", 5)
 	if roadStart then

@@ -3,6 +3,14 @@ GridUtil.__index = GridUtil
 
 local GridConfig = require(script.Parent:WaitForChild("GridConfig"))
 local GRID_SIZE = GridConfig.GRID_SIZE
+local ZERO_EPSILON = 1e-6
+
+local function normalizeGridIndex(value)
+	if math.abs(value) < ZERO_EPSILON then
+		return 0
+	end
+	return value
+end
 
 local RunService = game:GetService("RunService")
 
@@ -20,18 +28,26 @@ function GridUtil.gridToWorldPosition(gridX, gridZ, minX, minZ)
 	return worldX, worldZ
 end
 
--- Convert a world position to global grid coordinates using the global bounds.
-function GridUtil.worldToGlobalGridPosition(worldPosition, globalBounds)
-	local gridX = math.floor((worldPosition.X - globalBounds.minX) / GRID_SIZE)
-	local gridZ = math.floor((worldPosition.Z - globalBounds.minZ) / GRID_SIZE)
-	return gridX, gridZ
-end
-
 -- Convert global grid coordinates to a world position.
 -- Uses globalBounds for X/Z and scans terrains to pick a reasonable Y.
 function GridUtil.globalGridToWorldPosition(gridX, gridZ, globalBounds, terrains)
-	local worldX = globalBounds.minX + (gridX + 0.5) * GRID_SIZE
-	local worldZ = globalBounds.minZ + (gridZ + 0.5) * GRID_SIZE
+	-- Get per-plot axis from any terrain instance; fallback to (1,1)
+	local axisDirX, axisDirZ = 1, 1
+	if type(terrains) == "table" then
+		for _, inst in ipairs(terrains) do
+			if typeof(inst) == "Instance" then
+				axisDirX, axisDirZ = GridConfig.getAxisDirectionsForInstance(inst)
+				break
+			end
+		end
+	end
+
+	-- Interpret incoming (gridX, gridZ) as logical indices and convert to raw
+	local effGX = (axisDirX or 1) * (gridX or 0)
+	local effGZ = (axisDirZ or 1) * (gridZ or 0)
+
+	local worldX = globalBounds.minX + (effGX + 0.5) * GRID_SIZE
+	local worldZ = globalBounds.minZ + (effGZ + 0.5) * GRID_SIZE
 	local worldY = nil
 
 	for _, terrain in ipairs(terrains) do
@@ -47,6 +63,22 @@ function GridUtil.globalGridToWorldPosition(gridX, gridZ, globalBounds, terrains
 		worldY = GridConfig.Y_OFFSET
 	end
 	return worldX, worldY, worldZ
+end
+
+function GridUtil.worldToGlobalGridPosition(worldPosition, globalBounds, terrains)
+	local axisDirX, axisDirZ = 1, 1
+	if type(terrains) == "table" then
+		for _, inst in ipairs(terrains) do
+			if typeof(inst) == "Instance" then
+				axisDirX, axisDirZ = GridConfig.getAxisDirectionsForInstance(inst)
+				break
+			end
+		end
+	end
+
+	local rawGX = math.floor((worldPosition.X - globalBounds.minX) / GRID_SIZE)
+	local rawGZ = math.floor((worldPosition.Z - globalBounds.minZ) / GRID_SIZE)
+	return normalizeGridIndex(rawGX * (axisDirX or 1)), normalizeGridIndex(rawGZ * (axisDirZ or 1))
 end
 
 -- Generate a list of grid coordinates within a rectangle.

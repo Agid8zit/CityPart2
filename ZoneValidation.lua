@@ -144,6 +144,9 @@ local function getGlobalBoundsForPlot(plot)
 	end
 
 	local gb = GridConfig.calculateGlobalBounds(terrains)
+	local axisDirX, axisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
+	gb.axisDirX = axisDirX
+	gb.axisDirZ = axisDirZ
 	boundsCache[plot] = { bounds = gb, terrains = terrains }
 	return gb, terrains
 end
@@ -203,8 +206,9 @@ local function getUnlockGridSet(player)
 
 	local globalBounds = select(1, getGlobalBoundsForPlot(plot))
 	local gridSize     = GridConfig.GRID_SIZE or 4
-	local axisDirX     = (globalBounds.axisDirX == -1) and -1 or 1
-	local axisDirZ     = (globalBounds.axisDirZ == -1) and -1 or 1
+	local rawAxisDirX, rawAxisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
+	local axisDirX     = (rawAxisDirX == -1) and -1 or 1
+	local axisDirZ     = (rawAxisDirZ == -1) and -1 or 1
 	local plotWidthX   = (globalBounds.maxX - globalBounds.minX)
 	local plotWidthZ   = (globalBounds.maxZ - globalBounds.minZ)
 	local gridSizeX    = math.max(0, math.floor(plotWidthX / gridSize))

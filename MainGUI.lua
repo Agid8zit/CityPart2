@@ -17,6 +17,9 @@ local UtilityGUI = require(ReplicatedStorage.Scripts.UI.UtilityGUI)
 local BalanceEconomy = require(Balancing:WaitForChild("BalanceEconomy"))
 local SoundController = require(ReplicatedStorage.Scripts.Controllers.SoundController)
 local InputController = require(ReplicatedStorage.Scripts.Controllers.InputController)
+local PlayerDataControllerOk, PlayerDataController = pcall(function()
+	return require(ReplicatedStorage.Scripts.Controllers.PlayerDataController)
+end)
 
 -- Onboarding wires (for resilient Build button pulse/arrow)
 local UITargetRegistry = require(ReplicatedStorage.Scripts.UI.UITargetRegistry)
@@ -28,6 +31,231 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer.PlayerGui
 local ExitFunctions = {}
 local OBArrow = UI.OnboardingArrow
+local ALARM_OWNER_ATTRIBUTE = "OwnerUserId"
+
+-- Alarm visibility filter ------------------------------------------------------
+local ALARM_NAME_PATTERN = "^(Alarm%u%l+)_"
+local alarmVisibilityStarted = false
+local trackedAlarmParts = {}
+
+local function ownerIdFromPlotAncestor(inst: Instance?): number?
+	while inst do
+		local match = inst.Name:match("^Plot_(%d+)$")
+		if match then
+			local uid = tonumber(match)
+			if uid then
+				return uid
+			end
+		end
+		inst = inst.Parent
+	end
+	return nil
+end
+
+local function setAlarmBillboardEnabled(part: BasePart, visible: boolean)
+	for _, child in ipairs(part:GetChildren()) do
+		if child:IsA("BillboardGui") then
+			child.Enabled = visible
+		end
+	end
+end
+
+local function applyAlarmVisibility(part: BasePart)
+	local ownerId = part:GetAttribute(ALARM_OWNER_ATTRIBUTE) or ownerIdFromPlotAncestor(part)
+	local shouldShow = (ownerId == nil) or (ownerId == LocalPlayer.UserId)
+	part.LocalTransparencyModifier = 0
+	setAlarmBillboardEnabled(part, shouldShow)
+end
+
+local function stopTrackingAlarmPart(part: BasePart)
+	local bundle = trackedAlarmParts[part]
+	if bundle then
+		for _, conn in ipairs(bundle) do
+			conn:Disconnect()
+		end
+		trackedAlarmParts[part] = nil
+	end
+end
+
+local function trackAlarmPart(inst: Instance)
+	if not (inst and inst:IsA("BasePart")) then return end
+	if not inst.Name:match(ALARM_NAME_PATTERN) then return end
+
+	if trackedAlarmParts[inst] then
+		applyAlarmVisibility(inst)
+		return
+	end
+
+	applyAlarmVisibility(inst)
+
+	local connections = {}
+	connections[#connections+1] = inst:GetAttributeChangedSignal(ALARM_OWNER_ATTRIBUTE):Connect(function()
+		applyAlarmVisibility(inst)
+	end)
+	connections[#connections+1] = inst.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			stopTrackingAlarmPart(inst)
+		else
+			task.defer(applyAlarmVisibility, inst)
+		end
+	end)
+	if inst.Destroying then
+		connections[#connections+1] = inst.Destroying:Connect(function()
+			stopTrackingAlarmPart(inst)
+		end)
+	end
+
+	trackedAlarmParts[inst] = connections
+end
+
+local function startAlarmVisibilityFilter()
+	if alarmVisibilityStarted then return end
+	alarmVisibilityStarted = true
+
+	task.spawn(function()
+		local plots = workspace:FindFirstChild("PlayerPlots")
+		if not plots then
+			local ok, found = pcall(function()
+				return workspace:WaitForChild("PlayerPlots", 30)
+			end)
+			if ok then
+				plots = found
+			end
+		end
+
+		if not plots then
+			warn("[MainGui] PlayerPlots not found; cannot filter zone alarms per-player.")
+			return
+		end
+
+		for _, descendant in ipairs(plots:GetDescendants()) do
+			trackAlarmPart(descendant)
+		end
+
+		plots.DescendantAdded:Connect(function(inst)
+			trackAlarmPart(inst)
+		end)
+	end)
+end
+---------------------------------------------------------------------------------
+
+-- Utility infrastructure privacy ----------------------------------------------
+local INFRA_FOLDER_NAMES = {
+	Pipes = true,
+	MetroTunnels = true,
+}
+local infraControllers = {}
+local foreignPlotChildConns = {}
+local foreignInfraFilterStarted = false
+
+local function applyInfraVisibility(inst: Instance?, visible: boolean)
+	if inst and inst:IsA("BasePart") then
+		inst.LocalTransparencyModifier = visible and 0 or 1
+	end
+end
+
+local function ensureInfraController(folder: Instance)
+	local controller = infraControllers[folder]
+	if controller then
+		return controller
+	end
+
+	controller = {
+		visible = true,
+		conn = nil,
+	}
+
+	controller.conn = folder.DescendantAdded:Connect(function(inst)
+		applyInfraVisibility(inst, controller.visible)
+	end)
+
+	if folder.Destroying then
+		folder.Destroying:Connect(function()
+			local stored = infraControllers[folder]
+			if stored and stored.conn then
+				stored.conn:Disconnect()
+			end
+			infraControllers[folder] = nil
+		end)
+	end
+
+	infraControllers[folder] = controller
+	return controller
+end
+
+local function setInfraFolderVisible(folder: Instance?, visible: boolean)
+	if not folder then return end
+	local controller = ensureInfraController(folder)
+	controller.visible = visible and true or false
+	for _, desc in ipairs(folder:GetDescendants()) do
+		applyInfraVisibility(desc, controller.visible)
+	end
+end
+
+local function hideForeignInfrastructure(plot: Instance?)
+	if not (plot and plot:IsA("Model")) then return end
+	local ownerId = tonumber((plot.Name or ""):match("^Plot_(%d+)$"))
+	if not ownerId or ownerId == LocalPlayer.UserId then
+		return
+	end
+
+	local function handleChild(child: Instance)
+		if child and INFRA_FOLDER_NAMES[child.Name] then
+			setInfraFolderVisible(child, false)
+		end
+	end
+
+	for _, child in ipairs(plot:GetChildren()) do
+		handleChild(child)
+	end
+
+	if foreignPlotChildConns[plot] then
+		return
+	end
+
+	foreignPlotChildConns[plot] = plot.ChildAdded:Connect(handleChild)
+
+	if plot.Destroying then
+		plot.Destroying:Connect(function()
+			local conn = foreignPlotChildConns[plot]
+			if conn then
+				conn:Disconnect()
+			end
+			foreignPlotChildConns[plot] = nil
+		end)
+	end
+end
+
+local function startForeignInfraVisibilityFilter()
+	if foreignInfraFilterStarted then return end
+	foreignInfraFilterStarted = true
+
+	task.spawn(function()
+		local plots = workspace:FindFirstChild("PlayerPlots")
+		if not plots then
+			local ok, found = pcall(function()
+				return workspace:WaitForChild("PlayerPlots", 30)
+			end)
+			if ok then
+				plots = found
+			end
+		end
+
+		if not plots then
+			warn("[MainGui] PlayerPlots not found; cannot hide foreign infrastructure.")
+			return
+		end
+
+		for _, plot in ipairs(plots:GetChildren()) do
+			hideForeignInfrastructure(plot)
+		end
+
+		plots.ChildAdded:Connect(function(inst)
+			hideForeignInfrastructure(inst)
+		end)
+	end)
+end
+---------------------------------------------------------------------------------
 
 -- UI References
 local UI_ChartsButton = UI.right.charts.ImageButton
@@ -699,6 +927,8 @@ function MainGui.OnHide()
 end
 
 function MainGui.Init()
+	task.defer(startAlarmVisibilityFilter)
+	task.defer(startForeignInfraVisibilityFilter)
 
 	-- == City Name UI reference (added) ========================================
 	local UI_CityNameLabel = UI.cityLevel.background.CityName
@@ -731,6 +961,27 @@ function MainGui.Init()
 		local sf = pd.savefiles and pd.savefiles[cur]
 		if not sf then return end
 		_setCityName(sf.cityName)
+	end
+
+	-- Prime the label immediately if PlayerDataController already has a snapshot
+	if PlayerDataControllerOk and PlayerDataController then
+		local primed = false
+		local function _primeFromAny(pd)
+			if primed then return end
+			if type(pd) ~= "table" then return end
+			primed = true
+			_applyCityFromFull(pd)
+		end
+
+		local cached
+		if type(PlayerDataController.GetData) == "function" then
+			cached = PlayerDataController.GetData()
+		end
+		if cached then
+			_primeFromAny(cached)
+		elseif type(PlayerDataController.ListenForAnyDataChange) == "function" then
+			PlayerDataController.ListenForAnyDataChange(_primeFromAny)
+		end
 	end
 
 	RE_UpdatePlayerData.OnClientEvent:Connect(function(newValue, path)

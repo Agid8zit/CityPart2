@@ -65,6 +65,13 @@ local REQ_NAME_FOR_ALARM = {
 	AlarmPower = "Power",
 }
 
+-- Attribute used on alarm parts so clients can hide non-owned alarms locally
+local ALARM_OWNER_ATTRIBUTE = "OwnerUserId"
+local ALARM_CLUSTER_FLAG_ATTRIBUTE  = "ClusteredAlarm"
+local ALARM_CLUSTER_COUNT_ATTRIBUTE = "ClusteredCount"
+local ALARM_CLUSTER_MIN_SIZE        = 4 -- when >= this many neighbors, collapse into one alarm
+local ALARM_CLUSTER_TARGET_SIZE     = 5 -- desired tiles represented per cluster marker
+
 -- >>> ADDED: last-writer-wins sequencing to eliminate stale re-adds
 local AlarmSeq     = {} -- [uid][zoneId][alarmType] = seq
 local TempAlarmSeq = {} -- [uid][zoneId][alarmType] = seq
@@ -499,6 +506,9 @@ local function returnAlarm(part)
 	detachSharedBobbing(part)
 	local t = part.Name:match("^(Alarm%u%l+)")   -- AlarmRoad / AlarmWater / …
 	if not t then part:Destroy() return end
+	part:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
+	part:SetAttribute(ALARM_CLUSTER_FLAG_ATTRIBUTE, nil)
+	part:SetAttribute(ALARM_CLUSTER_COUNT_ATTRIBUTE, nil)
 	AlarmPool[t] = AlarmPool[t] or {}
 	table.insert(AlarmPool[t], part)
 	part.Parent = nil
@@ -630,6 +640,143 @@ end
 -- small helper for coord keying
 local function coordKey(c)
 	return ("%d_%d"):format(c.x, c.z)
+end
+
+local function parseCoordKey(key)
+	if type(key) ~= "string" then return nil end
+	local sx, sz = key:match("^([%-0-9]+)_([%-0-9]+)$")
+	if not sx or not sz then return nil end
+	return tonumber(sx), tonumber(sz)
+end
+
+local function getCoordFromNeededEntry(key, entry)
+	if typeof(entry) == "table" and typeof(entry.x) == "number" and typeof(entry.z) == "number" then
+		return entry.x, entry.z
+	end
+	return parseCoordKey(key)
+end
+
+local function clusterNeededTiles(neededSet)
+	local clusters = {}
+	if not neededSet then return clusters end
+
+	local visited = {}
+	for key, entry in pairs(neededSet) do
+		if not visited[key] then
+			local sx, sz = getCoordFromNeededEntry(key, entry)
+			if sx and sz then
+				visited[key] = true
+				local cluster = {}
+				local queue = { { x = sx, z = sz } }
+				local qi = 1
+				while queue[qi] do
+					local node = queue[qi]
+					cluster[#cluster+1] = { x = node.x, z = node.z }
+					local neighbors = {
+						{ x = node.x + 1, z = node.z },
+						{ x = node.x - 1, z = node.z },
+						{ x = node.x,     z = node.z + 1 },
+						{ x = node.x,     z = node.z - 1 },
+					}
+					for _, nbr in ipairs(neighbors) do
+						local nk = coordKey(nbr)
+						if neededSet[nk] and not visited[nk] then
+							visited[nk] = true
+							queue[#queue+1] = { x = nbr.x, z = nbr.z }
+						end
+					end
+					qi += 1
+				end
+				clusters[#clusters+1] = cluster
+			end
+		end
+	end
+
+	return clusters
+end
+
+local function clusterCentroid(cluster)
+	local sx, sz = 0, 0
+	for _, c in ipairs(cluster) do
+		sx += c.x
+		sz += c.z
+	end
+	local n = math.max(1, #cluster)
+	return {
+		x = math.floor(sx / n + 0.5),
+		z = math.floor(sz / n + 0.5),
+	}
+end
+
+local function chunkCluster(cluster, chunkSize)
+	local groups = {}
+	chunkSize = math.max(1, math.floor(chunkSize or 1))
+	local current = {}
+	for _, coord in ipairs(cluster or {}) do
+		current[#current+1] = coord
+		if #current >= chunkSize then
+			groups[#groups+1] = current
+			current = {}
+		end
+	end
+	if #current > 0 then
+		groups[#groups+1] = current
+	end
+	return groups
+end
+
+local function buildAlarmDisplayTargets(neededSet)
+	local targets = {}
+	if not neededSet or next(neededSet) == nil then
+		return targets
+	end
+
+	local threshold = ALARM_CLUSTER_MIN_SIZE or 0
+	local clusters = clusterNeededTiles(neededSet)
+	local targetSize = math.max(threshold, ALARM_CLUSTER_TARGET_SIZE or 0, 1)
+
+	local function registerSingle(c)
+		targets[coordKey(c)] = {
+			x = c.x,
+			z = c.z,
+			isCluster = false,
+			count = 1,
+		}
+	end
+
+	local function registerGroup(group)
+		if threshold > 0 and #group >= threshold then
+			local ctr = clusterCentroid(group)
+			local key = coordKey(ctr)
+			if targets[key] then
+				local fallback = group[1]
+				key = coordKey(fallback)
+				ctr = { x = fallback.x, z = fallback.z }
+			end
+			targets[key] = {
+				x = ctr.x,
+				z = ctr.z,
+				isCluster = true,
+				count = #group,
+			}
+		else
+			for _, c in ipairs(group) do
+				registerSingle(c)
+			end
+		end
+	end
+
+	for _, cluster in ipairs(clusters) do
+		if threshold > 0 and #cluster >= threshold and #cluster > targetSize then
+			for _, chunk in ipairs(chunkCluster(cluster, targetSize)) do
+				registerGroup(chunk)
+			end
+		else
+			registerGroup(cluster)
+		end
+	end
+
+	return targets
 end
 
 local function storePendingAlarms(player, zoneId, alarmType, coordsList)
@@ -1087,7 +1234,7 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 	end
 
 	-- >>> ADDED: build 'needed' from unsatisfiedCoords, but confirm with ZoneTracker (defensive truth check)
-	local needed = {}
+	local neededTiles = {}
 	local reqName = REQ_NAME_FOR_ALARM[alarmType]
 	for _, c in ipairs(unsatisfiedCoords or {}) do
 		local missing = true
@@ -1096,13 +1243,16 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 			missing = (v == false)
 		end
 		if missing and not hasHigherAlarm(c.x, c.z) then
-			needed[string.format("%d_%d", c.x, c.z)] = true
+			local key = coordKey(c)
+			neededTiles[key] = { x = c.x, z = c.z }
 		end
 	end
 
-	if #ALARM_LOWER[alarmType] > 0 and next(needed) ~= nil then
-		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], needed)
+	if #ALARM_LOWER[alarmType] > 0 and next(neededTiles) ~= nil then
+		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], neededTiles)
 	end
+
+	local displayTargets = buildAlarmDisplayTargets(neededTiles)
 
 	-- Remove any existing parts of this type that are no longer needed
 	for _, child in ipairs(zoneModel:GetChildren()) do
@@ -1110,7 +1260,7 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 			local gx, gz = child.Name:match("^"..alarmType.."_([%-0-9]+)_([%-0-9]+)$")
 			if gx and gz then
 				local key = gx.."_"..gz
-				if not needed[key] then
+				if not displayTargets[key] then
 					returnAlarm(child)
 				end
 			end
@@ -1118,18 +1268,32 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 	end
 
 	-- Place required alarms
-	for k, _ in pairs(needed) do
-		local x, z = k:match("^([%-0-9]+)_([%-0-9]+)$")
-		x, z = tonumber(x), tonumber(z)
+	for key, info in pairs(displayTargets) do
+		local x, z = info.x, info.z
 		local name = string.format("%s_%d_%d", alarmType, x, z)
-		if not zoneModel:FindFirstChild(name) then
+		local alarm = zoneModel:FindFirstChild(name)
+		if not alarm then
 			local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0,6,0)
-			local alarm   = borrowAlarm(templateFolder, alarmType)
+			alarm = borrowAlarm(templateFolder, alarmType)
 			if alarm then
-				alarm.Name     = name
+				alarm.Name = name
+				if player and player.UserId then
+					alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, player.UserId)
+				else
+					alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
+				end
 				alarm.Parent   = zoneModel
 				alarm.Position = basePos
 				startBobbing(alarm, basePos)
+			end
+		end
+		if alarm then
+			if info.isCluster then
+				alarm:SetAttribute(ALARM_CLUSTER_FLAG_ATTRIBUTE, true)
+				alarm:SetAttribute(ALARM_CLUSTER_COUNT_ATTRIBUTE, info.count)
+			else
+				alarm:SetAttribute(ALARM_CLUSTER_FLAG_ATTRIBUTE, nil)
+				alarm:SetAttribute(ALARM_CLUSTER_COUNT_ATTRIBUTE, nil)
 			end
 		end
 	end
@@ -1271,7 +1435,12 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 					local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0, 6, 0)
 					local alarm   = borrowAlarm(templateFolder, alarmType)
 					if alarm then
-						alarm.Name     = string.format("%s_%d_%d", alarmType, x, z)
+						alarm.Name = string.format("%s_%d_%d", alarmType, x, z)
+						if player and player.UserId then
+							alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, player.UserId)
+						else
+							alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
+						end
 						alarm.Parent   = tempFolder
 						alarm.Position = basePos
 						startBobbing(alarm, basePos)
