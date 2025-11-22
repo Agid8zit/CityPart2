@@ -78,6 +78,7 @@ local b3LastHintKey     : {[number]: string} = {}
 -- Tunables (B3)
 local B3_PRINT_HEARTBEAT = 5.0
 local B3_HINT_COOLDOWN   = 6.0
+local BARRAGE3_STEP_COUNT = 8
 
 -- --------------------------------------------------------------------------------------
 -- Barrage 1 idempotency / debounce + tunables
@@ -372,7 +373,7 @@ local function _roadAdjacencyHeuristic(p: Player, z): ("none"|"adjacent_isolated
 	return "none"
 end
 
-local function startBarrage3(p: Player)
+local function startBarrage3(p: Player, resumeAt: number?)
 	local uid = p.UserId
 	if barrage3Started[uid] then return end
 	print("[OB_B3] ▶ begin for", p.Name)
@@ -380,12 +381,18 @@ local function startBarrage3(p: Player)
 	b3ZoneId[uid]     = nil
 	b3KnownZones[uid] = _snapshotZones(p)
 	b3LastPrintAt[uid], b3LastHintAt[uid], b3LastHintKey[uid] = 0, 0, nil
+	pcall(function()
+		if OnboardingService and OnboardingService.SetB3Stage then
+			OnboardingService.SetB3Stage(p, "placing")
+		end
+	end)
 
 	StateChanged:FireClient(p, "Onboarding_B3_Begin")
 	-- Single rect guard to place Industrial at required coords
 	StateChanged:FireClient(p, "Onboarding_StartBarrage3", {
 		from = { x = -5, z =  6 },
 		to   = { x = -8, z = 15 },
+		resumeAt = resumeAt,
 	})
 end
 
@@ -558,14 +565,17 @@ local function checkBarrage3(p: Player, rectFrom, rectTo): boolean
 	-- Complete when zone is satisfied and budgets are OK
 	if roadOK and waterOK and powerOK and wBudgetOK and pBudgetOK then
 		print("[OB_B3] ✅ Industrial zone fully connected.")
-		pcall(function()
-			if OnboardingService and OnboardingService.MarkStep then
-				OnboardingService.MarkStep(p, "Barrage3_Industrial_Connected")
-			end
-			if OnboardingService and OnboardingService.Complete then
-				OnboardingService.Complete(p)
-			end
-		end)
+	pcall(function()
+		if OnboardingService and OnboardingService.MarkStep then
+			OnboardingService.MarkStep(p, "Barrage3_Industrial_Connected")
+		end
+		if OnboardingService and OnboardingService.SetB3Stage then
+			OnboardingService.SetB3Stage(p, "")
+		end
+		if OnboardingService and OnboardingService.Complete then
+			OnboardingService.Complete(p)
+		end
+	end)
 		setOnboardingEnabled(p, false)
 		StateChanged:FireClient(p, "Onboarding_B3_Complete", { zoneId = zid })
 		if barrage3Conn[uid] then barrage3Conn[uid]:Disconnect(); barrage3Conn[uid] = nil end
@@ -616,6 +626,11 @@ local function _beginBarrage3Connectivity(p: Player, rectFrom, rectTo)
 	local uid = p.UserId
 	barrage3Started[uid] = "connect"
 	b3ZoneId[uid] = _findNewIndustrialZone(p, b3KnownZones[uid] or {}, rectFrom, rectTo)
+	pcall(function()
+		if OnboardingService and OnboardingService.SetB3Stage then
+			OnboardingService.SetB3Stage(p, "connect", { zoneId = b3ZoneId[uid] })
+		end
+	end)
 
 	-- Ensure StatsChanged fanout
 	local statsBE = BE:FindFirstChild("StatsChanged") :: BindableEvent
@@ -644,100 +659,150 @@ end
 -- --------------------------------------------------------------------------------------
 -- Reseed onboarding after SaveManager reload (slot switch/delete)
 -- --------------------------------------------------------------------------------------
+-- Reseed onboarding after SaveManager reload (slot switch/delete)
 local function _reseedOnboardingFor(plr: Player)
-	if not plr or not plr.Parent then return end
+    if not plr or not plr.Parent then return end
 
-	-- Ensure account-wide onboarding state exists
-	pcall(function()
-		OnboardingService.StartIfNeeded(plr)
-	end)
+    -- Ensure account-wide onboarding state exists
+    pcall(function()
+        OnboardingService.StartIfNeeded(plr)
+    end)
 
-	-- Decide enabled vs completed/skipped
-	local completed, skipped = false, false
-	pcall(function()
-		completed = OnboardingService.IsCompleted and OnboardingService.IsCompleted(plr) or false
-		skipped   = OnboardingService.IsSkipped   and OnboardingService.IsSkipped(plr)   or false
-	end)
+    -- Decide enabled vs completed/skipped
+    local completed, skipped = false, false
+    pcall(function()
+        completed = OnboardingService.IsCompleted and OnboardingService.IsCompleted(plr) or false
+        skipped   = OnboardingService.IsSkipped   and OnboardingService.IsSkipped(plr)   or false
+    end)
 
-	-- Disable onboarding entirely if either Completed or Skipped
-	setOnboardingEnabled(plr, not (completed or skipped))
+    -- Disable onboarding entirely if either Completed or Skipped
+    setOnboardingEnabled(plr, not (completed or skipped))
 
-	if not onboardingActive(plr) then
-		-- Completed or Skipped → ensure client UI is clean
-		StateChanged:FireClient(plr, "BuildMenu_GateClear")
-		StateChanged:FireClient(plr, "UIPulse_Stop", { key = "BM_DirtRoad" })
-		StateChanged:FireClient(plr, "HideArrow")
-		return
-	end
+    if not onboardingActive(plr) then
+        -- Completed or Skipped + ensure client UI is clean
+        StateChanged:FireClient(plr, 'BuildMenu_GateClear')
+        StateChanged:FireClient(plr, 'UIPulse_Stop', { key = 'BM_DirtRoad' })
+        StateChanged:FireClient(plr, 'HideArrow')
+        return
+    end
 
-	-- If enabled, resume where appropriate
-	local resumeAt: number? = nil
-	pcall(function()
-		if OnboardingService.GetGuardProgress then
-			local idx, total = OnboardingService.GetGuardProgress(plr, "barrage1")
-			if type(idx) == "number" and idx >= 1 then
-				if type(total) == "number" and idx >= total then
-					barrage1Completed[plr.UserId] = true
-				else
-					resumeAt = idx + 1
-				end
-			end
-		end
-	end)
+    -- If enabled, resume where appropriate
+    local resumeAt: number? = nil
+    pcall(function()
+        if OnboardingService.GetGuardProgress then
+            local idx, total = OnboardingService.GetGuardProgress(plr, 'barrage1')
+            if type(idx) == 'number' and idx >= 1 then
+                if type(total) == 'number' and idx >= total then
+                    barrage1Completed[plr.UserId] = true
+                else
+                    resumeAt = idx + 1
+                end
+            end
+        end
+    end)
 
-	local b2ResumeAt: number? = nil
-	pcall(function()
-		if OnboardingService.GetGuardProgress then
-			local idx, total = OnboardingService.GetGuardProgress(plr, "barrage2")
-			if type(idx) == "number" and idx >= 1 then
-				local steps = BARRAGE2_STEP_COUNT
-				if type(total) == "number" and total > 0 then
-					steps = total
-				end
-				b2ResumeAt = math.clamp(math.floor(idx) + 1, 1, steps)
-			end
-		end
-	end)
+    local b2ResumeAt: number? = nil
+    pcall(function()
+        if OnboardingService.GetGuardProgress then
+            local idx, total = OnboardingService.GetGuardProgress(plr, 'barrage2')
+            if type(idx) == 'number' and idx >= 1 then
+                local steps = BARRAGE2_STEP_COUNT
+                if type(total) == 'number' and total > 0 then
+                    steps = total
+                end
+                b2ResumeAt = math.clamp(math.floor(idx) + 1, 1, steps)
+            end
+        end
+    end)
 
-	local savedB2Phase: string? = nil
-	pcall(function()
-		if OnboardingService.GetB2Phase then
-			local phase = OnboardingService.GetB2Phase(plr)
-			if phase == "water" or phase == "power" then
-				savedB2Phase = phase
-			end
-		end
-	end)
+    local savedB2Phase: string? = nil
+    pcall(function()
+        if OnboardingService.GetB2Phase then
+            local phase = OnboardingService.GetB2Phase(plr)
+            if phase == 'water' or phase == 'power' then
+                savedB2Phase = phase
+            end
+        end
+    end)
 
-	if barrage1Completed[plr.UserId] then
-		print("[OB_B2] Reseed: B1 previously complete → starting B2")
-		hideArrow(plr)
-		roadPending[plr.UserId] = false
-		if not barrage2Started[plr.UserId] then
-			startBarrage2(plr, b2ResumeAt, savedB2Phase)
-		end
-	elseif resumeAt then
-		print("[OB] Reseed: Resuming Barrage 1 at step", resumeAt)
-		hideArrow(plr)
-		roadPending[plr.UserId] = false
-		startBarrage1(plr, resumeAt)
-	else
-		-- Fresh resume, no auto-start to avoid auto-routing
-		print("[OB] Reseed: nudge Build (no auto-start)")
-		showBuildArrow(plr)
-		StateChanged:FireClient(plr, "BuildMenu_GateClear")
-		if B1_AUTOSTART_ON_JOIN then
-			task.defer(function()
-				if plr.Parent and onboardingActive(plr)
-					and not barrage2Started[plr.UserId]
-				then
-					ensureBarrage1Running(plr)
-				end
-			end)
-		end
-	end
+    local b3ResumeAt: number? = nil
+    local b3Stage: string? = nil
+    local b3SeqSteps = BARRAGE3_STEP_COUNT
+    local b3SeqCompleted = false
+    pcall(function()
+        if OnboardingService.GetGuardProgress then
+            local idx, total = OnboardingService.GetGuardProgress(plr, 'barrage3')
+            if type(total) == 'number' and total > 0 then
+                b3SeqSteps = total
+            end
+            if type(idx) == 'number' and idx >= 1 then
+                b3SeqCompleted = (idx >= b3SeqSteps)
+                b3ResumeAt = math.clamp(math.floor(idx) + 1, 1, b3SeqSteps)
+            end
+        end
+    end)
+    pcall(function()
+        if OnboardingService.GetB3Stage then
+            local stage, payload = OnboardingService.GetB3Stage(plr)
+            if type(stage) == 'string' then
+                b3Stage = stage
+            elseif type(stage) == 'table' and type(stage.stage) == 'string' then
+                b3Stage = stage.stage
+            elseif type(payload) == 'table' and type(payload.stage) == 'string' then
+                b3Stage = payload.stage
+            end
+        end
+    end)
+
+    local uid = plr.UserId
+    local stageStr = tostring(b3Stage or '')
+    local resumeConnect = (stageStr == 'connect') or (b3SeqCompleted and stageStr ~= 'placing')
+    local resumePlacement = (stageStr == 'placing') or (b3ResumeAt ~= nil and not b3SeqCompleted)
+
+    if resumeConnect then
+        print('[OB_B3] Reseed: resume Industrial connectivity checks')
+        hideArrow(plr)
+        roadPending[uid] = false
+        barrage1Completed[uid] = true
+        _clearB2Caches(uid)
+        barrage2Started[uid] = nil
+        StateChanged:FireClient(plr, 'Onboarding_B3_Begin')
+        _beginBarrage3Connectivity(plr, {x=-5,z=6}, {x=-8,z=15})
+    elseif resumePlacement then
+        local resumeStep = b3ResumeAt or 1
+        print(('[OB_B3] Reseed: resume Industrial placement at step %d'):format(resumeStep))
+        hideArrow(plr)
+        roadPending[uid] = false
+        barrage1Completed[uid] = true
+        startBarrage3(plr, resumeStep)
+    elseif barrage1Completed[plr.UserId] then
+        print('[OB_B2] Reseed: B1 previously complete + starting B2')
+        hideArrow(plr)
+        roadPending[plr.UserId] = false
+        if not barrage2Started[plr.UserId] then
+            startBarrage2(plr, b2ResumeAt, savedB2Phase)
+        end
+    elseif resumeAt then
+        print('[OB] Reseed: Resuming Barrage 1 at step', resumeAt)
+        hideArrow(plr)
+        roadPending[plr.UserId] = false
+        startBarrage1(plr, resumeAt)
+    else
+        -- Fresh resume, no auto-start to avoid auto-routing
+        print('[OB] Reseed: nudge Build (no auto-start)')
+        showBuildArrow(plr)
+        StateChanged:FireClient(plr, 'BuildMenu_GateClear')
+        if B1_AUTOSTART_ON_JOIN then
+            task.defer(function()
+                if plr.Parent and onboardingActive(plr)
+                    and not barrage2Started[plr.UserId]
+                then
+                    ensureBarrage1Running(plr)
+                end
+            end)
+        end
+    end
 end
-
 
 local function hookReloadFromCurrent(event: Instance?)
 	if not event or not event:IsA("BindableEvent") then
@@ -1021,3 +1086,4 @@ if OnboardingAdmin then
 else
 	warn("[Onboarding] OnboardingAdmin RemoteFunction not found; admin commands disabled.")
 end
+

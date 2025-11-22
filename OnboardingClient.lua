@@ -2219,7 +2219,8 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 				{ item="SolarPanels",mode="SolarPanels",kind="point",from={x=-7, z=6}, requireExactEnd=true },
 			}
 		end
-		GuardStart(barrage3(), 1)
+		local resumeAt = (typeof(payload.resumeAt) == "number" and payload.resumeAt) or 1
+		GuardStart(barrage3(), resumeAt)
 		local cur = guardSeq[guardIdx]; if cur then local id = canonItem(cur.mode or cur.item); Pulse(id); guardPulseItem = id end
 		arrowAndGateToCurrentStep()
 		return

@@ -11,19 +11,6 @@ Expose **logical** (axis‑normalized) coords on every `GridSquare` via `GridX`/
 
 ---
 
-## Output Requirements (for the editor)
-Return only **full, updated files** (not diffs). Wrap each file like:
-
-```
-=== FILE: <Studio Path / Module>.lua ===
--- entire updated file content here
-=== /FILE ===
-```
-
-Only include files you change.
-
----
-
 ## Files To Modify
 1. `ServerScriptService/PlotAssigner.server.lua`
 2. `ReplicatedStorage/Scripts/Grid/GridUtil.lua`

@@ -108,6 +108,11 @@ local function ensureOnboardingBlob(profile: table)
 		phase = "",                                              -- "" | "water" | "power"
 		lastSeenAt = 0,
 	}
+	ob.progress.b3 = ob.progress.b3 or {                          -- Barrage 3 coarse resume
+		stage = "",                                               -- "" | "placing" | "connect"
+		zoneId = "",
+		lastSeenAt = 0,
+	}
 
 	return ob
 end
@@ -197,6 +202,12 @@ function OnboardingService.Complete(player: Player)
 	if ob.progress and ob.progress.b2 then
 		ob.progress.b2.phase = ""
 		ob.progress.b2.lastSeenAt = os.time()
+	end
+	-- Clear B3 coarse stage tracker
+	if ob.progress and ob.progress.b3 then
+		ob.progress.b3.stage = ""
+		ob.progress.b3.zoneId = ""
+		ob.progress.b3.lastSeenAt = os.time()
 	end
 
 	awardCompletionBadge(player, ob)
@@ -290,6 +301,26 @@ function OnboardingService.GetB2Phase(player: Player): string?
 	return ob.progress and ob.progress.b2 and ob.progress.b2.phase or nil
 end
 
+-- === Progress (Barrage 3 coarse stage) =====================================
+
+function OnboardingService.SetB3Stage(player: Player, stage: "placing"|"connect"|""?, info: {zoneId: string?}?)
+	local profile = getProfile(player); if not profile then return end
+	local ob = ensureOnboardingBlob(profile)
+	ob.progress = ob.progress or {}
+	ob.progress.b3 = ob.progress.b3 or { stage = "", zoneId = "", lastSeenAt = 0 }
+	ob.progress.b3.stage = stage or ""
+	ob.progress.b3.zoneId = (info and info.zoneId) or ob.progress.b3.zoneId or ""
+	ob.progress.b3.lastSeenAt = os.time()
+end
+
+function OnboardingService.GetB3Stage(player: Player): (string?, {zoneId: string?, lastSeenAt: number?}?)
+	local profile = getProfile(player); if not profile then return nil end
+	local ob = ensureOnboardingBlob(profile)
+	local b3 = ob.progress and ob.progress.b3
+	if not b3 then return nil end
+	return b3.stage or "", { zoneId = b3.zoneId, lastSeenAt = b3.lastSeenAt }
+end
+
 -- === Queries ================================================================
 
 function OnboardingService.IsCompleted(player: Player): boolean
@@ -355,7 +386,8 @@ function OnboardingService.Reset(player: Player)
 	ob.progress = {
 		sequences = {},                     -- clears barrage1 guard progress
 		lastStage = { seq = "", index = 0, total = 0 },
-		b2 = { phase = "", lastSeenAt = os.time() }
+		b2 = { phase = "", lastSeenAt = os.time() },
+		b3 = { stage = "", zoneId = "", lastSeenAt = os.time() },
 	}
 
 	-- Also clear the audit “pending skip” record so StartIfNeeded won’t skip again

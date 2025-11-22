@@ -904,6 +904,8 @@ local storedBuildingTransparency = {} -- [Instance] = number
 local storedBuildingCanCollide = {}   -- [Instance] = boolean   -- [ADDED]
 local storedBuildingCanQuery   = {}   -- [Instance] = boolean   -- [ADDED]
 
+local RANGE_VISUAL_GUI_NAMES = { Inner = true, Outter = true, Outer = true }
+
 local function isRangeVisualPart(inst: Instance): boolean
 	if not (inst and inst:IsA("BasePart")) then return false end
 	local inner  = inst:FindFirstChild("Inner")
@@ -911,9 +913,38 @@ local function isRangeVisualPart(inst: Instance): boolean
 	return (inner and inner:IsA("SurfaceGui")) or (outter and outter:IsA("SurfaceGui"))
 end
 
+local function disableRangeVisualGuis(target: Instance)
+	-- Turn off the SurfaceGui layers that actually draw the ring
+	if target:IsA("SurfaceGui") then
+		if RANGE_VISUAL_GUI_NAMES[target.Name] then
+			target.Enabled = false
+		end
+		return
+	end
+
+	for guiName in pairs(RANGE_VISUAL_GUI_NAMES) do
+		local gui = target:FindFirstChild(guiName)
+		if gui and gui:IsA("SurfaceGui") then
+			gui.Enabled = false
+		end
+	end
+end
+
 local function hideRangeVisualPartLocally(inst: Instance)
 	if isRangeVisualPart(inst) then
 		inst.LocalTransparencyModifier = 1
+		disableRangeVisualGuis(inst)
+		return
+	end
+
+	-- Descendants may arrive in any order; also catch bare SurfaceGui additions
+	if inst:IsA("SurfaceGui") and RANGE_VISUAL_GUI_NAMES[inst.Name] then
+		inst.Enabled = false
+		local adornee = inst.Adornee
+			or inst:FindFirstAncestorWhichIsA("BasePart")
+		if adornee then
+			adornee.LocalTransparencyModifier = 1
+		end
 	end
 end
 

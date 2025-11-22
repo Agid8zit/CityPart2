@@ -449,6 +449,71 @@ local function convertGridToWorld(player, gx, gz)
 	return Vector3.new(wx, 1.025, wz)   
 end
 
+local function _plotAxisDirs(player)
+	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
+	if not plot then
+		return 1, 1
+	end
+	local ax = plot:GetAttribute("GridAxisDirX")
+	local az = plot:GetAttribute("GridAxisDirZ")
+	if ax ~= -1 then ax = 1 end
+	if az ~= -1 then az = 1 end
+	return ax, az
+end
+
+local function _normalizeLegacyList(entries, axisDir, field)
+	if axisDir ~= -1 then
+		return false
+	end
+	if type(entries) ~= "table" then
+		return false
+	end
+
+	for _, rec in ipairs(entries) do
+		local value = rec[field]
+		if type(value) == "number" and value > 0 then
+			for _, mutate in ipairs(entries) do
+				local current = mutate[field]
+				if type(current) == "number" then
+					mutate[field] = -current
+				end
+			end
+			return true
+		end
+	end
+
+	return false
+end
+
+local function normalizeLegacyEvenPlotData(player, gridList, saved)
+	local axisDirX, axisDirZ = _plotAxisDirs(player)
+
+	_normalizeLegacyList(gridList, axisDirX, "x")
+	_normalizeLegacyList(gridList, axisDirZ, "z")
+
+	if type(saved) ~= "table" then
+		return
+	end
+
+	if saved.segments then
+		_normalizeLegacyList(saved.segments, axisDirX, "gridX")
+		_normalizeLegacyList(saved.segments, axisDirZ, "gridZ")
+	end
+	if saved.interDecos then
+		_normalizeLegacyList(saved.interDecos, axisDirX, "gridX")
+		_normalizeLegacyList(saved.interDecos, axisDirZ, "gridZ")
+	end
+	if saved.strDecos then
+		_normalizeLegacyList(saved.strDecos, axisDirX, "gridX")
+		_normalizeLegacyList(saved.strDecos, axisDirZ, "gridZ")
+	end
+
+	if saved.segments == nil and #saved > 0 and saved[1] and saved[1].gridX ~= nil then
+		_normalizeLegacyList(saved, axisDirX, "gridX")
+		_normalizeLegacyList(saved, axisDirZ, "gridZ")
+	end
+end
+
 local function refreshRoadStartTransparency(player)
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
 	if not plot then return end
@@ -1749,6 +1814,7 @@ end
 
 
 function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation)
+	normalizeLegacyEvenPlotData(player, gridList, saved)
 	-- Case A: full snapshot
 	if typeof(saved) == "table" and saved.segments and #saved.segments > 0 then
 		return RoadGeneratorModule.recreateZoneExact(player, zoneId, mode, saved)
