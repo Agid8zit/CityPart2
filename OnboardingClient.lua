@@ -1016,7 +1016,7 @@ end
 ---------------------------
 -- Barrage-1 route helper --
 ---------------------------
-local arrowAndGateToCurrentStep -- fwd decl
+local arrowAndGateToCurrentStep, retargetCurrentStep -- fwd decl
 
 local ENABLE_BARRAGE1_SHOWCASE = false
 
@@ -1119,8 +1119,8 @@ local function startBarrage1RouteSequence(idx, id, wantMajor, wantHub)
 		clearBuildMenuPulsesExcept(nil)
 		dbg_route("route finished; hand back to orchestrator")
 		task.defer(function()
-			if arrowAndGateToCurrentStep then
-				arrowAndGateToCurrentStep(true)
+			if retargetCurrentStep then
+				retargetCurrentStep(true, true)
 			end
 		end)
 	end)
@@ -1242,6 +1242,14 @@ local function GuardCancel()
 	refreshManualTabGuidance()
 end
 
+-- Current target resolver (single source of truth for pulsing/gating order)
+local function resolveCurrentTarget()
+	local guardItem = guardCurrentItem()
+	local flowState = (activeSeq == "barrage1") and getFlowState() or nil
+	local flowItem  = flowState and flowState.current and canonItem(flowState.current.mode or flowState.current.item) or nil
+	return guardItem or flowItem or currentGateId, flowState
+end
+
 -------------------------------
 -- Arrow/Gate main orchestror --
 -------------------------------
@@ -1288,12 +1296,8 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	local skipBarrageRoute = (skipRoute == true)
 
 	-- Prefer guard/flow hints when present; fall back to explicit server gates (B2/B3).
-	local guardItem = guardCurrentItem()
-	local flowState = (activeSeq == "barrage1") and getFlowState() or nil
-	local flowItem  = flowState and flowState.current and canonItem(flowState.current.mode or flowState.current.item) or nil
-	local id        = guardItem or flowItem or currentGateId
-	dbg_route("choose id: guard=%s flow=%s gate=%s -> id=%s",
-		tostring(guardItem), tostring(flowItem), tostring(currentGateId), tostring(id))
+	local id, flowState = resolveCurrentTarget()
+	dbg_route("choose id (gate=%s) -> id=%s", tostring(currentGateId), tostring(id))
 
 	if not id then
 		cancelBarrage1Route()
@@ -1485,6 +1489,19 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	clearBuildMenuPulsesExcept(targetKey)
 end
 
+-- Retarget UI to the current step (single entry point for pulses/arrows)
+retargetCurrentStep = function(skipRoute, allowBuildNudge)
+	clearBuildMenuPulsesExcept(nil)
+	clearPulseAndArrow("BuildButton")
+
+	local id = resolveCurrentTarget()
+	if id then
+		arrowAndGateToCurrentStep(skipRoute)
+	elseif allowBuildNudge then
+		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+	end
+end
+
 local function clearArrowAndGate()
 	dbg_route("clearArrowAndGate()")
 	applyGate(nil)
@@ -1549,17 +1566,16 @@ local function handleBuildMenuStateChange()
 		end
 		requestBarrage1Kick("BuildMenuOpened")
 		task.defer(function()
-			arrowAndGateToCurrentStep() -- REVERT: do not suppress showcase on open
+			retargetCurrentStep(false)
 		end)
 	else
-		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+		retargetCurrentStep(true, true)
 		if not bmOpenHintShown then
 			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
 			bmOpenHintShown = true
 		end
 		disconnectClickWatcher("major")
 		disconnectClickWatcher("hub")
-		clearBuildMenuPulsesExcept("BuildButton")
 		committedMajor = nil
 		committedHub   = nil
 		majorHoldUntil = 0
@@ -1601,19 +1617,12 @@ local function applyToggle(enabled)
 		hubHoldUntil   = 0
 	else
 		ensureBuildMenuHook()
-		local id = guardCurrentItem() or getFlowItem()
+		local id = resolveCurrentTarget()
 		if id then
 			Pulse(id)      -- pulse on enable
 			guardPulseItem = id
 		end
-		local bm = buildMenu()
-		if bm and bm.Enabled then
-			-- Prevent the arrow from auto-routing while the menu is already open.
-			arrowAndGateToCurrentStep() -- REVERT: do not suppress showcase here
-		else
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-		end
+		retargetCurrentStep(false, true)
 		for key in pairs(wantPulse) do
 			if gateAllows(key) then UIPulse.start(key) end
 		end
@@ -1709,14 +1718,7 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				cancelBarrage1Route()
 				committedMajor = nil
 				committedHub   = nil
-				local bm = buildMenu()
-				if bm and bm.Enabled then
-					-- Keep the gate active but stop auto-routing; wait for explicit player clicks.
-					arrowAndGateToCurrentStep(true)
-				else
-					requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-					showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-				end
+				retargetCurrentStep(true, true)
 
 				-- Next step hint + re-pulse next expected item (persists until the next step)
 				if nextHintKey then
@@ -1810,13 +1812,7 @@ BE_GuardFB.Event:Connect(function(tag, info)
 		clearBuildMenuPulsesExcept(nil)
 		committedMajor = nil
 		committedHub   = nil
-		local bm = buildMenu()
-		if bm and bm.Enabled then
-			arrowAndGateToCurrentStep()
-		else
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-		end
+		retargetCurrentStep(false, true)
 
 		if nextGuard then
 			if activeSeq == "barrage1" and nextHintKey then
@@ -1844,8 +1840,7 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				if guardPulseItem == fbItem then guardPulseItem = nil end
 			end
 			barrage1LastIndex = 0
-			local bm = buildMenu()
-			if bm and bm.Enabled then arrowAndGateToCurrentStep(true) end
+			retargetCurrentStep(true, true)
 			return
 		end
 
@@ -1862,10 +1857,7 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			local want = canonItem(cur.mode or cur.item)
 			if want then
 				Pulse(want); guardPulseItem = want
-				local bm = buildMenu()
-				if bm and bm.Enabled then
-					arrowAndGateToCurrentStep(true)
-				end
+				retargetCurrentStep(true, true)
 			end
 		end
 
@@ -1880,8 +1872,7 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				if want then Pulse(want); guardPulseItem = want end
 			end
 			barrage1LastIndex = 0
-			local bm = buildMenu()
-			if bm and bm.Enabled then arrowAndGateToCurrentStep(true) end
+			retargetCurrentStep(true, true)
 			return
 		end
 
@@ -1922,7 +1913,7 @@ DisplayGrid.OnClientEvent:Connect(function(mode)
 	-- User action should immediately cut any staged routing and re-evaluate
 	if activeSeq == "barrage1" then
 		cancelBarrage1Route()
-		arrowAndGateToCurrentStep(true)
+		retargetCurrentStep(true, true)
 	end
 end)
 
@@ -1931,108 +1922,17 @@ end)
 ----------------------------
 local function bmGateOnly(id, offset)
 	applyGate(id)
-	local bm = buildMenu()
-	if not (bm and bm.Enabled) then
-		dbg_bm("bmGateOnly(%s) while BM closed → orchestrate()", tostring(id))
-		-- IMPORTANT: do not suppress showcase based on BM state
-		arrowAndGateToCurrentStep() -- REVERT
-		return
-	end
-
-	local wantMajor, wantHub = majorForItem(id), hubForItem(id)
-	local curMajor = getCommittedMajor() or getCurrentMajor(true)
-	local curHub   = getCommittedHub(curMajor) or getCurrentHub(curMajor, true)
-	dbg_bm("bmGateOnly id=%s wantMajor=%s wantHub=%s curMajor=%s curHub=%s", tostring(id), tostring(wantMajor), tostring(wantHub), tostring(curMajor), tostring(curHub))
-
-	-- If already on the item, gentle BM repulse in B1 to reaffirm the step
-	if _G.OB_CurrentTool == id then
-		clearBuildMenuPulsesExcept(nil)
-		if activeSeq == "barrage1" then
-			dbg_bm("bmGateOnly repulse same tool %s", tostring(id))
-			repulseSameToolIfNeeded(id)
-		else
-			dbg_bm("bmGateOnly hide global arrow; same tool already selected")
-			HideArrow("bmGateOnly-same-tool")
-		end
-		return
-	end
-
-	local key
-	if wantMajor and (curMajor ~= wantMajor) then
-		key = resolveMajorKey(wantMajor) -- FIX: robust major key
-		dbg_bm("bmGateOnly target major key=%s", tostring(key))
-		requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.12,0))
-
-		local clickArmed = connectClickWatcher("major", key, function()
-			setCommitted(wantMajor, nil)
-			bmGateOnly(id, offset)
-		end)
-
-		if allowAutoCommit() or not clickArmed then
-			-- Always watch for stable commit
-			hubWatchToken += 1
-			local my = hubWatchToken
-			local want = wantMajor
-			task.spawn(function()
-				if my ~= hubWatchToken then return end
-				local ok = pollCommittedEquality(function() return getCurrentMajor(true) end, want, COMMIT_TIMEOUT, COMMIT_STABLE)
-				if ok and my == hubWatchToken then
-					setCommitted(want, nil)
-					bmGateOnly(id, offset)
-				end
-			end)
-		end
-
-	else
-		disconnectClickWatcher("major")
-		if wantHub and (curHub ~= wantHub) then
-			key = resolveHubKey(wantMajor or "Supply", wantHub) or resolveMajorKey("Supply")
-			dbg_bm("bmGateOnly target hub key=%s", tostring(key))
-			requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.12,0))
-
-			local clickArmed = connectClickWatcher("hub", key, function()
-				setCommitted(nil, wantHub)
-				bmGateOnly(id, offset)
-			end)
-
-			if allowAutoCommit() or not clickArmed then
-				hubWatchToken += 1
-				local my = hubWatchToken
-				task.spawn(function()
-					if my ~= hubWatchToken then return end
-					local ok = pollCommittedEquality(function() return getCurrentHub(wantMajor) end, wantHub, COMMIT_TIMEOUT, COMMIT_STABLE)
-					if ok and my == hubWatchToken then
-						setCommitted(nil, wantHub)
-						bmGateOnly(id, offset)
-					end
-				end)
-			end
-		else
-			if not wantHub then
-				disconnectClickWatcher("hub")
-			end
-			key = "BM_" .. tostring(id) -- REVERT: direct item key
-			dbg_bm("bmGateOnly target item key=%s", tostring(key))
-			requestPulseAndArrow(key, offset or UDim2.new(0,0,-0.18,0))
-		end
-	end
-	clearBuildMenuPulsesExcept(key)
+	retargetCurrentStep(false, true)
 end
 
 StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	dbg("[STATE] %s", tostring(stepName))
 	if stepName == "ShowArrow_BuildMenu" then
 		if not _G.OB_ENABLED then applyToggle(true) end
-		requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
+		retargetCurrentStep(false, true)
 		showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
 		requestBarrage1Kick("ShowArrow_BuildMenu")
 		return
-	end
-	if stepName == "UIPulse_Start" and typeof(payload)=="table" and type(payload.key)=="string" then
-		requestPulseAndArrow(payload.key, payload.offset); return
-	end
-	if stepName == "UIPulse_Stop" and typeof(payload)=="table" and type(payload.key)=="string" then
-		clearPulseAndArrow(payload.key); return
 	end
 	if not _G.OB_ENABLED and stepName ~= "CityNaming" then return end
 	if stepName == "CityNaming" then return end
@@ -2044,7 +1944,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	end
 	if stepName == "BuildMenu_GateOnly_Current" then
 		-- Gate only; do not trigger a showcase route
-		arrowAndGateToCurrentStep(true)
+		retargetCurrentStep(true, true)
 		return
 	end
 	if stepName == "BuildMenu_GateClear"        then clearArrowAndGate(); return end
@@ -2104,9 +2004,9 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 
 		-- Auto-run showcase on true start; suppress on resume
 		if resumeAt <= 1 then
-			arrowAndGateToCurrentStep()       -- allow showcase route
+			retargetCurrentStep(false, true)  -- allow showcase route
 		else
-			arrowAndGateToCurrentStep(true)   -- suppress showcase on resume
+			retargetCurrentStep(true, true)   -- suppress showcase on resume
 		end
 		return
 	end
@@ -2131,7 +2031,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 
 		GuardStart(barrage2(), resumeAt)
 		local cur = guardSeq[guardIdx]; if cur then local id = canonItem(cur.mode or cur.item); Pulse(id); guardPulseItem = id end
-		arrowAndGateToCurrentStep()
+		retargetCurrentStep(false, true)
 		return
 	end
 
@@ -2139,12 +2039,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	if stepName == "Onboarding_B2_Begin_LegacyHint" then
 		dbg("[OB] Barrage 2 legacy coaching")
 		showB2(LANG.OB2_BEGIN, 5)
-		local bm = buildMenu()
-		if bm and bm.Enabled then
-			bmGateOnly("WaterTower", UDim2.new(0,0,-0.12,0))
-		else
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-		end
+		retargetCurrentStep(true, true)
 		return
 	end
 
@@ -2192,12 +2087,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	if stepName == "Onboarding_B3_Begin" then
 		dbg("[OB] Barrage 3 begin: Industrial placement + connectivity")
 		showB3(LANG.OB3_BEGIN, 5)
-		local bm = buildMenu()
-		if bm and bm.Enabled then
-			bmGateOnly("Industrial", UDim2.new(0,0,-0.12,0))
-		else
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-		end
+		retargetCurrentStep(true, true)
 		return
 	end
 
@@ -2222,7 +2112,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		local resumeAt = (typeof(payload.resumeAt) == "number" and payload.resumeAt) or 1
 		GuardStart(barrage3(), resumeAt)
 		local cur = guardSeq[guardIdx]; if cur then local id = canonItem(cur.mode or cur.item); Pulse(id); guardPulseItem = id end
-		arrowAndGateToCurrentStep()
+		retargetCurrentStep(false, true)
 		return
 	end
 
@@ -2255,20 +2145,8 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 	end
 end)
 
----------------------
 -- Self-nudge seed --
 ---------------------
-task.delay(0.40, function()
-	if _G.OB_ENABLED then
-		local gate = KEY_GATES.BuildButton and KEY_GATES.BuildButton()
-		if gate then
-			dbg_bm("self-nudge seed: request BuildButton arrow")
-			requestPulseAndArrow("BuildButton", UDim2.new(0,0,-0.12,0))
-			showOB1(LANG.OB_OPEN_BUILD_MENU, DUR.ROUTE)
-		end
-	end
-end)
-
 -- Use explicit tab change events as committed selection when available
 task.defer(function()
 	if BE_TabChanged and BE_TabChanged:IsA("BindableEvent") then
@@ -2285,7 +2163,7 @@ task.defer(function()
 			-- A real click should immediately cancel staged routing and re-evaluate.
 			if _G.OB_ENABLED and buildMenu() and buildMenu().Enabled then
 				cancelBarrage1Route()
-				arrowAndGateToCurrentStep(true)
+				retargetCurrentStep(true, true)
 			end
 		end)
 	end
