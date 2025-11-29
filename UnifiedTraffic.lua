@@ -271,12 +271,12 @@ local function buildEdgeKeysForPath(gridPath)
 	return edgeKeys
 end
 
-local function computePreIntersectionStops(gridPath)
+local function computePreIntersectionStops(player, gridPath)
 	if not gridPath or #gridPath < 3 then return {}, {} end
 	local preStops, keysByIdx = {}, {}
 	for i = 2, #gridPath - 1 do
 		local c = gridPath[i]
-		local cls = PathingModule.classifyNode(c)
+		local cls = PathingModule.classifyNode(c, player)
 		if cls == "4Way" or cls == "3Way" or (INCLUDE_TURNS_AS_STOPS and cls == "Turn") then
 			local preIdx = i - 1
 			if preIdx >= 1 then
@@ -605,10 +605,18 @@ local function refreshOwnRoadZones(player, ctx)
 	ctx.ownRoadZoneIds = set
 end
 
+local function adjacencyForPlayer(player)
+	if PathingModule.getAdjacencyForOwner then
+		return PathingModule.getAdjacencyForOwner(player) or PathingModule.globalAdjacency
+	end
+	return PathingModule.globalAdjacency
+end
+
 local function nodeOwnedByPlayer(player, key, ctx)
 	if not key then return false end
 	ctx = ctx or ensureCtx(player)
-	local meta = PathingModule.nodeMeta and PathingModule.nodeMeta[key]
+	local metaBucket = PathingModule.getNodeMetaForOwner and PathingModule.getNodeMetaForOwner(player) or nil
+	local meta = metaBucket and metaBucket[key]
 	if not meta then return false end
 	local zid = meta.groupId
 	if not zid then return false end
@@ -676,7 +684,7 @@ end
 local function ensureBfsSnapshot(player, ctx)
 	ctx = ctx or ensureCtx(player)
 	if not ctx then return nil end
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	if not adj then
 		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
 		return nil
@@ -720,7 +728,7 @@ local function bfsPathOwned(player, ctx, startCoord, endCoord)
 	local originKey = PathingModule.nodeKey(SOURCE_COORD)
 	local startKey = PathingModule.nodeKey(startCoord)
 	local endKey   = PathingModule.nodeKey(endCoord)
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	if ctx and ctx.bfsOriginKey == originKey and ctx.bfsDist then
 		if startKey == originKey then
 			local path = pathFromOrigin(ctx, endCoord)
@@ -785,7 +793,7 @@ end
 
 local function pathIsValid(player, path)
 	if not path or #path < 2 then return false end
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	local ctx = ensureCtx(player)
 	if not adj then return false end
 	for i = 1, #path do
@@ -807,7 +815,7 @@ end
 local function originLiveForPlayer(player, ctx)
 	ctx = ctx or ensureCtx(player)
 	local key = PathingModule.nodeKey(SOURCE_COORD)
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	return adj and adj[key] ~= nil and nodeOwnedByPlayer(player, key, ctx)
 end
 
@@ -831,7 +839,7 @@ local function collectNearZoneSinks(player, ctx)
 		if z.mode ~= "DirtRoad" and z.mode ~= "Pavement" and z.mode ~= "Highway" then
 			local center = zoneCenterCoord(z)
 			if center then
-				local near = PathingModule.findNearestRoadNode(center, NEAR_ZONE_MAX_DIST_CELLS)
+				local near = PathingModule.findNearestRoadNode(center, NEAR_ZONE_MAX_DIST_CELLS, player)
 				if near and nodeOwnedByPlayer(player, near.key, ctx) then
 					sinks[#sinks+1] = { x = near.x, z = near.z }
 					count += 1
@@ -967,7 +975,7 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel,
 	ctx.carCount = (ctx.carCount or 0) + 1
 	Debris:AddItem(car, CAR_LIFETIME_SEC)
 
-	local preStopIndices, preStopKeys = computePreIntersectionStops(gridPath)
+	local preStopIndices, preStopKeys = computePreIntersectionStops(player, gridPath)
 	local edgeKeyByIndex = buildEdgeKeysForPath(gridPath)
 
 	local opts = {

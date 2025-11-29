@@ -641,17 +641,17 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 
 		local filteredGridList = {}
 		for _, coord in ipairs(gridList) do
+			-- Deliberately check building occupants so IgnoreValidation/overlay types (e.g., WindTurbine) still block roads.
 			local occupied = ZoneTrackerModule.isGridOccupied(
 				player, coord.x, coord.z,
 				{
 					excludeZoneTypes    = OverlapExclusions,
-					excludeOccupantType = "building",
 				}
 			)
 			if not occupied then
 				table.insert(filteredGridList, coord)
 			else
-				debugPrint(string.format("Excluding grid (%d, %d) – blocked by non-crossable occupant.", coord.x, coord.z))
+				debugPrint(string.format("Excluding grid (%d, %d) - blocked by non-crossable occupant.", coord.x, coord.z))
 			end
 		end
 
@@ -676,7 +676,6 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 					player, coord.x, coord.z,
 					{
 						excludeZoneTypes    = OverlapExclusions,
-						excludeOccupantType = "building",
 					}
 					) then
 					cIsValid = false
@@ -837,7 +836,6 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 			player, gridPosition.x, gridPosition.z,
 			{
 				excludeZoneTypes    = exclusions,
-				excludeOccupantType = "building",
 			}
 		)
 		if blocked then
@@ -976,9 +974,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 
 			local filtered = {}
 			for _, c in ipairs(gridList) do
+				-- Keep building occupants in the check so overlay/IgnoreValidation zones remain blocking.
 				local blocked = ZoneTrackerModule.isGridOccupied(
 					player, c.x, c.z,
-					{ excludeZoneTypes = OverlapExclusions, excludeOccupantType = "building" }
+					{ excludeZoneTypes = OverlapExclusions }
 				)
 				if not blocked then table.insert(filtered, c) end
 			end
@@ -998,7 +997,7 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 				for _, c in ipairs(comp) do
 					local blocked = ZoneTrackerModule.isGridOccupied(
 						player, c.x, c.z,
-						{ excludeZoneTypes = OverlapExclusions, excludeOccupantType = "building" }
+						{ excludeZoneTypes = OverlapExclusions }
 					)
 					if blocked then
 						pushLangNotification(player, "Cant build on roads")

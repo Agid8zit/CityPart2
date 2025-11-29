@@ -1,9 +1,22 @@
-﻿local DataStoreService = game:GetService("DataStoreService")
+local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local SavePolicy = require(script.Parent.Parent.Config.SavePolicy)
 local SaveKeyNames = require(script.Parent.Parent.Services.SaveKeyNames)
 local SaveEnvelope = require(game.ReplicatedStorage.Systems.SaveEnvelope)
+
+-- This tool is expensive (lists every key + GetAsync). Only run when explicitly enabled.
+if not SavePolicy.RUN_AUDIT_ON_BOOT then
+	warn("[AUDIT] SaveAuditor skipped: RUN_AUDIT_ON_BOOT=false")
+	return
+end
+
+-- Extra safety: never hammer production servers automatically.
+if not RunService:IsStudio() then
+	warn("[AUDIT] SaveAuditor skipped outside Studio")
+	return
+end
 
 local function approxSize(value)
 	local ok, encoded = pcall(function()

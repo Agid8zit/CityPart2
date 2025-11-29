@@ -197,6 +197,71 @@ local function planarGridDistance(posA: Vector3, posB: Vector3): number
 	return math.max(dx, dz) / GRID_SIZE
 end
 
+-- Building-population guards (used to defer rope rebuilds / pad-pole links during reload)
+local INFRA_MODES = {
+	DirtRoad   = true,
+	Pavement   = true,
+	Highway    = true,
+	Road       = true,
+	RoadZone   = true,
+	PowerLines = true,
+	WaterPipe  = true,
+	MetroTunnel= true,
+	MetroEntrance = true,
+}
+
+local function _isBuildingMode(mode: any): boolean
+	if not mode then return false end
+	return INFRA_MODES[mode] ~= true
+end
+
+local function _hasPopulatingBuildingZone(player): boolean
+	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
+		if z and z.isPopulating and _isBuildingMode(z.mode) then
+			return true
+		end
+	end
+	return false
+end
+
+local _pendingRebuildAfterBuildings = {} -- [uid] = true
+local _queuedPadPoleLinks = {}           -- [uid] = { [buildingZoneId] = { padPole, ... } }
+
+local function _queuePadPoleLink(player, buildingZoneId, padPole)
+	if not (player and buildingZoneId and padPole) then return false end
+	local uid = player.UserId
+	local perPlayer = _queuedPadPoleLinks[uid]
+	if not perPlayer then
+		perPlayer = {}
+		_queuedPadPoleLinks[uid] = perPlayer
+	end
+	local perZone = perPlayer[buildingZoneId]
+	if not perZone then
+		perZone = {}
+		perPlayer[buildingZoneId] = perZone
+	end
+	perZone[#perZone+1] = padPole
+	return true
+end
+
+local function _drainQueuedPadPoleLinks(player, buildingZoneId)
+	local uid = player and player.UserId
+	if not (uid and buildingZoneId) then return end
+	local perPlayer = _queuedPadPoleLinks[uid]
+	if not perPlayer then return end
+	local pending = perPlayer[buildingZoneId]
+	if not pending then return end
+	perPlayer[buildingZoneId] = nil
+	if not next(perPlayer) then
+		_queuedPadPoleLinks[uid] = nil
+	end
+	for _, pole in ipairs(pending) do
+		if pole and pole.Parent then
+			PowerGeneratorModule.connectPadPoleToPowerZone(player, pole)
+		end
+	end
+end
+
 -- Try to locate a padpole model in the player's plot. Adapt the name/attribute checks to your prefab.
 local function findNearestPadPole(plot, fromPos)
 	local nearest, best = nil, math.huge
@@ -238,7 +303,7 @@ function PowerGeneratorModule.suppressPolesOnGridList(player, suppressorZoneId, 
 						instanceClone  = inst:Clone(),
 						originalParent = inst.Parent,
 						cframe         = (inst:IsA("Model") and inst:GetPivot() or inst.CFrame),
-					})
+					}, player)
 					-- Unmark occupancy
 					local pzid  = inst:GetAttribute("ZoneId") or powerZoneId
 					local occId = string.format("%s_power_%d_%d", tostring(pzid), gx, gz)
@@ -517,18 +582,27 @@ function PowerGeneratorModule.connectPadPoleToPowerZone(player, padPole)
 	-- but we won't guess here. (Spawn path stamps it for us.)
 	if not powerZoneId then return end
 
+	local owningZoneId = padPole:GetAttribute("ZoneId") or padPole:GetAttribute("BuildingZoneId")
+	if owningZoneId then
+		local owningZone = ZoneTrackerModule.getZoneById(player, owningZoneId)
+		if owningZone then
+			local populating = ZoneTrackerModule.isZonePopulating(player, owningZoneId)
+			local populated  = ZoneTrackerModule.isZonePopulated(player, owningZoneId)
+			if populating or (not populated) then
+				_queuePadPoleLink(player, owningZoneId, padPole)
+				return
+			end
+		end
+	end
+
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
 	local pf   = plot:FindFirstChild("PowerLines"); if not pf then return end
 	local zoneFolder = pf:FindFirstChild(powerZoneId); if not zoneFolder then return end
 
 	-- Find the nearest pole inside this *specific* zone folder
 	local pos = (padPole.PrimaryPart and padPole.PrimaryPart.Position) or padPole:GetPivot().Position
-	local pole, dist = _nearestPoleModel(zoneFolder, pos, PADPOLE_LINK_MAX_DISTANCE)
-	if not pole then
-		-- best-effort: unbounded search as a last resort
-		pole, dist = _nearestPoleModel(zoneFolder, pos, 1e9)
-		if not pole then return end
-	end
+	local pole = _nearestPoleModel(zoneFolder, pos, PADPOLE_LINK_MAX_DISTANCE)
+	if not pole then return end
 
 	local linkGridDelta = planarGridDistance(_modelPos(pole), pos)
 	if linkGridDelta > PADPOLE_LINK_MAX_GRIDS then
@@ -1461,7 +1535,7 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 							instanceClone  = ghost,
 							originalParent = zoneFolder,
 							cframe         = cf,
-						})
+						}, player)
 						bridgedZones[roadZoneId] = true
 						-- do not place the pole in-world here
 					end
@@ -1730,7 +1804,7 @@ function PowerGeneratorModule.suppressPoleForRoad(player, roadZoneId, gx, gz)
 		instanceClone  = target:Clone(),
 		originalParent = target.Parent,
 		cframe         = (target:IsA("Model") and target:GetPivot() or target.CFrame),
-	})
+	}, player)
 
 	-- unmark power occupancy for this grid
 	local occId = string.format("%s_power_%d_%d", tostring(pZoneId), gx, gz)
@@ -2004,6 +2078,11 @@ end
 function PowerGeneratorModule.rebuildRopesForAll(player)
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
 	local powerFolder = plot:FindFirstChild("PowerLines");                         if not powerFolder then return end
+	if _hasPopulatingBuildingZone(player) then
+		_pendingRebuildAfterBuildings[player.UserId] = true
+		return
+	end
+	_pendingRebuildAfterBuildings[player.UserId] = nil
 	for _, zf in ipairs(powerFolder:GetChildren()) do
 		if zf:IsA("Folder") then
 			local zid = zf.Name
@@ -2126,6 +2205,14 @@ if not _hookedRoadOverlap then
 	zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
 		local z = ZoneTrackerModule.getZoneById(player, zoneId)
 		local mode = z and z.mode
+
+		if z and _isBuildingMode(mode) then
+			_drainQueuedPadPoleLinks(player, zoneId)
+			if _pendingRebuildAfterBuildings[player.UserId] and (not _hasPopulatingBuildingZone(player)) then
+				PowerGeneratorModule.rebuildRopesForAll(player)
+			end
+		end
+
 		if mode == "DirtRoad" or mode == "Pavement" or mode == "Highway" or mode == "Road" then
 			-- NEW: after the road zone is fully placed, do one authoritative pass
 			PowerGeneratorModule.rebuildRopesForAll(player)

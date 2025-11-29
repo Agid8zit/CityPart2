@@ -223,7 +223,7 @@ local function _forEachRoadBillboard(player, callback)
 	end
 end
 
-local function _recordAndRemoveBillboard(ownerZoneId, inst)
+local function _recordAndRemoveBillboard(ownerZoneId, inst, player)
 	if not (ownerZoneId and inst) then return end
 	local cf = select(1, _getInstanceBoundingBox(inst))
 	local record = {
@@ -235,7 +235,7 @@ local function _recordAndRemoveBillboard(ownerZoneId, inst)
 		gridZ          = inst:GetAttribute("GridZ"),
 		zoneId         = inst:GetAttribute("ZoneId") or (inst.Parent and inst.Parent.Name),
 	}
-	LayerManagerModule.storeRemovedObject(REMOVED_BILLBOARD_TYPE, ownerZoneId, record)
+	LayerManagerModule.storeRemovedObject(REMOVED_BILLBOARD_TYPE, ownerZoneId, record, player)
 	inst:Destroy()
 end
 
@@ -244,7 +244,7 @@ local function _stripBillboardsInBox(player, ownerZoneId, boxCF, boxSize)
 	_forEachRoadBillboard(player, function(inst)
 		local cf, size = _getInstanceBoundingBox(inst)
 		if _overlapXZ(boxCF, boxSize, cf, size) then
-			_recordAndRemoveBillboard(ownerZoneId, inst)
+			_recordAndRemoveBillboard(ownerZoneId, inst, player)
 		end
 	end)
 end

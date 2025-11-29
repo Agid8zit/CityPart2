@@ -19,14 +19,76 @@ local function dprint(...) if DEBUG then print(...) end end
 local function dwarn(...)  if DEBUG then warn(...)  end end
 
 -- We'll store zone data in 'roadNetworks'
--- Also store a 'globalAdjacency' table for BFS across all zones
+-- Also store per-owner adjacency; `globalAdjacency` is a union view rebuilt from owner buckets.
 PathingModule.globalAdjacency = {}
 
-PathingModule.nodeMeta = {}
-local nodeMeta = PathingModule.nodeMeta
+-- Owner-scoped state
+local adjacencyByOwner = {}            -- [ownerKey] = { [nodeKey] = { neighborKey, ... } }
+local nodeMetaByOwner  = {}            -- [ownerKey] = { [nodeKey] = meta }
+PathingModule.nodeMeta = nodeMetaByOwner
 
-local roadNetworks = {}
-local globalAdjacency = PathingModule.globalAdjacency  -- convenience alias
+local roadNetworks = {}                -- [zoneId] = { owner=<ownerKey>, ... }
+local globalAdjacency = PathingModule.globalAdjacency  -- union view (read-only for consumers)
+
+-- Road Parallel helpers
+local function insertUnique(t, v)
+	for i = 1, #t do if t[i] == v then return t end end
+	table.insert(t, v)
+	return t
+end
+local function addEdge(adj, aKey, bKey)
+	if not adj then return end
+	adj[aKey] = insertUnique(adj[aKey] or {}, bKey)
+	adj[bKey] = insertUnique(adj[bKey] or {}, aKey)
+end
+
+-- Helpers to normalize an owner key (Player | userId | string)
+local function ownerKey(owner)
+	if typeof(owner) == "Instance" and owner:IsA("Player") then
+		return tostring(owner.UserId)
+	end
+	local n = tonumber(owner)
+	if n then return tostring(n) end
+	return owner and tostring(owner) or "global"
+end
+
+local function getAdjacency(owner, create)
+	local key = ownerKey(owner)
+	local bucket = adjacencyByOwner[key]
+	if not bucket and create then
+		bucket = {}
+		adjacencyByOwner[key] = bucket
+	end
+	return bucket, key
+end
+
+local function getNodeMeta(owner, create)
+	local key = ownerKey(owner)
+	local bucket = nodeMetaByOwner[key]
+	if not bucket and create then
+		bucket = {}
+		nodeMetaByOwner[key] = bucket
+	end
+	return bucket, key
+end
+
+local function rebuildAdjacencyUnion()
+	local newUnion = {}
+	for _, adj in pairs(adjacencyByOwner) do
+		for nodeKeyStr, neighbors in pairs(adj) do
+			local dest = newUnion[nodeKeyStr]
+			if not dest then
+				dest = {}
+				newUnion[nodeKeyStr] = dest
+			end
+			for _, nb in ipairs(neighbors) do
+				insertUnique(dest, nb)
+			end
+		end
+	end
+	globalAdjacency = newUnion
+	PathingModule.globalAdjacency = globalAdjacency
+end
 
 -- Public: cache of owned endpoints (dead-ends) by userId (rebuilt on demand)
 PathingModule._ownedDeadEndsCache = {}  -- [userId] = { ["x_z"]=true, ... }
@@ -88,17 +150,6 @@ local function areNeighbors(c1, c2)
 	local dx = math.abs(c1.x - c2.x)
 	local dz = math.abs(c1.z - c2.z)
 	return (dx == 1 and dz == 0) or (dx == 0 and dz == 1)
-end
-
--- Road Parallel helpers
-local function insertUnique(t, v)
-	for i = 1, #t do if t[i] == v then return t end end
-	table.insert(t, v)
-	return t
-end
-local function addEdge(aKey, bKey)
-	globalAdjacency[aKey] = insertUnique(globalAdjacency[aKey] or {}, bKey)
-	globalAdjacency[bKey] = insertUnique(globalAdjacency[bKey] or {}, aKey)
 end
 
 -- Axis helpers for “parallel shielding”
@@ -169,8 +220,10 @@ end
 --   * PERPENDICULAR: allow anywhere
 --   * PARALLEL colinear: policy gate (see shouldConnectParallel)
 --   * PARALLEL lateral: **allow only at endpoints** (see shouldConnectLateralAtEndpoints)
-local function addToNetwork(zoneId, roadCoords)
+local function addToNetwork(zoneId, roadCoords, owner)
 	dprint(string.format("[PathingModule] Adding road segments for Road ID '%s'", zoneId))
+	local adj, ownerKeyStr = getAdjacency(owner, true)
+	local meta = select(1, getNodeMeta(ownerKeyStr, true))
 
 	-- Build or update the per-road record
 	local network = roadNetworks[zoneId]
@@ -201,21 +254,21 @@ local function addToNetwork(zoneId, roadCoords)
 	-- Ensure nodes exist + write metadata (axis, role, group)
 	for i, c in ipairs(roadCoords) do
 		local k = nodeKey(c)
-		if not globalAdjacency[k] then globalAdjacency[k] = {} end
+		if adj and not adj[k] then adj[k] = {} end
 		local role = (i == 1 or i == #roadCoords) and "End" or "Mid"
 		local axis = axisOfCell(roadCoords, i)
-		nodeMeta[k] = { groupId = zoneId, axis = axis, role = role }
+		meta[k] = { groupId = zoneId, axis = axis, role = role }
 	end
 
 	-- Connect consecutive cells inside this path
 	for i = 1, #roadCoords - 1 do
-		addEdge(nodeKey(roadCoords[i]), nodeKey(roadCoords[i + 1]))
+		addEdge(adj, nodeKey(roadCoords[i]), nodeKey(roadCoords[i + 1]))
 	end
 
 	-- STITCH: to OTHER paths around every node
 	for i, e in ipairs(roadCoords) do
 		local eKey  = nodeKey(e)
-		local eMeta = nodeMeta[eKey]
+		local eMeta = meta[eKey]
 		local candidates = {
 			{ x = e.x + 1, z = e.z     },
 			{ x = e.x - 1, z = e.z     },
@@ -224,27 +277,27 @@ local function addToNetwork(zoneId, roadCoords)
 		}
 		for _, n in ipairs(candidates) do
 			local nKey  = nodeKey(n)
-			local nAdj  = globalAdjacency[nKey]
-			local nMeta = nodeMeta[nKey]
+			local nAdj  = adj and adj[nKey] or nil
+			local nMeta = meta[nKey]
 			if nAdj and nMeta and nMeta.groupId ~= eMeta.groupId then
 				local dx, dz = n.x - e.x, n.z - e.z
 				local axesParallel = (nMeta.axis == eMeta.axis)
 
 				if not axesParallel then
-					-- Perpendicular => allow T/4‑way joins anywhere
-					addEdge(eKey, nKey)
+					-- Perpendicular => allow T/4-way joins anywhere
+					addEdge(adj, eKey, nKey)
 				else
 					-- Parallel
 					local lateral = isLateralNeighbor(eMeta.axis, dx, dz)
 					if lateral then
 						-- NEW: allow lateral stitches ONLY at endpoints (one side or both)
 						if shouldConnectLateralAtEndpoints(eMeta, nMeta) then
-							addEdge(eKey, nKey)
+							addEdge(adj, eKey, nKey)
 						end
 					else
 						-- Colinear: policy gate
 						if shouldConnectParallel(eMeta, nMeta) then
-							addEdge(eKey, nKey)
+							addEdge(adj, eKey, nKey)
 						end
 					end
 				end
@@ -253,13 +306,14 @@ local function addToNetwork(zoneId, roadCoords)
 	end
 
 	-- invalidate owned endpoints cache (graph changed)
-	PathingModule._ownedDeadEndsCache = {}
+	PathingModule._ownedDeadEndsCache[ownerKeyStr] = nil
 end
 
 -- classifyNode: is it Straight, Turn, 3Way, 4Way, etc.?
-function PathingModule.classifyNode(coord)
+function PathingModule.classifyNode(coord, owner)
 	local k = nodeKey(coord)
-	local neighbors = globalAdjacency[k]
+	local adj = getAdjacency(owner, false) or globalAdjacency
+	local neighbors = adj and adj[k]
 	if not neighbors or #neighbors == 0 then return "None" end
 
 	local upKey = nodeKey({ x = coord.x,     z = coord.z - 1 })
@@ -311,7 +365,8 @@ end
 --=== NEW PUBLIC HELPERS: endpoints & proximity ===--
 
 local function nodeOwnedByPlayer(player, key)
-	local meta = nodeMeta and nodeMeta[key]
+	local metaBucket = select(1, getNodeMeta(player, false))
+	local meta = metaBucket and metaBucket[key]
 	if not meta then return false end
 	local zid = meta.groupId
 	if not zid then return false end
@@ -321,11 +376,14 @@ end
 
 -- Returns a set of dead-end nodeKeys owned by player. Cached per userId.
 function PathingModule.getOwnedDeadEndKeys(player)
-	local uid = player.UserId
+	if not player then return {} end
+	local uid = ownerKey(player)
 	local cached = PathingModule._ownedDeadEndsCache[uid]
 	if cached then return cached end
+	local adj = select(1, getAdjacency(player, false))
+	if not adj then return {} end
 	local set = {}
-	for k, nbrs in pairs(globalAdjacency) do
+	for k, nbrs in pairs(adj) do
 		if nodeOwnedByPlayer(player, k) then
 			if nbrs and #nbrs == 1 then
 				set[k] = true
@@ -347,9 +405,10 @@ function PathingModule.getOwnedDeadEnds(player)
 end
 
 -- Iterate all road nodes (coords)
-function PathingModule.iterAllRoadCoords()
+function PathingModule.iterAllRoadCoords(owner)
 	local list = {}
-	for k,_ in pairs(globalAdjacency) do
+	local adj = getAdjacency(owner, false) or globalAdjacency
+	for k,_ in pairs(adj) do
 		local x, z = splitKey(k)
 		list[#list+1] = { x = x, z = z, key = k }
 	end
@@ -357,9 +416,10 @@ function PathingModule.iterAllRoadCoords()
 end
 
 -- Find nearest road node to a given grid coord within maxManhattan (cells). Returns coord or nil.
-function PathingModule.findNearestRoadNode(coord, maxManhattan)
+function PathingModule.findNearestRoadNode(coord, maxManhattan, owner)
 	local best, bestD = nil, math.huge
-	for k,_ in pairs(globalAdjacency) do
+	local adj = getAdjacency(owner, false) or globalAdjacency
+	for k,_ in pairs(adj) do
 		local x, z = splitKey(k)
 		local d = math.abs(x - coord.x) + math.abs(z - coord.z)
 		if d < bestD and d <= maxManhattan then
@@ -372,50 +432,63 @@ end
 
 -- NEW: pass to add lateral stitches at endpoints across ALL currently known networks.
 -- Useful after loading old saves or toggling policy.
-function PathingModule.stitchEndpointLaterals()
-	for eKey, _ in pairs(globalAdjacency) do
-		local eMeta = nodeMeta[eKey]
-		if eMeta then
-			local ex, ez = splitKey(eKey)
-			local candidates
-			if eMeta.axis == "EW" then
-				candidates = {
-					{ x = ex, z = ez - 1 },
-					{ x = ex, z = ez + 1 },
-				}
-			else -- "NS"
-				candidates = {
-					{ x = ex - 1, z = ez },
-					{ x = ex + 1, z = ez },
-				}
-			end
-			for _, n in ipairs(candidates) do
-				local nKey  = nodeKey(n)
-				local nMeta = nodeMeta[nKey]
-				-- Only stitch to another group; require same axis (parallel) and endpoint on either side
-				if nMeta and nMeta.groupId ~= eMeta.groupId and nMeta.axis == eMeta.axis then
-					if shouldConnectLateralAtEndpoints(eMeta, nMeta) then
-						addEdge(eKey, nKey)
+function PathingModule.stitchEndpointLaterals(owner)
+	local function stitchBucket(adj, meta)
+		for eKey, _ in pairs(adj or {}) do
+			local eMeta = meta and meta[eKey]
+			if eMeta then
+				local ex, ez = splitKey(eKey)
+				local candidates
+				if eMeta.axis == "EW" then
+					candidates = {
+						{ x = ex, z = ez - 1 },
+						{ x = ex, z = ez + 1 },
+					}
+				else -- "NS"
+					candidates = {
+						{ x = ex - 1, z = ez },
+						{ x = ex + 1, z = ez },
+					}
+				end
+				for _, n in ipairs(candidates) do
+					local nKey  = nodeKey(n)
+					local nMeta = meta and meta[nKey]
+					-- Only stitch to another group; require same axis (parallel) and endpoint on either side
+					if nMeta and nMeta.groupId ~= eMeta.groupId and nMeta.axis == eMeta.axis then
+						if shouldConnectLateralAtEndpoints(eMeta, nMeta) then
+							addEdge(adj, eKey, nKey)
+						end
 					end
 				end
 			end
 		end
 	end
-	-- graph changed: drop caches
-	PathingModule._ownedDeadEndsCache = {}
+	if owner ~= nil then
+		local adj = select(1, getAdjacency(owner, false))
+		local meta = select(1, getNodeMeta(owner, false))
+		if adj and meta then stitchBucket(adj, meta) end
+		PathingModule._ownedDeadEndsCache[ownerKey(owner)] = nil
+	else
+		for ownerKeyStr, adj in pairs(adjacencyByOwner) do
+			local meta = nodeMetaByOwner[ownerKeyStr]
+			if adj and meta then stitchBucket(adj, meta) end
+			PathingModule._ownedDeadEndsCache[ownerKeyStr] = nil
+		end
+	end
+	rebuildAdjacencyUnion()
 end
 
 -- MAIN ENTRY: we fill missing cells, then add to adjacency, then store direction.
-function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoord)
+function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoord, owner)
 	dprint(string.format("[PathingModule] Registering road '%s' of type '%s' with grid coordinates:", zoneId, mode))
 	-- for _, coord in ipairs(gridCoords) do dprint(string.format("[PathingModule] (%d,%d)", coord.x, coord.z)) end
 
 	local filledCoords = fillLineBetweenCoords(gridCoords)
-	addToNetwork(zoneId, filledCoords)
+	addToNetwork(zoneId, filledCoords, owner)
 
 	-- NEW: after adding this network, stitch endpoint laterals globally so
 	-- endpoints next to side-by-side roads become connected.
-	PathingModule.stitchEndpointLaterals()
+	PathingModule.stitchEndpointLaterals(owner)
 
 	local overallDirection = PathingModule.determineOverallDirection(startCoord, endCoord)
 	dprint(string.format("[PathingModule] Road '%s' is built in direction: %s", zoneId, overallDirection))
@@ -425,31 +498,36 @@ function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoo
 		network.overallDirection = overallDirection
 		network.startCoord = startCoord
 		network.endCoord   = endCoord
+		network.owner      = ownerKey(owner)
 		dprint(string.format("[PathingModule] Stored direction '%s' + start/end for '%s'.", overallDirection, zoneId))
 	else
 		dwarn(string.format("[PathingModule] Could not update network for road '%s'.", zoneId))
 	end
+	rebuildAdjacencyUnion()
 end
 
-function PathingModule.unregisterRoad(zoneId)
+function PathingModule.unregisterRoad(zoneId, owner)
 	local network = roadNetworks[zoneId]
+	local ownerKeyStr = ownerKey(owner or (network and network.owner))
+	local adj = select(1, getAdjacency(ownerKeyStr, false)) or select(1, getAdjacency("global", false))
+	local meta = select(1, getNodeMeta(ownerKeyStr, false)) or select(1, getNodeMeta("global", false))
 	if network then
-		if network.segments then
+		if network.segments and adj then
 			for _, seg in ipairs(network.segments) do
 				local k = nodeKey(seg.coord)
-				if globalAdjacency[k] then
-					for _, neighborKey in ipairs(globalAdjacency[k]) do
-						if globalAdjacency[neighborKey] then
+				if adj[k] then
+					for _, neighborKey in ipairs(adj[k]) do
+						if adj[neighborKey] then
 							local newList = {}
-							for _, item in ipairs(globalAdjacency[neighborKey]) do
+							for _, item in ipairs(adj[neighborKey]) do
 								if item ~= k then table.insert(newList, item) end
 							end
-							globalAdjacency[neighborKey] = newList
+							adj[neighborKey] = newList
 						end
 					end
-					globalAdjacency[k] = nil
-					nodeMeta[k] = nil
+					adj[k] = nil
 				end
+				if meta then meta[k] = nil end
 			end
 		end
 		roadNetworks[zoneId] = nil
@@ -457,7 +535,8 @@ function PathingModule.unregisterRoad(zoneId)
 		dwarn(string.format("[PathingModule] Attempted to unregister non-existent road '%s'.", zoneId))
 	end
 	-- graph changed: drop caches
-	PathingModule._ownedDeadEndsCache = {}
+	PathingModule._ownedDeadEndsCache[ownerKeyStr] = nil
+	rebuildAdjacencyUnion()
 end
 
 -- BFS & other helpers
@@ -562,12 +641,34 @@ function PathingModule.getConnectedRoads(coord)
 end
 
 function PathingModule.reset()
+	adjacencyByOwner = {}
+	nodeMetaByOwner  = {}
+	PathingModule.nodeMeta = nodeMetaByOwner
 	PathingModule.globalAdjacency = {}
 	globalAdjacency = PathingModule.globalAdjacency
-	PathingModule.nodeMeta = {}
-	nodeMeta = PathingModule.nodeMeta
 	roadNetworks = {}
 	PathingModule._ownedDeadEndsCache = {}
+end
+
+function PathingModule.resetForPlayer(owner)
+	local key = ownerKey(owner)
+	adjacencyByOwner[key] = nil
+	nodeMetaByOwner[key]  = nil
+	PathingModule._ownedDeadEndsCache[key] = nil
+	for zid, net in pairs(roadNetworks) do
+		if net and (net.owner == key or (net.id and tostring(net.id):find(key))) then
+			roadNetworks[zid] = nil
+		end
+	end
+	rebuildAdjacencyUnion()
+end
+
+function PathingModule.getAdjacencyForOwner(owner)
+	return select(1, getAdjacency(owner, false))
+end
+
+function PathingModule.getNodeMetaForOwner(owner)
+	return select(1, getNodeMeta(owner, false))
 end
 
 PathingModule.nodeKey           = nodeKey

@@ -13,8 +13,8 @@ local WORDS_PER_MINUTE = 230
 local MIN_HOLD_SECONDS = 2.5          -- floor so short lines don't vanish
 local FADE_IN_SECONDS  = 0.25
 local FADE_OUT_SECONDS = 0.35
-local MAX_ACTIVE_BUBBLES = 1          -- concurrent bubbles allowed (<=0 disables limit)
-local GLOBAL_BUBBLE_COOLDOWN = 3.0    -- seconds between bubbles once the prior one fades
+local MAX_ACTIVE_BUBBLES = 1          -- concurrent bubbles allowed per plot (<=0 disables limit)
+local GLOBAL_BUBBLE_COOLDOWN = 3.0    -- seconds between bubbles once the prior one fades (per plot)
 
 ---------------------------------------------------------------------
 -- Template lookup (error fast if missing)
@@ -166,6 +166,28 @@ local function findCivByNameAllPlots(name: string): Model?
 	return nil
 end
 
+-- Find the owning plot for a civ model so we can enforce per-plot limits.
+local function findOwningPlot(model: Instance): Instance?
+	local pp = Workspace:FindFirstChild("PlayerPlots")
+	if not (pp and model) then return nil end
+
+	-- Walk ancestors until we find a direct child of PlayerPlots.
+	local cur = model
+	while cur and cur ~= pp do
+		if cur.Parent == pp then
+			return cur
+		end
+		cur = cur.Parent
+	end
+
+	-- Fallback: infer from OwnerUserId attribute.
+	local ownerId = model:GetAttribute("OwnerUserId")
+	if ownerId ~= nil then
+		return pp:FindFirstChild("Plot_" .. tostring(ownerId))
+	end
+	return nil
+end
+
 ---------------------------------------------------------------------
 -- Core: ensure a civ has a following TextDialog cloned from template
 ---------------------------------------------------------------------
@@ -224,8 +246,11 @@ end
 -- Per-model sequence number so a newer line cancels older animations.
 local ActiveSeq = setmetatable({}, { __mode = "k" }) -- weak keys so models can GC
 local bubbleTokens = setmetatable({}, { __mode = "k" })
-local activeBubbleCount = 0
-local lastBubbleReleasedAt = 0
+local modelPlots = setmetatable({}, { __mode = "k" }) -- cache owning plot per model
+local activeBubbleCountByPlot = setmetatable({}, { __mode = "k" })
+local lastBubbleReleasedAtByPlot = setmetatable({}, { __mode = "k" })
+local globalActiveBubbleCount = 0
+local globalLastBubbleReleasedAt = 0
 
 local function tryAcquireBubbleSlot(model)
 	if not model then return nil end
@@ -234,18 +259,39 @@ local function tryAcquireBubbleSlot(model)
 		bubbleTokens[model] = token
 		return token
 	end
+
+	local plot = findOwningPlot(model)
+	if plot then
+		modelPlots[model] = plot
+	end
+
 	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 then
-		if activeBubbleCount >= MAX_ACTIVE_BUBBLES then
-			return nil
-		end
-		if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and activeBubbleCount == 0 then
-			local since = os.clock() - lastBubbleReleasedAt
-			if since < GLOBAL_BUBBLE_COOLDOWN then
+		if plot then
+			local active = activeBubbleCountByPlot[plot] or 0
+			if active >= MAX_ACTIVE_BUBBLES then
 				return nil
 			end
+			if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and active == 0 then
+				local since = os.clock() - (lastBubbleReleasedAtByPlot[plot] or 0)
+				if since < GLOBAL_BUBBLE_COOLDOWN then
+					return nil
+				end
+			end
+			activeBubbleCountByPlot[plot] = active + 1
+		else
+			if globalActiveBubbleCount >= MAX_ACTIVE_BUBBLES then
+				return nil
+			end
+			if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and globalActiveBubbleCount == 0 then
+				local since = os.clock() - globalLastBubbleReleasedAt
+				if since < GLOBAL_BUBBLE_COOLDOWN then
+					return nil
+				end
+			end
+			globalActiveBubbleCount += 1
 		end
-		activeBubbleCount += 1
 	end
+
 	bubbleTokens[model] = token
 	return token
 end
@@ -254,9 +300,26 @@ local function releaseBubbleSlot(model, token)
 	if not model then return end
 	if bubbleTokens[model] ~= token then return end
 	bubbleTokens[model] = nil
-	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 and activeBubbleCount > 0 then
-		activeBubbleCount -= 1
-		lastBubbleReleasedAt = os.clock()
+
+	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 then
+		local plot = modelPlots[model] or findOwningPlot(model)
+		if plot then
+			local active = activeBubbleCountByPlot[plot] or 0
+			if active > 0 then
+				active -= 1
+				if active == 0 then
+					activeBubbleCountByPlot[plot] = nil
+					lastBubbleReleasedAtByPlot[plot] = os.clock()
+				else
+					activeBubbleCountByPlot[plot] = active
+				end
+			end
+		else
+			if globalActiveBubbleCount > 0 then
+				globalActiveBubbleCount -= 1
+				globalLastBubbleReleasedAt = os.clock()
+			end
+		end
 	end
 end
 

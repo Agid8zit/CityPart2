@@ -66,6 +66,7 @@ local ZoneTracker         = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local ZoneRequirementsCheck = require(ZoneMgr:WaitForChild("ZoneRequirementsCheck"))
 local EconomyService      = require(ZoneMgr:WaitForChild("EconomyService"))
 local CityInteractions    = require(ZoneMgr:WaitForChild("CityInteraction"))
+local LayerManager        = require(Bld:WaitForChild("LayerManager"))
 local CoreConcepts        = Zones:WaitForChild("CoreConcepts")
 local PowerGenFolder      = CoreConcepts:WaitForChild("PowerGen")
 local PowerGeneratorModule = require(PowerGenFolder:WaitForChild("PowerGenerator"))
@@ -826,6 +827,9 @@ local function wipeLiveWorld(player: Player)
 			end
 		end
 	end
+
+	-- Drop any archived layer data for this player to avoid cross-session restores
+	LayerManager.clearPlayer(player)
 end
 
 ----------------------------------------------------------------
@@ -1815,6 +1819,8 @@ Players.PlayerRemoving:Connect(function(plr)
 	InflightPopByUid[plr.UserId] = 0
 	InReload[plr] = nil
 
+	local firedPlayerSaved = false
+
 	if _loading[plr] then
 		LOG("PlayerRemoving: skipping world snapshot for", plr.Name, "(still loading)")
 	else
@@ -1829,17 +1835,23 @@ Players.PlayerRemoving:Connect(function(plr)
 			pcall(function() waitAllZonesSettled(plr, 10.0) end)
 		end
 
-		savePlayer(plr, false, {
+		savePlayer(plr, true, {
 			skipWorldWhenReloading = true,
 			awaitPipelines = true,
 			reason = "PlayerRemoving",
 		})
+		firedPlayerSaved = true
 	end
 
 	_loading[plr] = nil
 
 	PlayerDataService.SaveFlush(plr, "PlayerRemoving")
 	PlayerDataService.WaitForSavesToDrain(plr, 25)
+
+	-- Ensure listeners (PlotAssigner/cleanup) run even if we skipped the world snapshot.
+	if PlayerSaved and not firedPlayerSaved then
+		PlayerSaved:Fire(plr)
+	end
 end)
 
 ----------------------------------------------------------------

@@ -56,7 +56,7 @@ end)
 local CFG = {
 	-- populations
 	MaxAlivePerZone      = 1,
-	GlobalMaxAlive       = 40,    -- hard ceiling across the entire city
+	GlobalMaxAlive       = 40,    -- per-player ceiling
 	TargetMin            = 1,
 	TargetMax            = 1,
 	ZoneTypesEligible    = { Residential=true, ResDense=true, Commercial=true, CommDense=true, Industrial=true, IndusDense=true },
@@ -492,7 +492,7 @@ local zoneOwner        = {}   -- zoneId -> Player (for deferred maintain)
 local civByZone        = {}   -- zoneId -> { [Model]=true }
 local civFolderByZone  = {}   -- zoneId -> Folder
 local folderWatcher    = {}   -- zoneId -> RBXScriptConnection
-local globalAlive      = 0    -- total alive across the entire city
+local globalAliveByPlayer = {} -- [userId] -> alive count (per owner)
 local seededPlayers    = {}   -- userId -> true once seeded
 
 local function globalCapEnabled()
@@ -513,7 +513,11 @@ local function incAlive(zoneId, n)
 	local delta = n or 1
 	if delta <= 0 then return end
 	alivePerZone[zoneId] = (alivePerZone[zoneId] or 0) + delta
-	globalAlive += delta
+	local owner = zoneOwner[zoneId]
+	local uid = owner and owner.UserId
+	if uid then
+		globalAliveByPlayer[uid] = (globalAliveByPlayer[uid] or 0) + delta
+	end
 end
 local function decAlive(zoneId, n)
 	local delta = n or 1
@@ -521,11 +525,20 @@ local function decAlive(zoneId, n)
 	local current = alivePerZone[zoneId] or 0
 	local applied = math.min(delta, current)
 	alivePerZone[zoneId] = math.max(0, current - delta)
-	globalAlive = math.max(0, globalAlive - applied)
+	local owner = zoneOwner[zoneId]
+	local uid = owner and owner.UserId
+	if uid then
+		local nextCount = math.max(0, (globalAliveByPlayer[uid] or 0) - applied)
+		globalAliveByPlayer[uid] = nextCount
+	end
 end
 local function canSpawn(zoneId)
-	if globalCapEnabled() and globalAlive >= CFG.GlobalMaxAlive then
-		return false
+	if globalCapEnabled() then
+		local owner = zoneOwner[zoneId]
+		local uid = owner and owner.UserId
+		if uid and (globalAliveByPlayer[uid] or 0) >= CFG.GlobalMaxAlive then
+			return false
+		end
 	end
 	return (alivePerZone[zoneId] or 0) < CFG.MaxAlivePerZone
 end
@@ -729,9 +742,12 @@ maintainZoneSteadyState = function(player, zoneId)
 	local alive   = alivePerZone[zoneId] or 0
 	local deficit = math.max(0, math.min(target, CFG.MaxAlivePerZone) - alive)
 	if deficit <= 0 then return end
-	if globalCapEnabled() and globalAlive >= CFG.GlobalMaxAlive then
-		dprint(("[Maintain] global cap reached (%d/%d); deferring spawn for zone %s"):format(
-			globalAlive, CFG.GlobalMaxAlive, tostring(zoneId)))
+	local owner = zoneOwner[zoneId] or player
+	local uid = owner and owner.UserId
+	local ownerAlive = (uid and globalAliveByPlayer[uid]) or 0
+	if globalCapEnabled() and ownerAlive >= CFG.GlobalMaxAlive then
+		dprint(("[Maintain] global cap reached (%d/%d) for player %s; deferring spawn for zone %s"):format(
+			ownerAlive, CFG.GlobalMaxAlive, tostring(uid), tostring(zoneId)))
 		return
 	end
 	dprint(("[Maintain] zone=%s target=%d alive=%d deficit=%d"):format(zoneId, target, alive, deficit))
@@ -864,9 +880,10 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	end
 
 	local speed = math.max(0.5, CFG.CivilianWalkSpeed or 3.5)
-	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s (global=%d/%s)"):format(
+	local ownerAlive = globalAliveByPlayer[player.UserId] or 0
+	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s (playerAlive=%d/%s)"):format(
 		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(CFG.SpawnOnEdgeOutside), tostring(CFG.DespawnAtTargetEdge),
-		globalAlive, tostring(CFG.GlobalMaxAlive or "∞")))
+		ownerAlive, tostring(CFG.GlobalMaxAlive or "inf")))
 	CivilianMovement.moveAlongPath(model, wpath, zoneId, {
 		WalkSpeed    = speed,
 		DestroyAtEnd = false,   -- we will enqueue despawn ourselves
@@ -1102,6 +1119,7 @@ Players.PlayerRemoving:Connect(function(player)
 	zoneCellsVersion[uid] = nil
 	zoneSnapshotCache[uid] = nil
 	seededPlayers[uid] = nil
+	globalAliveByPlayer[uid] = nil
 	local bucket = readyQueueByPlayer[uid]
 	if bucket then
 		bucket.list = {}

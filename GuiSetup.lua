@@ -41,7 +41,6 @@ local GUI_TO_INITIALIZE: {[string]: boolean} = {
 -- Tunables
 local FIRST_PASS_TIMEOUT      = 6.0   -- seconds to look for each GUI at startup (avoids "infinite yield" warnings)
 local POLL_INTERVAL           = 0.25  -- polling cadence while waiting
-local LATE_BIND_LISTEN_WINDOW = 120.0 -- keep listening for late-added GUIs for this long
 
 -- Services / Defines
 local Players = game:GetService("Players")
@@ -145,13 +144,7 @@ end
 
 -- Second pass: listen for GUIs that spawn later (e.g., created by scripts)
 do
-	local deadline = time() + LATE_BIND_LISTEN_WINDOW
-
-	local conn; conn = PlayerGui.ChildAdded:Connect(function(child)
-		if time() > deadline then
-			if conn then conn:Disconnect() end
-			return
-		end
+	PlayerGui.ChildAdded:Connect(function(child)
 		local name = child.Name
 		local want = GUI_TO_INITIALIZE[name]
 		if want ~= nil and not Initialized[name] and child:IsA("ScreenGui") then
@@ -160,10 +153,5 @@ do
 				initializeGui(name, want)
 			end)
 		end
-	end)
-
-	-- Optional: hard stop the listener after the window
-	task.delay(LATE_BIND_LISTEN_WINDOW, function()
-		if conn then conn:Disconnect() end
 	end)
 end

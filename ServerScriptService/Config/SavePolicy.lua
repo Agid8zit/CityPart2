@@ -1,6 +1,7 @@
-﻿return {
+return {
 	APPLY_CHANGES = false,
 	ENV = "Release", -- "Studio" | "Release"
+	RUN_AUDIT_ON_BOOT = false, -- gate the expensive SaveAuditor pass unless explicitly enabled
 
 	PLAYER_DS_BY_ENV = {
 		Studio = "PlayerData_PublicTest2",

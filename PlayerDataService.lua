@@ -32,6 +32,9 @@ local SLOT_ID = "player"
 local PER_USER_PRUNE_INTERVAL = 90
 local PER_USER_PRUNE_BATCH = 2
 
+-- Fail-safe: world reload staging should be brief; auto-heal if it ever gets stuck.
+local NO_COMMIT_TIMEOUT_SEC = 60
+
 -- Defines
 PlayerDataService.AllPlayerData = {} -- [Player] = PlayerData
 
@@ -69,6 +72,7 @@ local RF_RequestReload = ReplicatedStorage.Events.RemoteEvents.RequestReload
 local _noCommitWindow = {}                 -- [Player] = true
 local _stagedPatches = {}                  -- [Player] = { [path] = value }
 local _lastGoodSlotSnapshot = {}           -- [Player] = deep clone of current savefile (slot table)
+local _noCommitEnteredAt = {}              -- [Player] = os.clock() timestamp
 
 local function _getSaveData(Player: Player)
 	local pd = PlayerDataService.AllPlayerData[Player]
@@ -233,6 +237,7 @@ local function _enterNoCommitWindow(Player: Player)
 	_noCommitWindow[Player] = true
 	_stagedPatches[Player] = {}
 	_lastGoodSlotSnapshot[Player] = _deepClone(sf)
+	_noCommitEnteredAt[Player] = os.clock()
 end
 
 local function _commitNoCommitWindow(Player: Player)
@@ -262,6 +267,7 @@ local function _commitNoCommitWindow(Player: Player)
 	-- Clear window
 	_stagedPatches[Player] = nil
 	_noCommitWindow[Player] = nil
+	_noCommitEnteredAt[Player] = nil
 end
 
 local function _rollbackNoCommitWindow(Player: Player)
@@ -273,6 +279,23 @@ local function _rollbackNoCommitWindow(Player: Player)
 	end
 	_stagedPatches[Player] = nil
 	_noCommitWindow[Player] = nil
+	_noCommitEnteredAt[Player] = nil
+end
+
+-- Guard: if WorldReloadEnd never fires, do not leave the player read-only forever.
+local function _maybeAutoCommitNoCommitWindow(Player: Player)
+	if not _noCommitWindow[Player] then return false end
+	local enteredAt = _noCommitEnteredAt[Player]
+	if not enteredAt then
+		_noCommitEnteredAt[Player] = os.clock()
+		return false
+	end
+	if (os.clock() - enteredAt) >= NO_COMMIT_TIMEOUT_SEC then
+		warn(("[PlayerDataService] Auto-committing stale no-commit window after %.1fs for %s"):format(os.clock() - enteredAt, Player.Name))
+		_commitNoCommitWindow(Player)
+		return true
+	end
+	return false
 end
 
 function PlayerDataService.IsInNoCommitWindow(Player: Player): boolean
@@ -604,11 +627,16 @@ function PlayerDataService.ModifySaveData(Player: Player, Path: string, NewValue
 
 	-- If a reload is in progress for this player, stage the mutation.
 	if _noCommitWindow[Player] then
-		local patches = _stagedPatches[Player]
-		if not patches then patches = {}; _stagedPatches[Player] = patches end
-		-- shallow copy is fine for our paths (strings/numbers/encoded blobs)
-		patches[Path] = (Utility and Utility.CloneTable) and Utility.CloneTable(NewValue) or NewValue
-		return
+		-- Auto-heal any stuck windows instead of silently dropping live updates (e.g., income).
+		if _maybeAutoCommitNoCommitWindow(Player) then
+			-- committed + window cleared; fall through to normal path below
+		else
+			local patches = _stagedPatches[Player]
+			if not patches then patches = {}; _stagedPatches[Player] = patches end
+			-- shallow copy is fine for our paths (strings/numbers/encoded blobs)
+			patches[Path] = (Utility and Utility.CloneTable) and Utility.CloneTable(NewValue) or NewValue
+			return
+		end
 	end
 
 	-- Normal path: mutate live data and notify client
@@ -876,6 +904,7 @@ function PlayerDataService.PlayerRemoved(Player: Player)
 	_noCommitWindow[Player] = nil
 	_stagedPatches[Player] = nil
 	_lastGoodSlotSnapshot[Player] = nil
+	_noCommitEnteredAt[Player] = nil
 end
 
 function PlayerDataService.Init()

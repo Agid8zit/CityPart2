@@ -38,15 +38,12 @@ local RE_OnboardingStepCompleted = RE:WaitForChild("OnboardingStepCompleted")
 -- [ADDED] bring in UpdateStatsUI for balance cache (you were already using this later)
 local UIUpdate_RemoteEvent = RE:WaitForChild("UpdateStatsUI")
 
-local Catalog = require(script.Parent:WaitForChild("BuildMenuCatalog"))
-local UnlockState = Catalog.UnlockState or { requirement = {}, order = {}, types = {}, prev = {} }
-local FeatureModels, RangeVisualTemplate, FLAGS, ITEMNAME_TO_SECTION = Catalog.getCatalog()
-
 -- Constant
 local BUTTON_SCROLL_SPEED = 300
 
 -- Defines
 local UI = script.Parent
+local LocalPlayer = Players.LocalPlayer
 local MajorCurrentTabName = nil
 local CurrentTabName = nil
 local TabSections = {} -- [TabName] = FrameContainer
@@ -54,13 +51,13 @@ local FrameButtons = {} -- [BuildingID] = Frame
 local CachedLevel = 0
 local CachedBalance = 0               -- [ADDED] numeric balance cache
 
-function _resolveLang(key: string?, fallback: string?)
+local function _resolveLang(key: string?, fallback: string?)
 	if type(key) ~= "string" or key == "" then
 		return fallback
 	end
 
 	local lang: string? = nil
-	local player = Players.LocalPlayer
+	local player = LocalPlayer
 	if player then
 		local attr = player:GetAttribute("Language")
 		if type(attr) == "string" and attr ~= "" then
@@ -117,11 +114,9 @@ end
 
 
 local OBArrow = UI.OnboardingArrow
-local ARROW = {
-	VERTICAL_OFFSET = -5,
-	BOUNCE_AMPLITUDE = 4,
-	BOUNCE_SPEED = 2,
-}
+local ARROW_VERTICAL_OFFSET = -5
+local ARROW_BOUNCE_AMPLITUDE = 4
+local ARROW_BOUNCE_SPEED = 2
 
 local BE_TabChanged   = BE:WaitForChild("OBBuildMenuTabChanged")       -- :Fire("major", "Zones" | "Transport" | "Supply" | "Services")
 local BF_GetMajorTab  = BF:WaitForChild("OBBuildMenuGetMajorTab")      -- :Invoke() -> string?
@@ -141,7 +136,7 @@ BF_GetHub.OnInvoke = function(majorName)
 	return nil
 end
 
-function ensureDisableDeleteModeEvent(): BindableEvent
+local function ensureDisableDeleteModeEvent(): BindableEvent
 	local evt = BE:FindFirstChild("DisableDeleteMode")
 	if not evt then
 		evt = Instance.new("BindableEvent")
@@ -159,7 +154,7 @@ local _obArrowConn = nil
 local _obArrowOwnerKey = nil
 local _obArrowToken = 0
 
-function _regTarget(key: string, gui: GuiObject?)
+local function _regTarget(key: string, gui: GuiObject?)
 	_pulseTargets[key] = gui
 	pcall(function() UITargetRegistry.Register(key, gui) end)
 end
@@ -168,7 +163,7 @@ local PULSE_COLOR = Color3.fromRGB(90, 255, 120)
 -- Forward-declare: other code calls this before we assign it.
 local _updatePulses: (() -> ())? = nil
 
-function _ensurePulseRing(gui: GuiObject)
+local function _ensurePulseRing(gui: GuiObject)
 	local ring = gui:FindFirstChild("_PulseRing")
 	if ring and ring:IsA("Frame") then
 		local stroke = ring:FindFirstChildOfClass("UIStroke")
@@ -203,7 +198,7 @@ function _ensurePulseRing(gui: GuiObject)
 end
 
 -- [FIX] central arrow release so we can hide even if the GUI target is gone
-function _releaseArrowIfOwner(key: string?)
+local function _releaseArrowIfOwner(key: string?)
 	if _obArrowOwnerKey and (_obArrowOwnerKey == key or key == nil) then
 		if _obArrowConn then _obArrowConn() end
 		_obArrowConn = nil
@@ -215,7 +210,7 @@ function _releaseArrowIfOwner(key: string?)
 	end
 end
 
-function _startPulseFor(gui: GuiObject?, key: string)
+local function _startPulseFor(gui: GuiObject?, key: string)
 	-- If no target exists, make sure any previous arrow owned by this key is gone.
 	if not gui or not gui.Parent then
 		_releaseArrowIfOwner(key)
@@ -256,8 +251,8 @@ function _startPulseFor(gui: GuiObject?, key: string)
 
 			local pos = gui.AbsolutePosition
 			local size = gui.AbsoluteSize
-			local bounce = math.sin(os.clock() * ARROW.BOUNCE_SPEED) * ARROW.BOUNCE_AMPLITUDE
-			OBArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y + ARROW.VERTICAL_OFFSET + bounce)
+			local bounce = math.sin(os.clock() * ARROW_BOUNCE_SPEED) * ARROW_BOUNCE_AMPLITUDE
+			OBArrow.Position = UDim2.fromOffset(pos.X + size.X * 0.5, pos.Y + ARROW_VERTICAL_OFFSET + bounce)
 		end)
 	end
 
@@ -278,7 +273,7 @@ function _startPulseFor(gui: GuiObject?, key: string)
 	return true
 end
 
-function _stopPulseForKey(key: string)
+local function _stopPulseForKey(key: string)
 	local gui = _pulseTargets[key]
 
 	-- If we still have the GUI reference, stop its ring tween/token.
@@ -309,7 +304,7 @@ function _stopPulseForKey(key: string)
 	end
 end
 
-function _stopAllPulses()
+local function _stopAllPulses()
 	for key, gui in pairs(_pulseTargets) do
 		if gui then _stopPulseForKey(key) else
 			-- key registered but no gui; still ensure arrow gets released if it was owned by this key
@@ -324,7 +319,7 @@ end
 local _obEnabled: boolean = false
 local _obGateItemID: string? = nil  -- single source of truth
 
-function _refreshPulseTargets()
+local function _refreshPulseTargets()
 	-- Transport
 	local transportBtn; pcall(function() transportBtn = UI.main.tabs.transport.Background end)
 	_regTarget("BM_Transport", transportBtn)
@@ -394,7 +389,7 @@ end
 -- ============================================================================
 
 -- [ADDED] helpers mirrored from Grid script so we can pre-check affordability at click time
-function parseAbbrev(str)
+local function parseAbbrev(str)
 	-- “50k” → 50000, “1.2m” → 1200000
 	local num, suffix = tonumber(str:match("^([%d%.]+)")), str:match("([kmbt])$")
 	if not num then return 0 end
@@ -402,14 +397,14 @@ function parseAbbrev(str)
 	return num * (mults[suffix] or 1)
 end
 
-function asNumber(val)
+local function asNumber(val)
 	if type(val) == "number" then return val end
 	if type(val) == "string" then return tonumber(val) or parseAbbrev(val) or 0 end
 	return 0
 end
 
-function openPremiumShop()
-	local pg = Players.LocalPlayer:FindFirstChild("PlayerGui") or Players.LocalPlayer:WaitForChild("PlayerGui")
+local function openPremiumShop()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
 
 	-- Preferred (module-driven) shop
 	local premiumShopGui = pg:FindFirstChild("PremiumShopGui")
@@ -448,12 +443,16 @@ local VARIABLE_COST_IDS = {
 	ResDense = true, CommDense = true, IndusDense = true,
 }
 
-function isZoneOrLinear(itemID)
+local function isZoneOrLinear(itemID)
 	if type(itemID) ~= "string" then return false end
 	-- dynamic flags are fixed price per placement (we DO pre-check those), so exclude them here
 	if itemID:sub(1,5) == "Flag:" then return false end
 	return VARIABLE_COST_IDS[itemID] == true
 end
+
+local BuildingLevelRequirement = {} -- [BuildingID] = MinLevel
+-- Populate Level Requirements
+local UnlockOrderIndex = {}        -- [BuildingID] = global sort index to preserve config ordering
 
 local unlocksByLevel = BalanceEconomy.ProgressionConfig.unlocksByLevel
 local levelKeys = {}
@@ -462,7 +461,7 @@ for level in pairs(unlocksByLevel) do
 end
 table.sort(levelKeys)
 
-function getUnlockList(levelNumber: number)
+local function getUnlockList(levelNumber: number)
 	return unlocksByLevel[levelNumber] or unlocksByLevel[tostring(levelNumber)]
 end
 
@@ -471,34 +470,152 @@ for _, levelNumber in ipairs(levelKeys) do
 	local buildingList = getUnlockList(levelNumber)
 	if type(buildingList) == "table" then
 		for _, buildingID in ipairs(buildingList) do
-			UnlockState.requirement[buildingID] = levelNumber
+			BuildingLevelRequirement[buildingID] = levelNumber
 			orderSeed += 1
-			UnlockState.order[buildingID] = orderSeed
+			UnlockOrderIndex[buildingID] = orderSeed
 		end
 	end
 end
 
-function shouldAnnounceUnlock(featureID: string): boolean
+local function shouldAnnounceUnlock(featureID: string): boolean
 	-- Treat anything missing from the config as level 0 (starter content)
-	return (UnlockState.requirement[featureID] or 0) > 0
+	return (BuildingLevelRequirement[featureID] or 0) > 0
 end
 
 -- UI References
-local UIRefs = {
-	Exit            = UI.main.exit,
-	TabServices     = UI.main.tabs.services,
-	TabSupply       = UI.main.tabs.supply,
-	TabTransport    = UI.main.tabs.transport,
-	TabZones        = UI.main.tabs.zones,
-	TabScrollLeft   = UI.main.container.Left,
-	TabScrollRight  = UI.main.container.Right,
-	TabChoices      = UI.main.container.TabChoices.Template,
-	PlaceButton     = UI.main.PlaceButton,
-}
+local UI_Exit = UI.main.exit
 
-UIRefs.TabChoices.Visible = false
+local UI_Tab_Services = UI.main.tabs.services
+local UI_Tab_Supply = UI.main.tabs.supply
+local UI_Tab_Transpot = UI.main.tabs.transport
+local UI_Tab_Zones = UI.main.tabs.zones
+
+local UI_TabScroll_Left = UI.main.container.Left
+local UI_TabScroll_Right = UI.main.container.Right
+
+local UI_TabChoicesContainer = UI.main.container.TabChoices.Template;
+UI_TabChoicesContainer.Visible = false
+
+local UI_PlaceButton = UI.main.PlaceButton
+
+local UnlockedTypes = {}
+local PrevUnlocks = {}  -- feature -> bool
+local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
+
+-- === Model catalog for unlock popups ===
+local RS  = game:GetService("ReplicatedStorage")
+local FT  = RS:WaitForChild("FuncTestGroundRS")
+local BLD = FT:WaitForChild("Buildings")
 
 local CategoryButtonForSection: {[string]: Frame} = {}
+
+-- optional name normalization for hub buttons whose label != section name
+local ITEMNAME_TO_SECTION = {
+	["Fire Dept"] = "Fire",
+	["Police"]    = "Police",
+	["Health"]    = "Health",
+	["Education"] = "Education",
+	["Leisure"]   = "Leisure",
+	["Sports"]    = "Sports",
+	["Landmarks"] = "Landmarks",
+	["Power"]     = "Power",
+	["Water"]     = "Water",
+	["Flags"]     = "Flags"
+}
+
+-- Common folders you used in BuildMenu
+local IND  = BLD:WaitForChild("Individual"):WaitForChild("Default")
+local EDUC = IND:WaitForChild("Education")
+local FIRE = IND:WaitForChild("Fire")
+local POLI = IND:WaitForChild("Police")
+local HLTH = IND:WaitForChild("Health")
+local LAND = IND:WaitForChild("Landmark")
+local LEIS = IND:WaitForChild("Leisure")
+local SPRT = IND:WaitForChild("Sports")
+local POWR = IND:WaitForChild("Power")
+local WATR = IND:WaitForChild("Water")
+local TRAN = IND:FindFirstChild("Transport") -- only if you have it
+local FLAGS = IND:WaitForChild("Flags")
+
+-- Map feature IDs (as used in Progression.unlocksByLevel) to models
+local FeatureModels = {
+	-- Education
+	PrivateSchool = EDUC["Private School"],
+	MiddleSchool  = EDUC["Middle School"],
+	NewsStation   = EDUC["News Station"],
+	Museum        = EDUC.Museum,
+
+	-- Fire
+	FireDept      = FIRE["FireDept"],
+	FireStation   = FIRE["FireStation"],
+	FirePrecinct  = FIRE["FirePrecinct"],
+
+	-- Leisure
+	Church        = LEIS["Church"],
+	Mosque        = LEIS["Mosque"],
+	ShintoTemple  = LEIS["Shinto Temple"],
+	HinduTemple   = LEIS["Hindu Temple"],
+	BuddhaStatue  = LEIS["Buddha Statue"],
+	Hotel         = LEIS["Hotel"],
+	MovieTheater  = LEIS["Movie Theater"],
+
+	-- Police
+	PoliceDept     = POLI["Police Dept"],
+	PoliceStation  = POLI["Police Station"],
+	PolicePrecinct = POLI["Police Precinct"],
+	Courthouse     = POLI["Courthouse"],
+
+	-- Health
+	SmallClinic   = HLTH["Small Clinic"],
+	LocalHospital = HLTH["Local Hospital"],
+	CityHospital  = HLTH["City Hospital"],
+	MajorHospital = HLTH["Major Hospital"],
+
+	-- Sports
+	SkatePark         = SPRT["Skate Park"],
+	TennisCourt       = SPRT["Tennis Court"],
+	PublicPool        = SPRT["Public Pool"],
+	ArcheryRange      = SPRT["Archery Range"],
+	GolfCourse        = SPRT["Golf Course"],
+	BasketballCourt   = SPRT["Basketball Court"],
+	SoccerStadium     = SPRT["Soccer Stadium"],
+	FootballStadium   = SPRT["Football Stadium"],
+	BasketballStadium = SPRT["Basketball Stadium"],
+
+	-- Landmarks
+	FerrisWheel          = LAND["Ferris Wheel"],
+	GasStation           = LAND["Gas Station"],
+	Bank                 = LAND["Bank"],
+	TechOffice           = LAND["Tech Office"],
+	NationalCapital      = LAND["National Capital"],
+	Obelisk              = LAND["Obelisk"],
+	ModernSkyscraper     = LAND["Modern Skyscraper"],
+	EmpireStateBuilding  = LAND["Empire State Building"],
+	SpaceNeedle          = LAND["Space Needle"],
+	WorldTradeCenter     = LAND["World Trade Center"],
+	CNTower              = LAND["CN Tower"],
+	StatueOfLiberty      = LAND["Statue Of Liberty"],
+	EiffelTower          = LAND["Eiffel Tower"],
+
+	-- Supply: Power
+	WindTurbine          = POWR["Wind Turbine"],
+	SolarPanels          = POWR["Solar Panels"],
+	CoalPowerPlant       = POWR["Coal Power Plant"],
+	GasPowerPlant        = POWR["Gas Power Plant"],
+	GeothermalPowerPlant = POWR["Geothermal Power Plant"],
+	NuclearPowerPlant    = POWR["Nuclear Power Plant"],
+
+	-- Supply: Water
+	WaterTower             = WATR["Water Tower"] or WATR:FindFirstChild("Water Tower"),
+	WaterPlant             = WATR["Water Plant"],
+	PurificationWaterPlant = WATR["Purification Water Plant"],
+	MolecularWaterPlant    = WATR["Molecular Water Plant"],
+
+	-- Transport (if present)
+	Airport               = TRAN and TRAN["Airport"] or nil,
+	BusDepot              = TRAN and TRAN["Bus Depot"] or nil,
+	MetroEntrance         = TRAN and TRAN["Metro Entrance"] or nil,
+}
 
 local FeatureIcons = {
 	Commercial  = "rbxassetid://80804212045512",
@@ -508,11 +625,9 @@ local FeatureIcons = {
 	IndusDense  = "rbxassetid://139640185589881",
 }
 
-local TabState = {
-	ItemToSection     = {}, -- "PoliceDept" -> "Police"
-	PendingByItem     = {}, -- per-item pending
-	SectionHasPending = {}, -- "Fire" -> true if any item pending in Fire
-}
+local ItemToSection: {[string]: string} = {}      -- "PoliceDept" -> "Police"
+local PendingByItem: {[string]: boolean} = {}     -- per-item pending
+local SectionHasPending: {[string]: boolean} = {} -- "Fire" -> true if any item pending in Fire
 
 -- Map a section to its top tab for hierarchical badges
 local SECTION_TO_MAJOR = {
@@ -541,7 +656,7 @@ local SECTION_TO_MAJOR = {
 }
 
 -- Ensure every button gets a "notification" Frame (red dot) once
-function ensureButtonNotif(btn: Frame)
+local function ensureButtonNotif(btn: Frame)
 	local dot = btn:FindFirstChild("notification")
 	if dot then return dot end
 	dot = Instance.new("Frame")
@@ -560,7 +675,7 @@ function ensureButtonNotif(btn: Frame)
 end
 
 -- Toggle top-tab pips based on any pending underneath
-function setTopTabNotification(major: string, state: boolean)
+local function setTopTabNotification(major: string, state: boolean)
 	if major == "Services" then
 		BuildMenu.SetServicesTabNotification(state)
 	elseif major == "Supply" then
@@ -573,12 +688,12 @@ function setTopTabNotification(major: string, state: boolean)
 end
 
 -- Recompute the *major* tab pips from SectionHasPending
-function recomputeTopTabBadges()
+local function recomputeTopTabBadges()
 	local anyServices = false
 	local anySupply   = false
 	local anyTransport= false
 	local anyZones    = false
-	for section, has in pairs(TabState.SectionHasPending) do
+	for section, has in pairs(SectionHasPending) do
 		if has then
 			local major = SECTION_TO_MAJOR[section]
 			if major == "Services"  then anyServices  = true
@@ -595,24 +710,24 @@ function recomputeTopTabBadges()
 end
 
 -- When user opens a section, mark everything in that section as "seen"
-function markSectionSeen(sectionName: string)
+local function markSectionSeen(sectionName: string)
 	local uiSection = TabSections[sectionName]
 	if not uiSection then return end
 
 	-- Clear per-button dots + pending flags for items in this section
 	for itemID, btn in pairs(FrameButtons) do
-		if TabState.ItemToSection[itemID] == sectionName then
-			TabState.PendingByItem[itemID] = nil
+		if ItemToSection[itemID] == sectionName then
+			PendingByItem[itemID] = nil
 			local dot = btn:FindFirstChild("notification")
 			if dot then dot.Visible = false end
 		end
 	end
 
-	TabState.SectionHasPending[sectionName] = false
+	SectionHasPending[sectionName] = false
 	recomputeTopTabBadges()
 end
 
-function entriesFor(features: {string})
+local function entriesFor(features: {string})
 	local arr = {}
 	for _, id in ipairs(features) do
 		-- Prefer icon for these
@@ -630,13 +745,13 @@ function entriesFor(features: {string})
 	return arr
 end
 
-function shallowCopy(t)
+local function shallowCopy(t)
 	local c = {}
 	for k, v in pairs(t) do c[k] = v end
 	return c
 end
 
-function openUnlockModal(gainedList)
+local function openUnlockModal(gainedList)
 	if #gainedList == 0 then return end
 
 	-- Locate/prepare the UnlockGUI ScreenGui
@@ -675,34 +790,45 @@ local RE_ToggleBusDepotGui = RE:WaitForChild("ToggleBusDepotGui")
 local RE_ToggleAirportGui  = RE:WaitForChild("ToggleAirportGui")
 local RE_AirSupportStatus  = RE:FindFirstChild("AirSupportStatus")
 -- In the BuildMenu table:
-local InfraState = {
-	myPlot = nil,
-	playerzones = nil,
-	playerzonesVisible = false,
-	pipesfolder = nil,
-	pipesfoldervisible = false,
-	waterpipeszones = nil,
-	waterpipeszonesVisible = false,
-	powerlineszones = nil,
-	powerlineszonesVisible = false,
-	buildings = nil,
-	buildingVisible = false,
-	buildingsNoQueryActive = false,
-	metroTunnelsFolder = nil,
-	metroTunnelsVisible = false,
-}
+local myPlot = nil
+local playerzones = nil
+local playerzonesVisible = false
+local pipesfolder = nil
+local pipesfoldervisible = false
+local waterpipeszones = nil
+local waterpipeszonesVisible = false
+local powerlineszones = nil
+local powerlineszonesVisible = false
+local buildings = nil
+local buildingVisible = false
+local buildingsNoQueryActive = false
+local metroTunnelsFolder = nil
+local metroTunnelsVisible = false
 
 local InfraVisibilityControllers: {[Instance]: {visible: boolean, conn: RBXScriptConnection?}} = {}
 local ForeignPlotChildConns: {[Instance]: RBXScriptConnection?} = {}
 local ForeignRangeVisualConns: {[Instance]: RBXScriptConnection?} = {}
 
-function applyLocalTransparency(inst: Instance, visible: boolean)
+local function applyLocalTransparency(inst: Instance, visible: boolean)
 	if inst:IsA("BasePart") then
 		inst.LocalTransparencyModifier = visible and 0 or 1
+		if not visible then
+			inst.Transparency = 1
+			inst.CanCollide = false
+			inst.CanTouch = false
+			inst.CanQuery = false
+			inst.CastShadow = false
+		end
+	elseif inst:IsA("Decal") or inst:IsA("Texture") then
+		if not visible then
+			inst.Transparency = 1
+		end
+	elseif inst:IsA("Beam") or inst:IsA("Trail") or inst:IsA("ParticleEmitter") then
+		inst.Enabled = visible
 	end
 end
 
-function ensureInfraController(folder: Instance)
+local function ensureInfraController(folder: Instance)
 	local controller = InfraVisibilityControllers[folder]
 	if controller then
 		return controller
@@ -730,7 +856,7 @@ function ensureInfraController(folder: Instance)
 	return controller
 end
 
-function setInfraFolderVisible(folder: Instance?, visible: boolean)
+local function setInfraFolderVisible(folder: Instance?, visible: boolean)
 	if not folder then return end
 	local controller = ensureInfraController(folder)
 	controller.visible = visible and true or false
@@ -739,29 +865,29 @@ function setInfraFolderVisible(folder: Instance?, visible: boolean)
 	end
 end
 
-local function hideInfraChild(child: Instance)
-	if not child then return end
-	local name = child.Name
-	if name == "Pipes" or name == "MetroTunnels" then
-		setInfraFolderVisible(child, false)
-	end
-end
-
-function hideForeignInfrastructure(plot: Instance)
+local function hideForeignInfrastructure(plot: Instance)
 	if not plot or not plot:IsA("Model") then return end
 	local ownerId = tonumber((plot.Name or ""):match("^Plot_(%d+)$"))
-	if ownerId == nil or ownerId == Players.LocalPlayer.UserId then
+	if not ownerId or ownerId == LocalPlayer.UserId then
 		return
 	end
 	if ForeignPlotChildConns[plot] then
 		return
 	end
 
-	for _, child in ipairs(plot:GetChildren()) do
-		hideInfraChild(child)
+	local function hideChild(child: Instance)
+		if not child then return end
+		local name = child.Name
+		if name == "Pipes" or name == "MetroTunnels" then
+			setInfraFolderVisible(child, false)
+		end
 	end
 
-	ForeignPlotChildConns[plot] = plot.ChildAdded:Connect(hideInfraChild)
+	for _, child in ipairs(plot:GetChildren()) do
+		hideChild(child)
+	end
+
+	ForeignPlotChildConns[plot] = plot.ChildAdded:Connect(hideChild)
 	plot.Destroying:Connect(function()
 		local conn = ForeignPlotChildConns[plot]
 		if conn then
@@ -779,93 +905,54 @@ PlayerPlotsFolder.ChildAdded:Connect(function(child)
 	hideForeignInfrastructure(child)
 end)
 
-InfraState.buildingTransparencyMode = false
-InfraState.storedBuildingTransparency = {} -- [Instance] = number
-InfraState.storedBuildingCanCollide = {}   -- [Instance] = boolean   -- [ADDED]
-InfraState.storedBuildingCanQuery   = {}   -- [Instance] = boolean   -- [ADDED]
+local buildingTransparencyMode = false
+local storedBuildingTransparency = {} -- [Instance] = number
+local storedBuildingCanCollide = {}   -- [Instance] = boolean   -- [ADDED]
+local storedBuildingCanQuery   = {}   -- [Instance] = boolean   -- [ADDED]
 
-function isRangeVisualGuiName(name: string?)
-	return name == "Inner" or name == "Outter" or name == "Outer"
-end
-
-function isRangeVisualPart(inst: Instance): boolean
+local function isRangeVisualPart(inst: Instance): boolean
 	if not (inst and inst:IsA("BasePart")) then return false end
 	local inner  = inst:FindFirstChild("Inner")
 	local outter = inst:FindFirstChild("Outter") or inst:FindFirstChild("Outer")
 	return (inner and inner:IsA("SurfaceGui")) or (outter and outter:IsA("SurfaceGui"))
 end
 
-function disableRangeVisualGuis(target: Instance)
-	-- Turn off the SurfaceGui layers that actually draw the ring
-	if target:IsA("SurfaceGui") then
-		if isRangeVisualGuiName(target.Name) then
-			target.Enabled = false
-		end
-		return
-	end
-
-	for _, guiName in ipairs({ "Inner", "Outter", "Outer" }) do
-		local gui = target:FindFirstChild(guiName)
-		if gui and gui:IsA("SurfaceGui") then
-			gui.Enabled = false
-		end
-	end
-end
-
-local function looksLikeRV(part: Instance): boolean
-	if not (part and part:IsA("BasePart")) then return false end
-	if string.find(part.Name, "RangeVisual", 1, true) then return true end
+local function _disableRangeSurfaceGuis(part: BasePart)
 	local inner = part:FindFirstChild("Inner")
-	if inner and inner:IsA("SurfaceGui") then return true end
+	if inner and inner:IsA("SurfaceGui") then inner.Enabled = false end
 	local outer = part:FindFirstChild("Outer") or part:FindFirstChild("Outter")
-	if outer and outer:IsA("SurfaceGui") then return true end
-	for _, d in ipairs(part:GetDescendants()) do
-		if d:IsA("SurfaceGui") then return true end
-	end
-	return false
+	if outer and outer:IsA("SurfaceGui") then outer.Enabled = false end
 end
 
-local function ensureIsRV(part: BasePart)
-	if looksLikeRV(part) and part:GetAttribute("IsRangeVisual") ~= true then
-		pcall(function() part:SetAttribute("IsRangeVisual", true) end)
-	end
-end
-
-local function disableRVGuisUnder(instance: Instance)
-	for _, d in ipairs(instance:GetDescendants()) do
-		if d:IsA("SurfaceGui") and isRangeVisualGuiName(d.Name) then
-			d.Enabled = false
-		end
-	end
-end
-
-local function disableAllZoneSurfaceGuis()
-	if not InfraState.playerzones then return end
-	disableRVGuisUnder(InfraState.playerzones)
-end
-
-function hideRangeVisualPartLocally(inst: Instance)
+local function hideRangeVisualPartLocally(inst: Instance)
 	if isRangeVisualPart(inst) then
 		inst.LocalTransparencyModifier = 1
-		disableRangeVisualGuis(inst)
-		return
-	end
-
-	-- Descendants may arrive in any order; also catch bare SurfaceGui additions
-	if inst:IsA("SurfaceGui") and isRangeVisualGuiName(inst.Name) then
-		inst.Enabled = false
-		local adornee = inst.Adornee
-			or inst:FindFirstAncestorWhichIsA("BasePart")
-		if adornee then
-			adornee.LocalTransparencyModifier = 1
+		if inst:IsA("BasePart") then
+			_disableRangeSurfaceGuis(inst)
+			inst.Transparency = 1
+			inst.CanCollide = false
+			inst.CanTouch = false
+			inst.CanQuery = false
+			inst.CastShadow = false
 		end
 	end
 end
 
-function hideForeignRangeVisuals(plot: Instance)
+local function _plotOwnerId(plot: Instance)
+	if not (plot and plot:IsA("Model")) then return nil end
+	local attr = plot:GetAttribute("Owner") or plot:GetAttribute("OwnerId") or plot:GetAttribute("PlayerId") or plot:GetAttribute("UserId")
+	if type(attr) == "number" then return attr end
+	if type(attr) == "string" then
+		local n = tonumber(attr)
+		if n then return n end
+	end
+	return tonumber((plot.Name or ""):match("(%d+)"))
+end
+
+local function hideForeignRangeVisuals(plot: Instance)
 	if not plot or not plot:IsA("Model") then return end
-	local ownerId = tonumber((plot.Name or ""):match("^Plot_(%d+)$"))
-	if ownerId == nil or ownerId == Players.LocalPlayer.UserId then
+	local ownerId = _plotOwnerId(plot)
+	if not ownerId or ownerId == LocalPlayer.UserId or (myPlot and plot == myPlot) then
 		return
 	end
 	if ForeignRangeVisualConns[plot] then
@@ -877,7 +964,12 @@ function hideForeignRangeVisuals(plot: Instance)
 	end
 
 	ForeignRangeVisualConns[plot] = plot.DescendantAdded:Connect(function(inst)
-		hideRangeVisualPartLocally(inst)
+		if inst:IsA("SurfaceGui") then
+			local p = inst:FindFirstAncestorWhichIsA("BasePart")
+			if p then hideRangeVisualPartLocally(p) end
+		else
+			hideRangeVisualPartLocally(inst)
+		end
 	end)
 
 	plot.Destroying:Connect(function()
@@ -896,46 +988,46 @@ task.spawn(function()
 	PlayerPlotsFolder.ChildAdded:Connect(hideForeignRangeVisuals)
 end)
 
-function SetBuildingsTransparent(state: boolean)
-	if not InfraState.buildings then return end
-	if InfraState.buildingTransparencyMode == state then return end
-	InfraState.buildingTransparencyMode = state
+local function SetBuildingsTransparent(state: boolean)
+	if not buildings then return end
+	if buildingTransparencyMode == state then return end
+	buildingTransparencyMode = state
 
-	for _, inst in ipairs(InfraState.buildings:GetDescendants()) do
+	for _, inst in ipairs(buildings:GetDescendants()) do
 		if inst:IsA("BasePart") then
 			-- SKIP range-visual parts entirely
 			if isRangeVisualPart(inst) then
 				-- do nothing
 			else
 				if state then
-					InfraState.storedBuildingTransparency[inst] = inst.Transparency
-					InfraState.storedBuildingCanCollide[inst]   = inst.CanCollide
-					InfraState.storedBuildingCanQuery[inst]     = inst.CanQuery
+					storedBuildingTransparency[inst] = inst.Transparency
+					storedBuildingCanCollide[inst]   = inst.CanCollide
+					storedBuildingCanQuery[inst]     = inst.CanQuery
 					inst.Transparency = 0.75
 					inst.CanCollide   = false
 					inst.CanQuery     = false
 				else
-					local t = InfraState.storedBuildingTransparency[inst]
-					if t ~= nil then inst.Transparency = t; InfraState.storedBuildingTransparency[inst] = nil end
-					local cc = InfraState.storedBuildingCanCollide[inst]
-					if cc ~= nil then inst.CanCollide = cc; InfraState.storedBuildingCanCollide[inst] = nil end
-					local cq = InfraState.storedBuildingCanQuery[inst]
-					if cq ~= nil then inst.CanQuery = cq;   InfraState.storedBuildingCanQuery[inst]   = nil end
+					local t = storedBuildingTransparency[inst]
+					if t ~= nil then inst.Transparency = t; storedBuildingTransparency[inst] = nil end
+					local cc = storedBuildingCanCollide[inst]
+					if cc ~= nil then inst.CanCollide = cc; storedBuildingCanCollide[inst] = nil end
+					local cq = storedBuildingCanQuery[inst]
+					if cq ~= nil then inst.CanQuery = cq;   storedBuildingCanQuery[inst]   = nil end
 				end
 			end
 		end
 	end
 end
 
-if InfraState.buildings then
-	InfraState.buildings.DescendantAdded:Connect(function(inst)
-		if not InfraState.buildingTransparencyMode then return end
+if buildings then
+	buildings.DescendantAdded:Connect(function(inst)
+		if not buildingTransparencyMode then return end
 		if inst:IsA("BasePart") then
 			-- SKIP range-visual parts entirely
 			if isRangeVisualPart(inst) then return end
-			InfraState.storedBuildingTransparency[inst] = inst.Transparency
-			InfraState.storedBuildingCanCollide[inst]   = inst.CanCollide
-			InfraState.storedBuildingCanQuery[inst]     = inst.CanQuery
+			storedBuildingTransparency[inst] = inst.Transparency
+			storedBuildingCanCollide[inst]   = inst.CanCollide
+			storedBuildingCanQuery[inst]     = inst.CanQuery
 			inst.Transparency = 0.75
 			inst.CanCollide   = false
 			inst.CanQuery     = false
@@ -944,14 +1036,14 @@ if InfraState.buildings then
 end
 
 -- keep stored values updated when new parts are added
-if InfraState.buildings then
-	InfraState.buildings.DescendantAdded:Connect(function(inst)
-		if not InfraState.buildingTransparencyMode then return end
+if buildings then
+	buildings.DescendantAdded:Connect(function(inst)
+		if not buildingTransparencyMode then return end
 		if inst:IsA("BasePart") then
 			-- store originals
-			InfraState.storedBuildingTransparency[inst] = inst.Transparency
-			InfraState.storedBuildingCanCollide[inst]   = inst.CanCollide
-			InfraState.storedBuildingCanQuery[inst]     = inst.CanQuery
+			storedBuildingTransparency[inst] = inst.Transparency
+			storedBuildingCanCollide[inst]   = inst.CanCollide
+			storedBuildingCanQuery[inst]     = inst.CanQuery
 			-- apply placement-friendly state
 			inst.Transparency = 0.75
 			inst.CanCollide   = false
@@ -960,12 +1052,12 @@ if InfraState.buildings then
 	end)
 end
 
-function SetBuildingsNoQuery(state: boolean)
-	if not InfraState.buildings then return end
-	if InfraState.buildingsNoQueryActive == state then return end
-	InfraState.buildingsNoQueryActive = state
+local function SetBuildingsNoQuery(state: boolean)
+	if not buildings then return end
+	if buildingsNoQueryActive == state then return end
+	buildingsNoQueryActive = state
 
-	for _, inst in ipairs(InfraState.buildings:GetDescendants()) do
+	for _, inst in ipairs(buildings:GetDescendants()) do
 		-- tag both parts and container models, in case your query layer checks either
 		if inst:IsA("BasePart") or inst:IsA("Model") then
 			-- pcall so we don't care if something is locked down / lacks attributes
@@ -976,11 +1068,11 @@ function SetBuildingsNoQuery(state: boolean)
 	end
 end
 
-function zoneAlpha(visible: boolean): number
+local function zoneAlpha(visible: boolean): number
 	return visible and 0.75 or 1.0
 end
 
-function applyZoneFolderVisibility(folder: Folder?, shouldShow: boolean)
+local function applyZoneFolderVisibility(folder: Folder?, shouldShow: boolean)
 	if not folder then return end
 	for _, child in ipairs(folder:GetChildren()) do
 		if child:IsA("BasePart") and not isRangeVisualPart(child) then
@@ -989,31 +1081,31 @@ function applyZoneFolderVisibility(folder: Folder?, shouldShow: boolean)
 	end
 end
 
-function playerZonesShouldRender(): boolean
-	return InfraState.playerzonesVisible and (UI and UI.Enabled)
+local function playerZonesShouldRender(): boolean
+	return playerzonesVisible and (UI and UI.Enabled)
 end
 
-function waterZonesShouldRender(): boolean
-	return InfraState.waterpipeszonesVisible and (UI and UI.Enabled)
+local function waterZonesShouldRender(): boolean
+	return waterpipeszonesVisible and (UI and UI.Enabled)
 end
 
-function powerZonesShouldRender(): boolean
-	return InfraState.powerlineszonesVisible and (UI and UI.Enabled)
+local function powerZonesShouldRender(): boolean
+	return powerlineszonesVisible and (UI and UI.Enabled)
 end
 
-function applyPlayerZoneVisibility()
-	applyZoneFolderVisibility(InfraState.playerzones, playerZonesShouldRender())
+local function applyPlayerZoneVisibility()
+	applyZoneFolderVisibility(playerzones, playerZonesShouldRender())
 end
 
-function applyWaterZoneVisibility()
-	applyZoneFolderVisibility(InfraState.waterpipeszones, waterZonesShouldRender())
+local function applyWaterZoneVisibility()
+	applyZoneFolderVisibility(waterpipeszones, waterZonesShouldRender())
 end
 
-function applyPowerZoneVisibility()
-	applyZoneFolderVisibility(InfraState.powerlineszones, powerZonesShouldRender())
+local function applyPowerZoneVisibility()
+	applyZoneFolderVisibility(powerlineszones, powerZonesShouldRender())
 end
 
-function applyAllZoneVisibilities()
+local function applyAllZoneVisibilities()
 	applyPlayerZoneVisibility()
 	applyWaterZoneVisibility()
 	applyPowerZoneVisibility()
@@ -1023,24 +1115,24 @@ if UI and UI.GetPropertyChangedSignal then
 	UI:GetPropertyChangedSignal("Enabled"):Connect(applyAllZoneVisibilities)
 end
 
-function ShowPipesModels(State: boolean)
-	InfraState.pipesfoldervisible = State == true
-	if not InfraState.pipesfolder then return end
-	if InfraState.pipesfoldervisible and InfraState.myPlot then
-		InfraState.pipesfolder.Parent = InfraState.myPlot
+local function ShowPipesModels(State: boolean)
+	pipesfoldervisible = State == true
+	if not pipesfolder then return end
+	if pipesfoldervisible and myPlot then
+		pipesfolder.Parent = myPlot
 	else
-		InfraState.pipesfolder.Parent = nil
+		pipesfolder.Parent = nil
 	end
 end
 ShowPipesModels(false)
 
-function ShowMetroModels(State: boolean)
-	InfraState.metroTunnelsVisible = State == true
-	if not InfraState.metroTunnelsFolder then return end
-	if InfraState.metroTunnelsVisible and InfraState.myPlot then
-		InfraState.metroTunnelsFolder.Parent = InfraState.myPlot
+local function ShowMetroModels(State: boolean)
+	metroTunnelsVisible = State == true
+	if not metroTunnelsFolder then return end
+	if metroTunnelsVisible and myPlot then
+		metroTunnelsFolder.Parent = myPlot
 	else
-		InfraState.metroTunnelsFolder.Parent = nil
+		metroTunnelsFolder.Parent = nil
 	end
 end
 ShowMetroModels(false)
@@ -1048,37 +1140,56 @@ ShowMetroModels(false)
 task.spawn(function()
 	local player = Players.LocalPlayer
 	local plots = PlayerPlotsFolder
-	InfraState.myPlot = plots:WaitForChild("Plot_" .. player.UserId)
-	InfraState.playerzones = InfraState.myPlot:WaitForChild("PlayerZones")
-	InfraState.waterpipeszones = InfraState.myPlot:WaitForChild("WaterPipeZones")
-	InfraState.powerlineszones = InfraState.myPlot:WaitForChild("PowerLinesZones")
-	InfraState.buildings = InfraState.myPlot:WaitForChild("Buildings")
-	InfraState.pipesfolder = InfraState.myPlot:WaitForChild("Pipes")
-	ShowPipesModels(InfraState.pipesfoldervisible)
-	InfraState.metroTunnelsFolder = InfraState.myPlot:WaitForChild("MetroTunnels", 3) or InfraState.metroTunnelsFolder
-	if InfraState.metroTunnelsFolder then
-		ShowMetroModels(InfraState.metroTunnelsVisible)
+	myPlot = plots:WaitForChild("Plot_" .. player.UserId)
+	playerzones = myPlot:WaitForChild("PlayerZones")
+	waterpipeszones = myPlot:WaitForChild("WaterPipeZones")
+	powerlineszones = myPlot:WaitForChild("PowerLinesZones")
+	buildings = myPlot:WaitForChild("Buildings")
+	pipesfolder = myPlot:WaitForChild("Pipes")
+	ShowPipesModels(pipesfoldervisible)
+	metroTunnelsFolder = myPlot:WaitForChild("MetroTunnels", 3) or metroTunnelsFolder
+	if metroTunnelsFolder then
+		ShowMetroModels(metroTunnelsVisible)
 	end
 
-	InfraState.myPlot.ChildAdded:Connect(function(child)
+	myPlot.ChildAdded:Connect(function(child)
 		if child.Name == "Pipes" and child:IsA("Folder") then
-			InfraState.pipesfolder = child
-			ShowPipesModels(InfraState.pipesfoldervisible)
+			pipesfolder = child
+			ShowPipesModels(pipesfoldervisible)
 		elseif child.Name == "MetroTunnels" and child:IsA("Folder") then
-			InfraState.metroTunnelsFolder = child
-			ShowMetroModels(InfraState.metroTunnelsVisible)
+			metroTunnelsFolder = child
+			ShowMetroModels(metroTunnelsVisible)
 		end
 	end)
 
+	local function looksLikeRV(part: Instance): boolean
+		if not (part and part:IsA("BasePart")) then return false end
+		if string.find(part.Name, "RangeVisual", 1, true) then return true end
+		local inner = part:FindFirstChild("Inner")
+		if inner and inner:IsA("SurfaceGui") then return true end
+		local outer = part:FindFirstChild("Outer") or part:FindFirstChild("Outter")
+		if outer and outer:IsA("SurfaceGui") then return true end
+		for _, d in ipairs(part:GetDescendants()) do
+			if d:IsA("SurfaceGui") then return true end
+		end
+		return false
+	end
+
+	local function ensureIsRV(part: BasePart)
+		if looksLikeRV(part) and part:GetAttribute("IsRangeVisual") ~= true then
+			pcall(function() part:SetAttribute("IsRangeVisual", true) end)
+		end
+	end
+
 	-- retro-tag anything already under PlayerZones
-	for _, inst in ipairs(InfraState.playerzones:GetDescendants()) do
+	for _, inst in ipairs(playerzones:GetDescendants()) do
 		if inst:IsA("BasePart") then
 			ensureIsRV(inst)
 		end
 	end
 
 	-- live: if a BasePart or its SurfaceGui appears later, stamp the attr
-	InfraState.playerzones.DescendantAdded:Connect(function(inst)
+	playerzones.DescendantAdded:Connect(function(inst)
 		if inst:IsA("BasePart") then
 			ensureIsRV(inst)
 		elseif inst:IsA("SurfaceGui") then
@@ -1088,54 +1199,68 @@ task.spawn(function()
 	end)
 
 	-- === RangeVisual SurfaceGui hard-off under PlayerZones ===
+	local function isRVGuiName(n) return n == "Inner" or n == "Outter" or n == "Outer" end
+
+	local function disableRVGuisUnder(instance: Instance)
+		for _, d in ipairs(instance:GetDescendants()) do
+			if d:IsA("SurfaceGui") and isRVGuiName(d.Name) then
+				d.Enabled = false
+			end
+		end
+	end
+
+	local function disableAllZoneSurfaceGuis()
+		if not playerzones then return end
+		disableRVGuisUnder(playerzones)
+	end
 	disableAllZoneSurfaceGuis()
 
-	InfraState.playerzones.DescendantAdded:Connect(function(inst)
-		if inst:IsA("SurfaceGui") and isRangeVisualGuiName(inst.Name) then
+	playerzones.DescendantAdded:Connect(function(inst)
+		if inst:IsA("SurfaceGui") and isRVGuiName(inst.Name) then
 			inst.Enabled = false
 			return
 		end
 		if inst:IsA("BasePart") and inst.Name == "RangeVisual" then
 			disableRVGuisUnder(inst)
 			inst.DescendantAdded:Connect(function(d)
-				if d:IsA("SurfaceGui") and isRangeVisualGuiName(d.Name) then
+				if d:IsA("SurfaceGui") and isRVGuiName(d.Name) then
 					d.Enabled = false
 				end
 			end)
 		end
 	end)
 
-	InfraState.playerzones.DescendantAdded:Connect(function(inst)
-		if inst:IsA("SurfaceGui") and isRangeVisualGuiName(inst.Name) then
+	playerzones.DescendantAdded:Connect(function(inst)
+		if inst:IsA("SurfaceGui") and (inst.Name == "Inner" or inst.Name == "Outter") then
 			inst.Enabled = false
 		end
 	end)
 
-if InfraState.buildings then
-	InfraState.buildings.ChildAdded:Connect(function(child)
-		if not InfraState.buildingsNoQueryActive then return end
-		for _, inst in ipairs(child:GetDescendants()) do
-			if inst:IsA("BasePart") or inst:IsA("Model") then
-				pcall(function() inst:SetAttribute("noquery", true) end)
+	if buildings then
+		buildings.ChildAdded:Connect(function(child)
+			if not buildingsNoQueryActive then return end
+			for _, inst in ipairs(child:GetDescendants()) do
+				if inst:IsA("BasePart") or inst:IsA("Model") then
+					pcall(function() inst:SetAttribute("noquery", true) end)
+				end
 			end
-		end
-		if child:IsA("BasePart") or child:IsA("Model") then
-			pcall(function() child:SetAttribute("noquery", true) end)
-		end
-	end)
-end
+			if child:IsA("BasePart") or child:IsA("Model") then
+				pcall(function() child:SetAttribute("noquery", true) end)
+			end
+		end)
+	end
 
-	InfraState.playerzones.ChildAdded:Connect(function(Part)
+	playerzones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
 		Part.Transparency = zoneAlpha(playerZonesShouldRender())
 	end)
-	InfraState.waterpipeszones.ChildAdded:Connect(function(Part)
+	waterpipeszones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
 		Part.Transparency = zoneAlpha(waterZonesShouldRender())
 	end)
-	InfraState.powerlineszones.ChildAdded:Connect(function(Part)
+	powerlineszones.ChildAdded:Connect(function(Part)
 		if not Part:IsA("BasePart") then return end
 		if isRangeVisualPart(Part) then return end
 		Part.Transparency = zoneAlpha(powerZonesShouldRender())
@@ -1144,7 +1269,7 @@ end
 	applyAllZoneVisibilities()
 end)
 
-function findScreenGui(container, name)
+local function findScreenGui(container, name)
 	local obj = container:FindFirstChild(name)
 	if obj and obj:IsA("ScreenGui") then return obj end
 	if obj then
@@ -1154,14 +1279,14 @@ function findScreenGui(container, name)
 	return nil
 end
 
-local PlayerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local HasBusDepot = false
 local HasAirport  = false
 local HasMetro   = false
 local BUS_DEPOT_GUI_NAME = "BusDepot"
 local AIRPORT_GUI_NAME = "Airport"
 
-function OpenAirportGUI()
+local function OpenAirportGUI()
 	local gui = PlayerGui:FindFirstChild(AIRPORT_GUI_NAME)
 	if not gui or not gui:IsA("ScreenGui") then
 		local template = ReplicatedStorage:FindFirstChild(AIRPORT_GUI_NAME)
@@ -1190,14 +1315,14 @@ function OpenAirportGUI()
 	if root then root.Visible = true end
 end
 
-function CloseAirportGUI()
+local function CloseAirportGUI()
 	local gui = PlayerGui:FindFirstChild(AIRPORT_GUI_NAME)
 	if gui and gui:IsA("ScreenGui") then
 		gui.Enabled = false
 	end
 end
 
-function ToggleAirportGUI(forceState)
+local function ToggleAirportGUI(forceState)
 	local gui = PlayerGui:FindFirstChild(AIRPORT_GUI_NAME)
 	if not gui or not gui:IsA("ScreenGui") then
 		if forceState == false then return end
@@ -1210,7 +1335,7 @@ end
 
 -- ==== Bus Depot GUI helpers ====
 
-function OpenBusDepotGUI()
+local function OpenBusDepotGUI()
 	local gui = PlayerGui:FindFirstChild(BUS_DEPOT_GUI_NAME)
 	if not gui or not gui:IsA("ScreenGui") then
 		local template = ReplicatedStorage:FindFirstChild(BUS_DEPOT_GUI_NAME)
@@ -1229,14 +1354,14 @@ function OpenBusDepotGUI()
 	if root then root.Visible = true end
 end
 
-function CloseBusDepotGUI()
+local function CloseBusDepotGUI()
 	local gui = PlayerGui:FindFirstChild(BUS_DEPOT_GUI_NAME)
 	if gui and gui:IsA("ScreenGui") then
 		gui.Enabled = false
 	end
 end
 
-function ToggleBusDepotGUI(forceState: boolean?)
+local function ToggleBusDepotGUI(forceState: boolean?)
 	local gui = PlayerGui:FindFirstChild(BUS_DEPOT_GUI_NAME)
 	if not gui or not gui:IsA("ScreenGui") then
 		if forceState == false then return end
@@ -1256,29 +1381,29 @@ RE_ToggleAirportGui.OnClientEvent:Connect(function(forceState)
 	ToggleAirportGUI(forceState)
 end)
 
-function SetPlayerZonesVisible(State: boolean)
-	InfraState.playerzonesVisible = State == true
+local function SetPlayerZonesVisible(State: boolean)
+	playerzonesVisible = State == true
 	applyPlayerZoneVisibility()
 end
 
-function SetWaterPipesZonesVisible(State: boolean)
-	InfraState.waterpipeszonesVisible = State == true
+local function SetWaterPipesZonesVisible(State: boolean)
+	waterpipeszonesVisible = State == true
 	applyWaterZoneVisibility()
 end
 
-function SetPowerLinesZonesVisible(State: boolean)
-	InfraState.powerlineszonesVisible = State == true
+local function SetPowerLinesZonesVisible(State: boolean)
+	powerlineszonesVisible = State == true
 	applyPowerZoneVisibility()
 end
 
-function ShowBuildingModels(State: boolean)
-	if not InfraState.buildings then return end
-	if InfraState.buildingVisible == State then return end
-	InfraState.buildingVisible = State
+local function ShowBuildingModels(State: boolean)
+	if not buildings then return end
+	if buildingVisible == State then return end
+	buildingVisible = State
 	if State then
-		InfraState.buildings.Parent = InfraState.myPlot
+		buildings.Parent = myPlot
 	else
-		InfraState.buildings.Parent = nil
+		buildings.Parent = nil
 	end
 end
 
@@ -1315,10 +1440,10 @@ local DefaultZoneTypes = {
 local _activeCategory
 local _suppressSeen = false
 
-function _refreshCategoryVisibility()
-	if not InfraState.playerzones then return end
+local function _refreshCategoryVisibility()
+	if not playerzones then return end
 	if not UI.Enabled then
-		for _, part in ipairs(InfraState.playerzones:GetChildren()) do
+		for _, part in ipairs(playerzones:GetChildren()) do
 			if part:IsA("BasePart") then
 				part.Transparency = 1.0
 			end
@@ -1326,7 +1451,7 @@ function _refreshCategoryVisibility()
 		return
 	end
 
-	for _, part in ipairs(InfraState.playerzones:GetChildren()) do
+	for _, part in ipairs(playerzones:GetChildren()) do
 		if not part:IsA("BasePart") then continue end
 		if isRangeVisualPart(part) then continue end
 		local zt = part:GetAttribute("ZoneType")
@@ -1366,9 +1491,9 @@ function BuildMenu.ShowZoneCategory(categoryName : string?)
 end
 
 function BuildMenu.ShowRangeVisualsOnly(selectedType)
-	local plot = InfraState.myPlot
+	local plot = myPlot
 	if not plot then return end
-	local b = InfraState.buildings
+	local b = buildings
 	if not b then return end
 
 	for _, model in ipairs(b:GetChildren()) do
@@ -1392,11 +1517,11 @@ function BuildMenu.ShowRangeVisualsOnly(selectedType)
 end
 
 -- Helper Functions
-function UpdateLocks()
+local function UpdateLocks()
 	local playerLevel = tonumber(CachedLevel) or 0
 
 	for itemID, Frame in pairs(FrameButtons) do
-		local LevelCost = tonumber(UnlockState.requirement[itemID])
+		local LevelCost = tonumber(BuildingLevelRequirement[itemID])
 		if LevelCost ~= nil then
 			local IsLocked = playerLevel < LevelCost
 
@@ -1426,14 +1551,14 @@ function UpdateLocks()
 	end
 end
 
-function _setPriceVisible(itemID: string, visible: boolean)
+local function _setPriceVisible(itemID: string, visible: boolean)
 	local btn = FrameButtons[itemID]
 	if not btn then return end
 	local priceLabel = btn.info and btn.info:FindFirstChild("price")
 	if priceLabel then priceLabel.Visible = visible end
 end
 
-function UpdateBusDepotButton()
+local function UpdateBusDepotButton()
 	local btn = FrameButtons["BusDepot"]
 	if btn and btn.info and btn.info.itemName then
 		local langKey = HasBusDepot and "Bus Depot Owned" or "Bus Depot"
@@ -1444,7 +1569,7 @@ function UpdateBusDepotButton()
 	_setPriceVisible("BusDepot", not HasBusDepot)
 end
 
-function UpdateAirportButton()
+local function UpdateAirportButton()
 	local btn = FrameButtons["Airport"]
 	if btn and btn.info and btn.info.itemName then
 		local langKey = HasAirport and "Airport Owned" or "Airport"
@@ -1455,7 +1580,7 @@ function UpdateAirportButton()
 	_setPriceVisible("Airport", not HasAirport)
 end
 
-function UpdateMetroButton()
+local function UpdateMetroButton()
 	local btn = FrameButtons["MetroEntrance"]
 	if btn and btn.info and btn.info.itemName then
 		local langKey = HasMetro and "Metro Owned" or "Metro"
@@ -1466,8 +1591,8 @@ function UpdateMetroButton()
 	_setPriceVisible("MetroEntrance", not HasMetro)
 end
 
-function CreateTabSection(SectionName: string, Choices) -- {itemname, price, image, modelref}
-	local UISection = UIRefs.TabChoices:Clone()
+local function CreateTabSection(SectionName: string, Choices) -- {itemname, price, image, modelref}
+	local UISection = UI_TabChoicesContainer:Clone()
 	UISection.Name = "TabSection_"..SectionName
 	UISection.Visible = false
 
@@ -1553,7 +1678,7 @@ function CreateTabSection(SectionName: string, Choices) -- {itemname, price, ima
 			Choice.LevelLocked.Visible = false
 
 		elseif Data.itemID ~= nil then
-			local LevelCost = UnlockState.requirement[Data.itemID]
+			local LevelCost = BuildingLevelRequirement[Data.itemID]
 			if LevelCost ~= nil then
 				Choice.Locked.Visible = (tonumber(CachedLevel) or 0) < LevelCost
 				Choice.LevelLocked.Text = "Lv. " .. tostring(LevelCost)
@@ -1597,32 +1722,32 @@ function CreateTabSection(SectionName: string, Choices) -- {itemname, price, ima
 
 		if Data.itemID then
 			FrameButtons[Data.itemID] = Choice
-			TabState.ItemToSection[Data.itemID] = SectionName
+			ItemToSection[Data.itemID] = SectionName
 
 			if type(Data.itemID) == "string" and Data.itemID ~= "" then
 				_regTarget("BM_" .. Data.itemID, Choice)
 			end
 
-			if TabState.PendingByItem[Data.itemID] then
+			if PendingByItem[Data.itemID] then
 				dot.Visible = true
-				TabState.SectionHasPending[SectionName] = true
+				SectionHasPending[SectionName] = true
 			end
 		else
 			local target = (ITEMNAME_TO_SECTION[Data.itemName] or Data.itemName)
 			CategoryButtonForSection[target] = Choice
 			_regTarget("BM_" .. target, Choice)
-			if TabState.SectionHasPending[target] then
+			if SectionHasPending[target] then
 				dot.Visible = true
 			end
 		end
 	end
 
-	UISection.Parent = UIRefs.TabChoices.Parent
+	UISection.Parent = UI_TabChoicesContainer.Parent
 	TabSections[SectionName] = UISection
 end
 
 -- Build the flags list from the folder on demand
-function _flagsChoices()
+local function _flagsChoices()
 	local arr = {}
 	local children = FLAGS and FLAGS:GetChildren() or {}
 	table.sort(children, function(a,b) return a.Name < b.Name end)
@@ -1643,7 +1768,7 @@ function _flagsChoices()
 	return arr
 end
 
-function _rebuildFlagsTab()
+local function _rebuildFlagsTab()
 	local old = TabSections["Flags"]
 	if old and old.Parent then old:Destroy() end
 	TabSections["Flags"] = nil
@@ -1661,19 +1786,19 @@ end
 
 -- Module Functions
 function BuildMenu.SetServicesTabNotification(State: boolean)
-	UIRefs.TabServices.notification.Visible = State
+	UI_Tab_Services.notification.Visible = State
 end
 
 function BuildMenu.SetSupplyTabNotification(State: boolean)
-	UIRefs.TabSupply.notification.Visible = State
+	UI_Tab_Supply.notification.Visible = State
 end
 
 function BuildMenu.SetTranspotTabNotification(State: boolean)
-	UIRefs.TabTransport.notification.Visible = State
+	UI_Tab_Transpot.notification.Visible = State
 end
 
 function BuildMenu.SetZonesTabNotification(State: boolean)
-	UIRefs.TabZones.notification.Visible = State
+	UI_Tab_Zones.notification.Visible = State
 end
 
 function BuildMenu.SetTab(TabName: string)
@@ -1814,14 +1939,14 @@ end
 
 FUS.OnClientEvent:Connect(function(unlockStatus)
 	for k, v in pairs(unlockStatus) do
-		UnlockState.types[k] = v
+		UnlockedTypes[k] = v
 	end
 
 	for _, UISection in pairs(TabSections) do
 		for _, btn in ipairs(UISection:GetChildren()) do
 			if btn:IsA("Frame") and btn.info and btn.info.itemName then
 				local itemType = btn.Name
-				local unlocked = UnlockState.types[itemType]
+				local unlocked = UnlockedTypes[itemType]
 
 				if btn.ModelPreview then
 					btn.ModelPreview.Visible = unlocked
@@ -1839,29 +1964,29 @@ FUS.OnClientEvent:Connect(function(unlockStatus)
 	UpdateAirportButton()
 
 	local gained = {}
-	local firstSync = (next(UnlockState.prev) == nil)
+	local firstSync = (next(PrevUnlocks) == nil)
 	if firstSync then
-		UnlockState.prev = shallowCopy(unlockStatus)
+		PrevUnlocks = shallowCopy(unlockStatus)
 	else
 		for feature, now in pairs(unlockStatus) do
-			local before = UnlockState.prev[feature] == true
+			local before = PrevUnlocks[feature] == true
 			if now and not before and shouldAnnounceUnlock(feature) then
 				table.insert(gained, feature)
 			end
 		end
-		UnlockState.prev = shallowCopy(unlockStatus)
+		PrevUnlocks = shallowCopy(unlockStatus)
 	end
 
 	if #gained > 0 then
 		table.sort(gained, function(a: string, b: string)
-			local levelA = UnlockState.requirement[a] or math.huge
-			local levelB = UnlockState.requirement[b] or math.huge
+			local levelA = BuildingLevelRequirement[a] or math.huge
+			local levelB = BuildingLevelRequirement[b] or math.huge
 			if levelA ~= levelB then
 				return levelA < levelB
 			end
 
-			local orderA = UnlockState.order[a] or levelA
-			local orderB = UnlockState.order[b] or levelB
+			local orderA = UnlockOrderIndex[a] or levelA
+			local orderB = UnlockOrderIndex[b] or levelB
 			if orderA ~= orderB then
 				return orderA < orderB
 			end
@@ -1870,14 +1995,14 @@ FUS.OnClientEvent:Connect(function(unlockStatus)
 		end)
 
 		for _, feature in ipairs(gained) do
-			TabState.PendingByItem[feature] = true
+			PendingByItem[feature] = true
 			local btn = FrameButtons[feature]
 			if btn then
 				ensureButtonNotif(btn).Visible = true
 			end
-			local section = TabState.ItemToSection[feature]
+			local section = ItemToSection[feature]
 			if section then
-				TabState.SectionHasPending[section] = true
+				SectionHasPending[section] = true
 				local hubBtn = CategoryButtonForSection[section]
 				if hubBtn then
 					ensureButtonNotif(hubBtn).Visible = true
@@ -1915,27 +2040,27 @@ function BuildMenu.Init()
 	RangeVisualsClient.init()
 	RangeVisualsClient.debugDump()
 	-- Place
-	UIRefs.PlaceButton.MouseButton1Down:Connect(function()
+	UI_PlaceButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		ReplicatedStorage.Events.BindableEvents.MobileClick:Fire()
 	end)
-	UIRefs.PlaceButton.Visible = false
+	UI_PlaceButton.Visible = false
 	if UserInputService.TouchEnabled then
 		task.spawn(function()
 			local CardinalFolder = workspace.PlayerPlots.GridParts
-			UIRefs.PlaceButton.Visible = #CardinalFolder:GetChildren() > 0
+			UI_PlaceButton.Visible = #CardinalFolder:GetChildren() > 0
 			CardinalFolder.ChildAdded:Connect(function(Child)
 				if #CardinalFolder:GetChildren() > 0 then 
-					UIRefs.PlaceButton.Visible = true
+					UI_PlaceButton.Visible = true
 				else
-					UIRefs.PlaceButton.Visible = false
+					UI_PlaceButton.Visible = false
 				end
 			end)
 			CardinalFolder.ChildRemoved:Connect(function(Child)
 				if #CardinalFolder:GetChildren() > 0 then 
-					UIRefs.PlaceButton.Visible = true
+					UI_PlaceButton.Visible = true
 				else
-					UIRefs.PlaceButton.Visible = false
+					UI_PlaceButton.Visible = false
 				end
 			end)
 		end)
@@ -1979,10 +2104,10 @@ function BuildMenu.Init()
 		local UISection = TabSections[CurrentTabName]
 		if not UISection then return end
 
-		if UIRefs.TabScrollLeft.GuiState == Enum.GuiState.Press and UIRefs.TabScrollRight.GuiState ~= Enum.GuiState.Press then
+		if UI_TabScroll_Left.GuiState == Enum.GuiState.Press and UI_TabScroll_Right.GuiState ~= Enum.GuiState.Press then
 			UISection.CanvasPosition -= Vector2.new(Step * BUTTON_SCROLL_SPEED, 0)
 
-		elseif UIRefs.TabScrollLeft.GuiState ~= Enum.GuiState.Press and UIRefs.TabScrollRight.GuiState == Enum.GuiState.Press then
+		elseif UI_TabScroll_Left.GuiState ~= Enum.GuiState.Press and UI_TabScroll_Right.GuiState == Enum.GuiState.Press then
 			UISection.CanvasPosition += Vector2.new(Step * BUTTON_SCROLL_SPEED, 0)
 		end
 	end)
@@ -2736,24 +2861,24 @@ function BuildMenu.Init()
 	-- Tab Buttons
 	BuildMenu.SetTab("Transport")
 
-	UIRefs.TabServices.Background.MouseButton1Down:Connect(function()
+	UI_Tab_Services.Background.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.SetTab("Services")
 	end)
-	UIRefs.TabSupply.Background.MouseButton1Down:Connect(function()
+	UI_Tab_Supply.Background.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.SetTab("Supply")
 	end)
-	UIRefs.TabTransport.Background.MouseButton1Down:Connect(function()
+	UI_Tab_Transpot.Background.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.SetTab("Transport")
 	end)
-	UIRefs.TabZones.Background.MouseButton1Down:Connect(function()
+	UI_Tab_Zones.Background.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.SetTab("Zones")
 	end)
 
-	UIRefs.Exit.MouseButton1Down:Connect(function()
+	UI_Exit.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		BuildMenu.Toggle()
 	end)
@@ -2768,7 +2893,7 @@ function BuildMenu.Init()
 	end
 
 	UtilityGUI.VisualMouseInteraction(
-		UIRefs.Exit, UIRefs.Exit.TextLabel,
+		UI_Exit, UI_Exit.TextLabel,
 		TweenInfo.new(0.15),
 		{ Size = UDim2.fromScale(1.25, 1.25) },
 		{ Size = UDim2.fromScale(0.5, 0.5) }

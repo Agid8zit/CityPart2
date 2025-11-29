@@ -877,7 +877,7 @@ local function removeAndArchiveUnderlyingBuildings(player, zoneId, gridX, gridZ,
 								end
 							end)(),
 							zoneId         = originalZoneId,
-						})
+						}, player)
 
 						-- clear occupancy & quadtree for the whole footprint
 						_clearOccupancyForInstance(player, originalZoneId or zoneId, inst)
@@ -1840,7 +1840,7 @@ function BuildingGeneratorModule.generateBuilding(
 									instanceClone  = nzClone,
 									originalParent = nz.Parent,
 									cframe         = nzCFrame
-								})
+								}, player)
 								nz:Destroy()
 							end
 						end
@@ -3974,7 +3974,7 @@ function BuildingGeneratorModule.upgradeGrid(player, zoneId, gridX, gridZ, newWe
 		gridZ = originGZ,
 		rotationY = target:GetAttribute("RotationY") or 0,
 		wealthState = target:GetAttribute("WealthState"),
-	})
+	}, player)
 
 	-- Unmark occupancy for the old building (and try to drop it from the quadtree)
 	local oldName, oldRot = target:GetAttribute("BuildingName"), target:GetAttribute("RotationY") or 0
@@ -4340,7 +4340,7 @@ function BuildingGeneratorModule.bulkRemoveInstances(player, zoneId, instanceLis
 				gridZ         = gz,
 				rotationY     = inst:GetAttribute("RotationY") or 0,
 				wealthState   = inst:GetAttribute("WealthState"),
-			})
+			}, player)
 			-- Clear occupancy for full footprint
 			local rotY = inst:GetAttribute("RotationY") or 0
 			local bnm  = inst:GetAttribute("BuildingName")

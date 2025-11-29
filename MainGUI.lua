@@ -314,6 +314,7 @@ local activeFollowConn
 
 local deleteMode   = false
 local selectedPart = nil
+local DELETE_MODE_TRANSPARENCY = 0.75 -- match build-mode plate alpha
 
 local function ensureDisableDeleteModeEvent(): BindableEvent
 	local evt = BindableEvents:FindFirstChild("DisableDeleteMode")
@@ -452,7 +453,7 @@ local function hookContainerChildAdded(folder: Folder)
 				if c:GetAttribute("_OrigCanQuery") == nil then
 					c:SetAttribute("_OrigCanQuery", c.CanQuery)
 				end
-				c.Transparency = 0.75
+				c.Transparency = DELETE_MODE_TRANSPARENCY
 				c.CanQuery     = true
 			end
 		end
@@ -766,7 +767,7 @@ local function toggleDeleteMode(on: boolean)
 
 		if on then
 			-- DELETE-MODE: show & click
-			part.Transparency = 0.25
+			part.Transparency = DELETE_MODE_TRANSPARENCY
 			part.CanQuery     = true
 
 			-- thickness by zone class

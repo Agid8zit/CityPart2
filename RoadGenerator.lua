@@ -189,7 +189,7 @@ local function removeOverlappingObjects(player, zoneId, roadPos, gridCoord)
 									occupantId     = occId,
 									mode           = mode,
 									zoneId         = origZoneId,
-								})
+								}, player)
 
 								-- Clear occupancy & quadtree for the entire footprint
 								for x = gx, gx + w - 1 do
@@ -235,7 +235,7 @@ local function removeOverlappingObjects(player, zoneId, roadPos, gridCoord)
 						instanceClone  = item:Clone(),
 						originalParent = item.Parent,
 						cframe         = itemCF,
-					})
+					}, player)
 					item:Destroy()
 				end
 			end
@@ -454,11 +454,45 @@ local function _plotAxisDirs(player)
 	if not plot then
 		return 1, 1
 	end
-	local ax = plot:GetAttribute("GridAxisDirX")
-	local az = plot:GetAttribute("GridAxisDirZ")
+
+	-- Prefer the GridConfig context (mirrors BuildingGenerator axis handling)
+	local ax, az = GridConfig.getAxisDirectionsForPlot(plot)
+
+	-- Fallback to attributes if the context was never seeded for this plot
+	if ax ~= 1 and ax ~= -1 then
+		ax = plot:GetAttribute("GridAxisDirX")
+	end
+	if az ~= 1 and az ~= -1 then
+		az = plot:GetAttribute("GridAxisDirZ")
+	end
+
+	-- Last resort: derive from any terrain instance (matches BuildingGenerator fallback)
+	if (ax ~= -1 and ax ~= 1) or (az ~= -1 and az ~= 1) then
+		local _, terrains = getGlobalBoundsForPlot(plot)
+		for _, inst in ipairs(terrains or {}) do
+			if typeof(inst) == "Instance" then
+				ax, az = GridConfig.getAxisDirectionsForInstance(inst)
+				break
+			end
+		end
+	end
+
+	-- Normalize to either -1 or +1
 	if ax ~= -1 then ax = 1 end
 	if az ~= -1 then az = 1 end
 	return ax, az
+end
+
+-- Axis-aware yaw adjustment: mirror yaw when plot axes are flipped (even plots)
+local function _adjustYawForAxis(yaw, axisDirX, axisDirZ)
+	yaw = norm360(yaw or 0)
+	if axisDirX == -1 then
+		yaw = 180 - yaw
+	end
+	if axisDirZ == -1 then
+		yaw = -yaw
+	end
+	return norm360(yaw)
 end
 
 local function _normalizeLegacyList(entries, axisDir, field)
@@ -486,6 +520,11 @@ local function _normalizeLegacyList(entries, axisDir, field)
 end
 
 local function normalizeLegacyEvenPlotData(player, gridList, saved)
+	-- New-format snapshots already store logical, parity-normalized coords; don't flip them.
+	if type(saved) == "table" and saved.version ~= nil then
+		return
+	end
+
 	local axisDirX, axisDirZ = _plotAxisDirs(player)
 
 	_normalizeLegacyList(gridList, axisDirX, "x")
@@ -782,7 +821,7 @@ end
 
 
 -- getIntersectionRotation
-function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification)
+function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification, ownerId)
 	-- --- safe local helpers (don’t collide with any globals you may already have)
 	local function _norm360(d) d = (d or 0) % 360; if d < 0 then d = d + 360 end; return d end
 	local function _iprint(...)
@@ -799,7 +838,7 @@ function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification)
 		right = PathingModule.nodeKey({ x = cellCoord.x+1, z = cellCoord.z     }),
 	}
 
-	local adjacency = PathingModule.globalAdjacency
+	local adjacency = PathingModule.getAdjacencyForOwner(ownerId) or PathingModule.globalAdjacency
 	if not adjacency then
 		warn("getIntersectionRotation: adjacency data not found!")
 		return 0
@@ -1075,6 +1114,23 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	opts = opts or {}
 	local SPAWN_INTERSECTION_DECOS = (opts.noDecorations ~= true)
 
+	-- Axis directions for this plot (needed to mirror yaw on even plots)
+	local axisDirX, axisDirZ = 1, 1
+	if roadsFolder and roadsFolder.Parent then
+		axisDirX, axisDirZ = GridConfig.getAxisDirectionsForPlot(roadsFolder.Parent)
+	end
+
+	local ownerId = opts.ownerId
+	if not ownerId and roadsFolder and roadsFolder.Parent then
+		local match = tostring(roadsFolder.Parent.Name):match("Plot_(%d+)")
+		if match then ownerId = tonumber(match) end
+	end
+	if not ownerId and zoneId then
+		local match = tostring(zoneId):match("_(%d+)_") or tostring(zoneId):match("_(%d+)$")
+		if match then ownerId = tonumber(match) end
+	end
+	local adjacency = PathingModule.getAdjacencyForOwner(ownerId) or PathingModule.globalAdjacency
+
 	----------------------------------------------------------------------
 	-- Index existing road-ish objects (visible pieces) by cell
 	----------------------------------------------------------------------
@@ -1219,7 +1275,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	-- Optional: adjacency flags (kept for parity with your debug paths)
 	----------------------------------------------------------------------
 	local function neighborFlagsFromAdjacency(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey   = PathingModule.nodeKey(cellCoord)
 		local neighborKeys = adjacency and adjacency[cellKey] or {}
 		local upKey    = PathingModule.nodeKey({ x = cellCoord.x,   z = cellCoord.z - 1 })
@@ -1235,7 +1290,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	end
 
 	local function flagsPreferAdj(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey = PathingModule.nodeKey(cellCoord)
 		if adjacency and adjacency[cellKey] then
 			return neighborFlagsFromAdjacency(cellCoord), "adj"
@@ -1340,8 +1394,13 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 		end
 
 		local chosenYaw = customRotation
-		if chosenYaw == nil and prevYaw ~= nil then chosenYaw = prevYaw end
-		chosenYaw = _applyOffset(newRoadName, chosenYaw or 0)
+		if chosenYaw == nil then
+			if prevYaw ~= nil then chosenYaw = prevYaw end
+			chosenYaw = _applyOffset(newRoadName, chosenYaw or 0)
+			chosenYaw = _adjustYawForAxis(chosenYaw, axisDirX, axisDirZ)
+		else
+			chosenYaw = norm360(chosenYaw)
+		end
 
 		if clone:IsA("Model") and clone.PrimaryPart then
 			clone:SetPrimaryPartCFrame(CFrame.new(oldPos) * CFrame.Angles(0, math.rad(chosenYaw), 0))
@@ -1399,7 +1458,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	-- neighbor flags source (visible preferred unless adjacency present)
 	----------------------------------------------------------------------
 	local function flagsForCell(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey = PathingModule.nodeKey(cellCoord)
 		if adjacency and adjacency[cellKey] then
 			local f = neighborFlagsFromAdjacency(cellCoord)
@@ -1453,6 +1511,7 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 		if kind == "3Way" or kind == "4Way" or kind == "Turn" then
 			local rotFromVis = (kind == "4Way") and 0 or rotationFromFlags(kind, flags)
 			local finalYaw   = _applyOffset(kind, rotFromVis)
+			finalYaw = _adjustYawForAxis(finalYaw, axisDirX, axisDirZ)
 
 			if newestPart.Name ~= kind then
 				-- If we are moving AWAY from 4Way, clear any leftover intersection decos.
@@ -1541,6 +1600,7 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 				finalYaw = norm360(newestPrevYaw)
 			end
 			finalYaw = _applyOffset(newestPart.Name or "Road", finalYaw)
+			finalYaw = _adjustYawForAxis(finalYaw, axisDirX, axisDirZ)
 
 			if newestPart.Name ~= "Road" then
 				newestPart = swapRoadModel(newestPart, "Road", cellCoord, finalYaw)
@@ -1790,7 +1850,7 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 			for _, rData in ipairs(placedRoadsData) do
 				coordsForAdj[#coordsForAdj+1] = { x = rData.gridX, z = rData.gridZ }
 			end
-			PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj])
+			PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj], player and player.UserId)
 		end
 
 		RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder)
@@ -2339,7 +2399,7 @@ function RoadGeneratorModule.recreateZoneExact(player, zoneId, mode, snapshot)
 
 	-- ===== 2) Register with pathing so adjacency matches the exact layout =======
 	if #coordsForAdj > 0 then
-		PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj])
+		PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj], player and player.UserId)
 	end
 
 	-- ===== 3) Recreate intersection decorations ================================

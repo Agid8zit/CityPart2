@@ -584,7 +584,7 @@ function ZoneManager.buildRoad(player, startCoord, endCoord, mode)
 		local zoneId = "RoadZone_" .. userId .. "_" .. ZoneManager.playerZoneCounters[userId]
 
 		-- Register the Road with PathingModule BEFORE firing the event
-		PathingModule.registerRoad(zoneId, mode, component, startCoord, endCoord)
+		PathingModule.registerRoad(zoneId, mode, component, startCoord, endCoord, userId)
 		debugPrint("Road registered with PathingModule.")
 
 		-- Fire the ZoneCreated event
@@ -637,7 +637,7 @@ function ZoneManager.removeRoad(player, roadId)
 
 	local success = ZoneTrackerModule.removeZone(player, roadId, mode, gridList)
 	if success then
-		PathingModule.unregisterRoad(roadId)
+		PathingModule.unregisterRoad(roadId, player and player.UserId)
 		RoadGen.recalculateIntersectionsForPlot(player)
 		-- Fire the zoneRemoveDisplayEvent with just the zoneId
 		--[[

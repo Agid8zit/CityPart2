@@ -10,6 +10,7 @@ local ZoneManager = require(ZoneMgr:WaitForChild("ZoneManager"))
 local ZoneTracker = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local ZoneRequirementsCheck = require(ZoneMgr:WaitForChild("ZoneRequirementsCheck"))
 local EconomyService = require(ZoneMgr:WaitForChild("EconomyService"))
+local LayerManager = require(S3.Build.LayerManager)
 
 local Transport = Bld:WaitForChild("Transport")
 local Roads = Transport:WaitForChild("Roads")
@@ -39,12 +40,18 @@ function PlayerCleanupService.cleanupPlayer(player)
 	-- Clear RequirementsCheck cache
 	ZoneRequirementsCheck.clearPlayerData(player)
 
+	-- Clear any archived layer data for this player (prevents cross-session restores)
+	LayerManager.clearPlayer(player)
+
 	-- Road-specific cleanup
 	local roadNetworks = PathingModule.getRoadNetworks()
+	local ownerKey = tostring(userId)
 	for zoneId, network in pairs(roadNetworks) do
-		if network and network.id and string.find(network.id, tostring(userId)) then
+		local owned = network and ((network.owner and network.owner == ownerKey)
+			or (network.id and string.find(network.id, ownerKey)))
+		if owned then
 			-- Unregister road
-			PathingModule.unregisterRoad(zoneId)
+			PathingModule.unregisterRoad(zoneId, userId)
 
 			-- Stop all car movement for this zone
 			CarMovement.stopMovementsForZone(zoneId)

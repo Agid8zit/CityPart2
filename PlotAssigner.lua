@@ -87,6 +87,63 @@ local function getNextAvailablePlot()
 	return nil -- No available plots
 end
 
+-- Resolve which part to use as the placement anchor for a placeholder.
+-- If the physical placeholder is rotated/offset (plots 3+), you can set
+-- PlacementPrimaryPartName on the placeholder to force a specific anchor.
+local function resolvePlacementPrimaryPart(placeholder: Model): BasePart?
+	if not placeholder then return nil end
+	local overrideName = placeholder:GetAttribute("PlacementPrimaryPartName")
+	if typeof(overrideName) == "string" and overrideName ~= "" then
+		local found = placeholder:FindFirstChild(overrideName, true)
+		if found and found:IsA("BasePart") then
+			return found
+		end
+	end
+	if placeholder.PrimaryPart then
+		return placeholder.PrimaryPart
+	end
+	return placeholder:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- Build the desired placement CFrame for the player plot. The placeholder can
+-- override position/yaw via attributes so we don't inherit bad physical
+-- orientation from the map:
+--   PlacementPosX/PlacementPosY/PlacementPosZ : target world position
+--   PlacementYaw : yaw in degrees
+--   PlacementOffsetX/PlacementOffsetY/PlacementOffsetZ : small post-pivot offset
+--   PlacementPrimaryPartName : optional anchor part name
+local function getPlacementCFrame(placeholder: Model): CFrame?
+	if not placeholder then return nil end
+	local anchor = resolvePlacementPrimaryPart(placeholder)
+	if not anchor then return nil end
+
+	local px = placeholder:GetAttribute("PlacementPosX")
+	local py = placeholder:GetAttribute("PlacementPosY")
+	local pz = placeholder:GetAttribute("PlacementPosZ")
+	local basePos
+	if typeof(px) == "number" and typeof(py) == "number" and typeof(pz) == "number" then
+		basePos = Vector3.new(px, py, pz)
+	else
+		basePos = anchor.Position
+	end
+
+	local yaw = placeholder:GetAttribute("PlacementYaw")
+	if typeof(yaw) ~= "number" then
+		yaw = anchor.Orientation.Y
+	end
+
+	local cf = CFrame.new(basePos) * CFrame.Angles(0, math.rad(yaw), 0)
+
+	local ox = placeholder:GetAttribute("PlacementOffsetX")
+	local oy = placeholder:GetAttribute("PlacementOffsetY")
+	local oz = placeholder:GetAttribute("PlacementOffsetZ")
+	if typeof(ox) == "number" or typeof(oy) == "number" or typeof(oz) == "number" then
+		cf = cf * CFrame.new(ox or 0, oy or 0, oz or 0)
+	end
+
+	return cf
+end
+
 -- Function to teleport player to their plot
 local function teleportPlayerToPlot(player, plot)
 	local character = player.Character
@@ -322,7 +379,11 @@ Players.PlayerAdded:Connect(function(player)
 	playerPlot:SetAttribute("PrimaryPartName", playerPlot.PrimaryPart.Name)
 
 	-- Position the plot at the placeholder's position
-	playerPlot:PivotTo(placeholder.PrimaryPart.CFrame)
+	local targetCF = getPlacementCFrame(placeholder)
+	if not targetCF then
+		targetCF = placeholder.PrimaryPart and placeholder.PrimaryPart.CFrame or placeholder:GetPivot()
+	end
+	playerPlot:PivotTo(targetCF)
 	setPlotOddEvenAttributes(playerPlot)
 
 	-- Determine axis directions based on actual orientation so Odd is canonical (+1,+1)

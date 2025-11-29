@@ -209,9 +209,9 @@ local function rebuildRoadGraphForPlayer(player)
 				warn(("[RoadGraphReloadSync] Skipping road %s – unable to order coords."):format(zoneId))
 			else
 				-- Drop any stale edges for this road id, then re-register cleanly
-				pcall(PathingModule.unregisterRoad, zoneId)
+				pcall(PathingModule.unregisterRoad, zoneId, player and player.UserId)
 				local ok, err = pcall(function()
-					PathingModule.registerRoad(zoneId, z.mode, ordered, startCoord, endCoord)
+					PathingModule.registerRoad(zoneId, z.mode, ordered, startCoord, endCoord, player and player.UserId)
 				end)
 				if not ok then
 					warn(("[RoadGraphReloadSync] registerRoad failed for %s: %s"):format(zoneId, tostring(err)))
