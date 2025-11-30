@@ -23,6 +23,11 @@ local plotAssignedEvent = REFolder:FindFirstChild("PlotAssigned")
 local plotAssignedBE = BEFolder:FindFirstChild("PlotAssignedBE")
 local PlayerSavedEvent = BEFolder:FindFirstChild("PlayerSaved")
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 if not plotAssignedEvent then
 	error("RemoteEvent 'PlotAssigned' not found in ReplicatedStorage.Events.RemoteEvents.")
 end
@@ -181,7 +186,7 @@ local function teleportPlayerToPlot(player, plot)
 	character:PivotTo(targetCFrame)
 	--humanoidRootPart.CFrame = targetCFrame
 
-	print(string.format("Teleported '%s' to their plot '%s' at position %s.", player.Name, plot.Name, tostring(targetCFrame.Position)))
+	log(string.format("Teleported '%s' to their plot '%s' at position %s.", player.Name, plot.Name, tostring(targetCFrame.Position)))
 end
 
 local function teleportPlayerToTheirPlot(player: Player)
@@ -413,7 +418,7 @@ Players.PlayerAdded:Connect(function(player)
 	end
 
 	--playerPlot:SetPrimaryPartCFrame(placeholder.PrimaryPart.CFrame)
-	print(string.format("Assigned plot '%s' to placeholder '%s'.", playerPlot.Name, placeholder.Name))
+	log(string.format("Assigned plot '%s' to placeholder '%s'.", playerPlot.Name, placeholder.Name))
 
 	-- Assign the plot using the PlotDataModule
 	PlotDataModule:AssignPlot(player, playerPlot)
@@ -480,15 +485,15 @@ local function cleanupPlotForPlayer(player)
 			placeholder.Parent = placeholderPlotsFolder
 			placeholder:SetAttribute("Assigned", false)
 			assignedPlaceholders[player.UserId] = nil
-			print(string.format("Cleared assignment and restored placeholder '%s'.", placeholder.Name))
+			log(string.format("Cleared assignment and restored placeholder '%s'.", placeholder.Name))
 		end
 
 		-- destroy cloned plot
 		plot:Destroy()
-		print(string.format("PlotAssigner: Removed plot '%s' for player '%s'.", plot.Name, player.Name))
+		log(string.format("PlotAssigner: Removed plot '%s' for player '%s'.", plot.Name, player.Name))
 		PlotDataModule:RemovePlot(player)
 	else
-		print(string.format("PlotAssigner: No plot found for player '%s' to remove.", player.Name))
+		log(string.format("PlotAssigner: No plot found for player '%s' to remove.", player.Name))
 	end
 
 	-- extra clean-up handled by the service
@@ -506,12 +511,12 @@ end)
 
 -- Optional: Handle Server Shutdown to clean up plots
 game:BindToClose(function()
-	print("Server is shutting down. Cleaning up plots...")
+log("Server is shutting down. Cleaning up plots...")
 
 	for userId, plot in pairs(PlotDataModule.playerPlots) do
 		if plot then
 			plot:Destroy()
-			print(string.format("PlotAssigner: Cleaned up plot '%s' for user ID '%d' on shutdown.", 
+			log(string.format("PlotAssigner: Cleaned up plot '%s' for user ID '%d' on shutdown.", 
 				plot.Name, userId))
 		end
 	end
@@ -521,7 +526,7 @@ game:BindToClose(function()
 		if placeholder then
 			placeholder.Parent = placeholderPlotsFolder
 			placeholder:SetAttribute("Assigned", false)
-			print(string.format("PlotAssigner: Restored placeholder '%s' for user ID '%d' on shutdown.", 
+			log(string.format("PlotAssigner: Restored placeholder '%s' for user ID '%d' on shutdown.", 
 				placeholder.Name, userId))
 		end
 	end

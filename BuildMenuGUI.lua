@@ -43,13 +43,14 @@ local BUTTON_SCROLL_SPEED = 300
 
 -- Defines
 local UI = script.Parent
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayerSl
 local MajorCurrentTabName = nil
 local CurrentTabName = nil
 local TabSections = {} -- [TabName] = FrameContainer
 local FrameButtons = {} -- [BuildingID] = Frame
 local CachedLevel = 0
 local CachedBalance = 0               -- [ADDED] numeric balance cache
+local UI_PlaceButton = UI.main.PlaceButton
 
 local function _resolveLang(key: string?, fallback: string?)
 	if type(key) ~= "string" or key == "" then
@@ -338,6 +339,9 @@ local function _refreshPulseTargets()
 	-- Road button
 	local roadBtn = FrameButtons and FrameButtons["DirtRoad"] or nil
 	_regTarget("BM_DirtRoad", roadBtn)
+
+	-- Mobile confirm / placement button
+	_regTarget("BM_PlaceButton", UI_PlaceButton)
 end
 
 -- BuildMenu is being gated to a specific next-step item while onboarding runs
@@ -495,8 +499,6 @@ local UI_TabScroll_Right = UI.main.container.Right
 
 local UI_TabChoicesContainer = UI.main.container.TabChoices.Template;
 UI_TabChoicesContainer.Visible = false
-
-local UI_PlaceButton = UI.main.PlaceButton
 
 local UnlockedTypes = {}
 local PrevUnlocks = {}  -- feature -> bool

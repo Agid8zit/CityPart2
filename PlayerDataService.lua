@@ -26,6 +26,11 @@ local DEBUG_IGNORE_SESSION_LOCKING = false
 local DEBUG_IGNORE_PLAYERDATA_SAVE = false
 local DEBUG_IGNORE_PLAYERDATA_LOAD = false
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 local DEFAULT_PLAYER_DS = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release1"
 local PLAYERDATA_DATASTORE = SavePolicy.PLAYER_DS_BY_ENV[SavePolicy.ENV] or DEFAULT_PLAYER_DS
 local SLOT_ID = "player"
@@ -175,7 +180,7 @@ local function _pruneBackupsForUserId(userId)
 				end)
 				if ok then
 					mutated = true
-					print(("[RETENTION][USER] Deleted orphaned backup for %s slot=%s key=%s"):format(userId, tostring(slotId), key))
+					log(("[RETENTION][USER] Deleted orphaned backup for %s slot=%s key=%s"):format(userId, tostring(slotId), key))
 				else
 					warn("[RETENTION][ERROR] per-user delete failed", userId, key, err)
 					table.insert(survivors, key)
@@ -367,10 +372,10 @@ local function _recoverFromBackups(Player)
 				if not ok then
 					warn("[DEDUP][ERROR] restore primary failed", Player.UserId, err)
 				else
-					print(("[DEDUP] Restored primary for %s from %s"):format(Player.UserId, key))
+					log(("[DEDUP] Restored primary for %s from %s"):format(Player.UserId, key))
 				end
 			else
-				print(("[AUDIT] Would restore primary for %s from %s"):format(Player.UserId, key))
+				log(("[AUDIT] Would restore primary for %s from %s"):format(Player.UserId, key))
 			end
 			return env, true
 		end
@@ -621,9 +626,13 @@ end
 function PlayerDataService.ModifySaveData(Player: Player, Path: string, NewValue: any)
 	local PlayerData = PlayerDataService.AllPlayerData[Player]
 	if not PlayerData then return end
-	local SaveData = PlayerData.savefiles[PlayerData.currentSaveFile]
+	local curSlot = PlayerData.currentSaveFile
+	if not curSlot then return end
+
+	local SaveData = PlayerData.savefiles[curSlot]
 	if not SaveData then return end
 	_markHighChurn(Player, Path)
+	local fullPath = ("savefiles/%s/%s"):format(curSlot, Path)
 
 	-- If a reload is in progress for this player, stage the mutation.
 	if _noCommitWindow[Player] then
@@ -635,12 +644,14 @@ function PlayerDataService.ModifySaveData(Player: Player, Path: string, NewValue
 			if not patches then patches = {}; _stagedPatches[Player] = patches end
 			-- shallow copy is fine for our paths (strings/numbers/encoded blobs)
 			patches[Path] = (Utility and Utility.CloneTable) and Utility.CloneTable(NewValue) or NewValue
+			-- Keep live data/UI in sync even while staging (prevents income pauses).
+			PlayerDataService.ModifyData(Player, fullPath, NewValue)
 			return
 		end
 	end
 
 	-- Normal path: mutate live data and notify client
-	PlayerDataService.ModifyData(Player, "savefiles/"..PlayerData.currentSaveFile.."/"..Path, NewValue)
+	PlayerDataService.ModifyData(Player, fullPath, NewValue)
 end
 -- ---------------------------------------------------------------------------
 
@@ -684,7 +695,7 @@ function PlayerDataService.Load(Player: Player)
 	if DEBUG_IGNORE_PLAYERDATA_LOAD or DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		DebugPrintLoad("[NO LOAD] Ignoring PlayerData ("..Player.UserId..")")
 	else
-		print("[LOAD] PlayerData ("..Player.UserId..")")
+	log("[LOAD] PlayerData ("..Player.UserId..")")
 		local env, ok = _loadPrimaryEnvelope(Player)
 		if ok ~= false and not env then
 			env, ok = _recoverFromBackups(Player)
@@ -720,7 +731,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 	if DEBUG_IGNORE_PLAYERDATA_SAVE or DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		DebugPrintSave("[NO SAVE] PlayerData ("..Player.UserId..")")
 	else
-		print(("[SAVE] PlayerData (%d) %s"):format(Player.UserId, reason or ""))
+	log(("[SAVE] PlayerData (%d) %s"):format(Player.UserId, reason or ""))
 		PlayerDataService.AllPlayerData[Player] = PlayerDataInterfaceService.OnSave(Player, PlayerDataService.AllPlayerData[Player])
 
 		local pd = PlayerDataService.AllPlayerData[Player]
@@ -736,7 +747,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 		end
 
 		if SavePolicy.DEDUPE_BY_HASH and meta and meta.hash == env._envelope.hash and not flush then
-			print(("[DEDUP] Skip unchanged save user=%s reason=%s"):format(Player.UserId, tostring(reason)))
+			log(("[DEDUP] Skip unchanged save user=%s reason=%s"):format(Player.UserId, tostring(reason)))
 		else
 			local lastTime = meta and meta.updatedAt or 0
 			local since = now - lastTime
@@ -745,14 +756,14 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 				if _highChurnTouches[Player] and (now - _highChurnTouches[Player]) < SavePolicy.MIN_COMMIT_INTERVAL_SECONDS then
 					suffix = " (high-churn staged)"
 				end
-				print(("[DEDUP] Skip due to min interval (%ds)%s user=%s"):format(SavePolicy.MIN_COMMIT_INTERVAL_SECONDS, suffix, Player.UserId))
+				log(("[DEDUP] Skip due to min interval (%ds)%s user=%s"):format(SavePolicy.MIN_COMMIT_INTERVAL_SECONDS, suffix, Player.UserId))
 			else
 				local store = _playerStore()
 				local primaryKey = _primaryKey(Player.UserId)
 				local backupKey = SaveKeyNames.backup(Player.UserId, _slotIdForPlayer())
 
 				if SavePolicy.APPLY_CHANGES ~= true then
-					print(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
+					log(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
 					_rememberEnvelopeMeta(Player, env)
 				else
 					local okBackup, errBackup = pcall(function()
@@ -769,7 +780,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 					if not okPrimary then
 						warn("[DEDUP][ERROR] primary write failed", primaryKey, errPrimary)
 					else
-						print(("[DEDUP] Saved primary=%s backup=%s bytes=%d"):format(primaryKey, backupKey, env._envelope.approxBytes))
+						log(("[DEDUP] Saved primary=%s backup=%s bytes=%d"):format(primaryKey, backupKey, env._envelope.approxBytes))
 						_updateIndexWithBackup(Player, primaryKey, backupKey)
 						_rememberEnvelopeMeta(Player, env)
 					end

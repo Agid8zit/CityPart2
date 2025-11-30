@@ -22,6 +22,10 @@ local EconomyService = require(ZoneMgr:WaitForChild("EconomyService"))
 local XPManager = require(Stats:WaitForChild("XPManager"))
 
 local COIN_REFUND_WINDOW = 60
+local LATE_REFUND_MODES = {
+	Airport = 0.25,
+	BusDepot = 0.25,
+}
 
 local OWNERSHIP_PREFIXES = {
 	"Zone_",
@@ -67,6 +71,23 @@ local function computeAgeSeconds(player: Player, zoneId: string, zoneData)
 	return math.huge
 end
 
+local function computeCoinRefund(mode, cost, ageSeconds)
+	if typeof(cost) ~= "number" or cost <= 0 then
+		return 0
+	end
+
+	if ageSeconds <= COIN_REFUND_WINDOW then
+		return cost
+	end
+
+	local pct = LATE_REFUND_MODES[mode]
+	if pct then
+		return math.floor(cost * pct)
+	end
+
+	return 0
+end
+
 local function buildPreview(player: Player, zoneId: string)
 	local zoneData = ZoneTracker.getZoneById(player, zoneId)
 	if not zoneData then
@@ -85,10 +106,7 @@ local function buildPreview(player: Player, zoneId: string)
 	local withinWindow = ageSeconds <= COIN_REFUND_WINDOW
 	local isExclusive = EconomyService.isRobuxExclusiveBuilding(mode) == true
 
-	local coinRefund = 0
-	if typeof(cost) == "number" and cost > 0 and withinWindow then
-		coinRefund = cost
-	end
+	local coinRefund = computeCoinRefund(mode, cost, ageSeconds)
 
 	return {
 		ok = true,

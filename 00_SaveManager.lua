@@ -144,6 +144,31 @@ local function safeB64(s: string?): string
 	return (okd and out) or ""
 end
 
+local function isValidB64(s: string?): boolean
+	local ok = pcall(b64dec, s or "")
+	return ok == true
+end
+
+-- If serialization fails, prefer a previous valid snapshot; otherwise fall back to empty cityStorage.
+local function finalizeCityStorageBuffer(newBuffer: string?, prevB64: string?, prevValid: boolean, label: string): string
+	local buf = (type(newBuffer) == "string") and newBuffer or ""
+	local prior = (type(prevB64) == "string") and prevB64 or ""
+
+	if buf ~= "" then
+		return b64enc(buf)
+	end
+
+	if prevValid and prior ~= "" then
+		warn(("[SaveManager] %s save failed; reusing previous snapshot"):format(label))
+		return prior
+	end
+
+	if prior ~= "" then
+		warn(("[SaveManager] %s save failed; previous snapshot invalid; writing empty cityStorage"):format(label))
+	end
+	return ""
+end
+
 local function toWealthString(w: any): string?
 	if w == nil then return nil end
 	if typeof(w) == "number" then
@@ -638,20 +663,23 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 	local unlockNames  = {}
 	local missingSetForSummary : { [string]: boolean }? = nil
 
-	-- Keep a reference to previous zonesB64 in case we need to retain it
-	local prevZonesB64 = ""
+	-- Keep a reference to previous cityStorage in case we need to retain it
+	local prevZonesB64, prevRoadsB64, prevUnlocksB64 = "", "", ""
+	local prevZonesValid, prevRoadsValid, prevUnlocksValid = false, false, false
 	pcall(function()
 		local sf = PlayerDataService.GetSaveFileData(player)
-		prevZonesB64 = (sf and sf.cityStorage and sf.cityStorage.zonesB64) or ""
+		local storage = sf and sf.cityStorage
+		if storage then
+			prevZonesB64   = storage.zonesB64 or ""
+			prevRoadsB64   = storage.roadsB64 or ""
+			prevUnlocksB64 = storage.unlocksB64 or ""
+		end
+		prevZonesValid   = isValidB64(prevZonesB64)
+		prevRoadsValid   = isValidB64(prevRoadsB64)
+		prevUnlocksValid = isValidB64(prevUnlocksB64)
 	end)
 	
-	local prevRoadsB64 = ""
-	pcall(function()
-		local sf = PlayerDataService.GetSaveFileData(player)
-		prevRoadsB64 = (sf and sf.cityStorage and sf.cityStorage.roadsB64) or ""
-	end)
-	
-	-- [NEW] Decode previous rows once for **per‑zone fallback**
+	-- [NEW] Decode previous rows once for **per-zone fallback**
 	local prevRowsById = decodePrevZoneRows(prevZonesB64)
 	local prevRoadById = decodePrevRoadRows(prevRoadsB64)
 	
@@ -719,12 +747,14 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 		end
 	end
 
+	local zonesB64Out   = finalizeCityStorageBuffer(bufferZone,   prevZonesB64,   prevZonesValid,   "Zone")
+	local roadsB64Out   = finalizeCityStorageBuffer(bufferRoad,   prevRoadsB64,   prevRoadsValid,   "RoadSnapshot")
+	local unlocksB64Out = finalizeCityStorageBuffer(bufferUnlock, prevUnlocksB64, prevUnlocksValid, "Unlock")
+
 	-- Apply to save object
-	pcall(function()
-		PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64", b64enc(bufferZone))
-	end)
-	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   b64enc(bufferRoad)) end)
-	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", b64enc(bufferUnlock)) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64",   zonesB64Out) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   roadsB64Out) end)
+	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", unlocksB64Out) end)
 	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/schema",     1) end)
 	pcall(function() PlayerDataService.ModifySaveData(player, "lastPlayed",             os.time()) end)
 	pcall(function() PlayerDataService.ModifySaveData(player, "unlocks",                unlockNames) end)
@@ -836,10 +866,10 @@ end
 --  Progressive LOAD scheduler (server-wide wheel + per-player slicing)
 ----------------------------------------------------------------
 -- You can tune these safely.
-local LOAD_WHEEL_DIV              = 3
-local LOAD_BUDGET_MS_PER_SLICE    = 6
-local LOAD_MAX_ROADS_PER_SLICE    = 28
-local LOAD_MAX_BUILDINGS_PER_SLICE= 10
+local LOAD_WHEEL_DIV              = 2   -- fewer buckets = more work per frame per player
+local LOAD_BUDGET_MS_PER_SLICE    = 12  -- per-bucket budget in ms
+local LOAD_MAX_ROADS_PER_SLICE    = 40
+local LOAD_MAX_BUILDINGS_PER_SLICE= 20
 local LOAD_MAX_NETWORKS_PER_SLICE = 20
 
 -- Internal structures (LOAD)
@@ -972,7 +1002,7 @@ local function buildInitialLoadState(player: Player)
 		end
 	end
 
-	print(("Load payload sizes: Zone=%d  Roads=%d  Unlocks=%d")
+	LOG(("Load payload sizes: Zone=%d  Roads=%d  Unlocks=%d")
 		:format(#bufferZone, #bufferRoad, #bufferUnlock))
 
 	-- Unlocks (build table now; apply early in Phase A)
@@ -1507,19 +1537,22 @@ local function buildInitialSaveStateForAutosave(player: Player)
 		return nil
 	end
 
-	-- Decode previous zones for per-zone fallback
-	local prevZonesB64 = ""
+	-- Decode previous cityStorage for per-zone fallback + write fallback
+	local prevZonesB64, prevRoadsB64, prevUnlocksB64 = "", "", ""
+	local prevZonesValid, prevRoadsValid, prevUnlocksValid = false, false, false
 	pcall(function()
 		local sf = PlayerDataService.GetSaveFileData(player)
-		prevZonesB64 = (sf and sf.cityStorage and sf.cityStorage.zonesB64) or ""
+		local storage = sf and sf.cityStorage
+		if storage then
+			prevZonesB64   = storage.zonesB64 or ""
+			prevRoadsB64   = storage.roadsB64 or ""
+			prevUnlocksB64 = storage.unlocksB64 or ""
+		end
+		prevZonesValid   = isValidB64(prevZonesB64)
+		prevRoadsValid   = isValidB64(prevRoadsB64)
+		prevUnlocksValid = isValidB64(prevUnlocksB64)
 	end)
 	local prevRowsById = decodePrevZoneRows(prevZonesB64)
-	
-	local prevRoadsB64 = ""
-	pcall(function()
-		local sf = PlayerDataService.GetSaveFileData(player)
-		prevRoadsB64 = (sf and sf.cityStorage and sf.cityStorage.roadsB64) or ""
-	end)
 	local prevRoadById = decodePrevRoadRows(prevRoadsB64)
 
 	-- Classify ids now; we re-validate existence on capture
@@ -1551,6 +1584,12 @@ local function buildInitialSaveStateForAutosave(player: Player)
 		missingSet    = {},
 		prevRowsById  = prevRowsById,
 		prevRoadById  = prevRoadById,
+		prevZonesB64   = prevZonesB64,
+		prevRoadsB64   = prevRoadsB64,
+		prevUnlocksB64 = prevUnlocksB64,
+		prevZonesValid   = prevZonesValid,
+		prevRoadsValid   = prevRoadsValid,
+		prevUnlocksValid = prevUnlocksValid,
 		dirty         = {},
 
 		startedAt = os.clock(),
@@ -1691,10 +1730,14 @@ local function runSaveSlice(state, budgetMs)
 		local okU, outU = pcall(function() return Sload.Save("Unlock", state.unlockRows or {}) end)
 		if okU then bufferUnlock = outU else warn("[ProgSave] Unlock Save skipped:", outU) end
 
+		local zonesB64Out   = finalizeCityStorageBuffer(bufferZone,   state.prevZonesB64 or "",   state.prevZonesValid == true,   "Zone")
+		local roadsB64Out   = finalizeCityStorageBuffer(bufferRoad,   state.prevRoadsB64 or "",   state.prevRoadsValid == true,   "RoadSnapshot")
+		local unlocksB64Out = finalizeCityStorageBuffer(bufferUnlock, state.prevUnlocksB64 or "", state.prevUnlocksValid == true, "Unlock")
+
 		-- Apply to savefile (will stage automatically if a reload window is open)
-		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64", b64enc(bufferZone)) end)
-		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   b64enc(bufferRoad)) end)
-		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", b64enc(bufferUnlock)) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64",   zonesB64Out) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/roadsB64",   roadsB64Out) end)
+		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/unlocksB64", unlocksB64Out) end)
 		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/schema",     1) end)
 		pcall(function() PlayerDataService.ModifySaveData(player, "lastPlayed",             os.time()) end)
 		pcall(function() PlayerDataService.ModifySaveData(player, "unlocks",                state.unlockNames or {}) end)

@@ -48,6 +48,7 @@ local GRID_SIZE      = GridConfig.GRID_SIZE
 local BUILD_INTERVAL = 0.1
 local Y_OFFSET       = 0.625
 local SEARCH_RADIUS  = 4 
+local INTERSECTION_RESCAN_RADIUS = 8  -- how far around a newly placed cell we re-evaluate intersections
 
 local function debugPrint(...)
 	if DEBUG_LOGS then
@@ -1113,6 +1114,16 @@ end
 function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder, opts)
 	opts = opts or {}
 	local SPAWN_INTERSECTION_DECOS = (opts.noDecorations ~= true)
+	if typeof(placedRoadsData) ~= "table" then
+		placedRoadsData = {}
+	end
+
+	local recalcRadius = tonumber(opts.recalcRadius)
+	if recalcRadius then
+		recalcRadius = math.max(1, math.floor(recalcRadius))
+	else
+		recalcRadius = 1
+	end
 
 	-- Axis directions for this plot (needed to mirror yaw on even plots)
 	local axisDirX, axisDirZ = 1, 1
@@ -1471,19 +1482,23 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	----------------------------------------------------------------------
 	-- 1) Expand cells to check
 	----------------------------------------------------------------------
-	local cellsToCheck = {}
+	local unique, finalCellsToCheck = {}, {}
+	local function addCell(x, z)
+		local key = string.format("%d_%d", x, z)
+		if unique[key] then return end
+		unique[key] = true
+		table.insert(finalCellsToCheck, { x = x, z = z })
+	end
+
 	for _, cellInfo in ipairs(placedRoadsData) do
 		local gx, gz = cellInfo.gridX, cellInfo.gridZ
-		table.insert(cellsToCheck, { x = gx,   z = gz   })
-		table.insert(cellsToCheck, { x = gx+1, z = gz   })
-		table.insert(cellsToCheck, { x = gx-1, z = gz   })
-		table.insert(cellsToCheck, { x = gx,   z = gz+1 })
-		table.insert(cellsToCheck, { x = gx,   z = gz-1 })
-	end
-	local unique, finalCellsToCheck = {}, {}
-	for _, c in ipairs(cellsToCheck) do
-		local key = string.format("%d_%d", c.x, c.z)
-		if not unique[key] then unique[key] = true; table.insert(finalCellsToCheck, c) end
+		if gx and gz then
+			for dx = -recalcRadius, recalcRadius do
+				for dz = -recalcRadius, recalcRadius do
+					addCell(gx + dx, gz + dz)
+				end
+			end
+		end
 	end
 
 	----------------------------------------------------------------------
@@ -1853,7 +1868,9 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 			PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj], player and player.UserId)
 		end
 
-		RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder)
+		RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder, {
+			recalcRadius = INTERSECTION_RESCAN_RADIUS,
+		})
 		pcall(function()
 			placeStraightRoadDecorations(player, zoneFolder, placedRoadsData, zoneId)
 		end)

@@ -219,8 +219,12 @@ local function getUnlockGridSet(player)
 
 	local function mark(gx, gz, src)
 		if gx < 0 or gz < 0 or gx >= gridSizeX or gz >= gridSizeZ then return end
+
+		-- Normalize into the same logical axis space used everywhere else
 		local logicalGX = (axisDirX == -1) and -gx or gx
-		local k = logicalGX .. "," .. gz
+		local logicalGZ = (axisDirZ == -1) and -gz or gz
+
+		local k = logicalGX .. "," .. logicalGZ
 		set[k] = true
 		if DEBUG and not whoFilled[k] then whoFilled[k] = src end
 	end

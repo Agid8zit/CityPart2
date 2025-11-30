@@ -1,4 +1,9 @@
-print("[Income] Module loaded (sharded + scheduled)")
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
+log("[Income] Module loaded (sharded + scheduled)")
 
 --// Services
 local Players        = game:GetService("Players")
@@ -329,38 +334,48 @@ local function doPayoutChunked()
 	local startCpu = os.clock()
 	for i = 1, #activePlayers do
 		local player = activePlayers[i]
-		if not player or not player.Parent then
-			continue
+		-- Guard per-player payout so a single bad entry cannot kill the whole loop.
+		local ok, err = pcall(function()
+			if not player or not player.Parent then
+				return
+			end
+
+			local SaveData = PlayerDataService.GetSaveFileData(player)
+			if not SaveData then
+				return
+			end
+
+			local playerId = player.UserId
+			ensurePlayerTables(playerId)
+
+			-- 1) Base income from cache (sum of per-tile rounded incomes)
+			local baseTotal = playerBaseIncome[playerId] or 0
+
+			-- 2) Gamepass
+			if PlayerDataInterfaceService.HasGamepass(player, "x2 Money") then
+				baseTotal = baseTotal * 2
+			end
+
+			-- 3) Coverage and global rate scaling
+			local coverage = computeCoverage(player)
+			local rate = Balance.IncomeRate and Balance.IncomeRate.TICK_INCOME or 1
+
+			local pay = math.floor(baseTotal * coverage * rate + 0.5)
+
+			-- cache per-tick
+			playerIncomeCache[playerId] = pay
+
+			-- 4) Apply and 5) notify
+			EconomyService.adjustBalance(player, pay)
+			StatsChanged:Fire(player)
+		end)
+
+		if not ok then
+			warn(("[Income] payout skipped for %s: %s"):format(
+				(player and player.Name) or ("player#" .. tostring(i)),
+				tostring(err)
+			))
 		end
-
-		local SaveData = PlayerDataService.GetSaveFileData(player)
-		if not SaveData then
-			continue
-		end
-
-		local playerId = player.UserId
-		ensurePlayerTables(playerId)
-
-		-- 1) Base income from cache (sum of per-tile rounded incomes)
-		local baseTotal = playerBaseIncome[playerId] or 0
-
-		-- 2) Gamepass
-		if PlayerDataInterfaceService.HasGamepass(player, "x2 Money") then
-			baseTotal = baseTotal * 2
-		end
-
-		-- 3) Coverage and global rate scaling
-		local coverage = computeCoverage(player)
-		local rate = Balance.IncomeRate and Balance.IncomeRate.TICK_INCOME or 1
-
-		local pay = math.floor(baseTotal * coverage * rate + 0.5)
-
-		-- cache per-tick
-		playerIncomeCache[playerId] = pay
-
-		-- 4) Apply and 5) notify
-		EconomyService.adjustBalance(player, pay)
-		StatsChanged:Fire(player)
 
 		-- Yield cooperatively under long-task budget
 		if (os.clock() - startCpu) * 1000.0 >= LONG_TASK_CHUNK_MS then
@@ -456,7 +471,10 @@ local function startPayoutLoop()
 	task.spawn(function()
 		while true do
 			task.wait(TICK_INTERVAL)
-			doPayoutChunked()
+			local ok, err = pcall(doPayoutChunked)
+			if not ok then
+				warn("[Income] payout loop error: " .. tostring(err))
+			end
 		end
 	end)
 end
@@ -539,25 +557,25 @@ end
 function Income.getIncomePerSecond(player)
 	local incomePerTick = playerIncomeCache[player.UserId] or 0
 	local perSecond     = incomePerTick / TICK_INTERVAL
-	print(("[INCOME/s] %s: %d"):format(player.Name, perSecond))
+	log(("[INCOME/s] %s: %d"):format(player.Name, perSecond))
 	return perSecond
 end
 
 function Income.setBalance(player, amount)
 	EconomyService.setBalance(player, amount)
-	print(("[SET] %s balance to %d"):format(player.Name, amount))
+	log(("[SET] %s balance to %d"):format(player.Name, amount))
 end
 
 function Income.addMoney(player, amount)
 	EconomyService.adjustBalance(player, amount)
-	print(("[ADD] %s: +%d → %d"):format(
+	log(("[ADD] %s: +%d → %d"):format(
 		player.Name, amount, EconomyService.getBalance(player)
 		))
 end
 
 function Income.removeMoney(player, amount)
 	EconomyService.adjustBalance(player, -amount)
-	print(("[REMOVE] %s: -%d → %d"):format(
+	log(("[REMOVE] %s: -%d → %d"):format(
 		player.Name, amount, EconomyService.getBalance(player)
 		))
 end

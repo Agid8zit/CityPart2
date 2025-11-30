@@ -65,23 +65,6 @@ local function _queueBulkRebuild(player: Player, zoneId: string)
 	_pendingBulkRebuild[player][zoneId] = true
 end
 
-local function _drainBulkRebuild(player: Player, zoneId: string)
-	local map = _pendingBulkRebuild[player]
-	if not (map and map[zoneId]) then return end
-	map[zoneId] = nil
-	if not next(map) then
-		_pendingBulkRebuild[player] = nil
-	end
-	task.defer(function()
-		-- guard again in case the zone went back into populate mode mid-yield
-		if not _shouldDeferWealthChanges(player, zoneId) then
-			CityInteractions.bulkWealthRebuild(player, zoneId)
-		else
-			_queueBulkRebuild(player, zoneId)
-		end
-	end)
-end
-
 -- ==== Tunables / Guardrails ====
 local ADJACENCY_RADIUS = 5 -- interpreted as *diameter in cells*; the circular radius is floor(ADJACENCY_RADIUS/2)
 local BULK_REBUILD_THRESHOLD = 4
@@ -201,6 +184,18 @@ local synergyMapping: { [string]: { [string]: number } } = {
 local DEBUG_UXP = false
 local DEBUG_SYNERGY = false
 local DEBUG_UXP_ALARMS = false
+local VERBOSE_LOG = false
+
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
+-- Load-safe mode (during join/reload): suppress FX & heavy work briefly
+local LOAD_SAFE_GRACE_SEC = 8
+local LOAD_SAFE_CLUSTER_MAX = 16
+local LOAD_SAFE_CLUSTER_YIELD = 0.01
+local UXP_STEP_BUDGET_SEC = 0.006 -- per-loop yield budget for UXP passes
+local _loadSafeUntil: { [Player]: number } = {}
 
 local function dprintUXP(...: any) if DEBUG_UXP then print("[GridUXP]", ...) end end
 local function dprintSYN(...: any) if DEBUG_SYNERGY then print("[Synergy]", ...) end end
@@ -223,6 +218,11 @@ local RefillQueue = {}
 
 local function _isInLoad(player: Player): boolean
 	return _loadPhase[player] == true
+end
+local function _isLoadSafe(player: Player): boolean
+	if _isInLoad(player) then return true end
+	local untilT = _loadSafeUntil[player]
+	return untilT ~= nil and os.clock() < untilT
 end
 local function _canDowngradeNow(player: Player): boolean
 	local t = _graceUntil[player]
@@ -323,7 +323,7 @@ local function _pollutionAllowed(targetMode: string, sourceMode: string): boolea
 	end
 	local ok = row[sourceMode] == true
 	if DEBUG_SYNERGY then
-		print(("[Pollution] allow? %s <- %s : %s"):format(targetMode, sourceMode, tostring(ok)))
+		log(("[Pollution] allow? %s <- %s : %s"):format(targetMode, sourceMode, tostring(ok)))
 	end
 	return ok
 end
@@ -375,6 +375,18 @@ local SEED_CLUSTERING = {
 	diagonal      = false,  -- 4-neighbor connectivity; set true for 8-neighbor
 	yield_between = 0.02,   -- short cooperative yield after each cluster
 }
+
+local function _seedClusterCfgFor(player: Player)
+	if _isLoadSafe(player) then
+		return {
+			enabled = true,
+			max_cluster = LOAD_SAFE_CLUSTER_MAX,
+			diagonal = SEED_CLUSTERING.diagonal,
+			yield_between = LOAD_SAFE_CLUSTER_YIELD,
+		}
+	end
+	return SEED_CLUSTERING
+end
 
 local function _neighborsFor(x: number, z: number, diagonal: boolean)
 	if diagonal then
@@ -849,7 +861,33 @@ end
 -- UXP FLASH ALARM SYSTEM  (AlarmUpgrade / AlarmDowngrade / AlarmPolution [reserved])
 -- =========================================================================================
 
-local UXP_SOUND_COOLDOWN = 0.9 -- seconds between Upgrade/Downgrade SFX buckets per player
+local Fx = {
+	SOUND_COOLDOWN = 0.9, -- seconds between Upgrade/Downgrade SFX buckets per player
+	ALARM_FOLDER_NAME = "TempUxpAlarms",
+	FADE_IN_TIME = 0.15,
+	PULSE_UP_TIME = 0.25,
+	PULSE_DOWN_TIME = 0.25,
+	PULSE_CYCLES = 2, -- gentle, not spammy
+	FADE_OUT_TIME = 0.18,
+	PULSE_SCALE = 0.18, -- 18% bigger at peak
+	BASE_ALPHA = 0.15,  -- end-of-fade-in target (semi-opaque)
+	PEAK_ALPHA = 0.00,  -- most visible at pulse peak (0 = fully opaque for Image, 0 = fully opaque bg if you invert)
+	EASING = Enum.EasingStyle.Sine,
+	THROTTLE_PER_TILE = 0.12,
+	POLLUTION_TYPES = { AlarmPolution = true, AlarmPollution = true },
+	ALARM_OFFSET_Y = 6,
+	POLLUTION_OFFSET_Y = 9, -- higher Y only for pollution
+	POLLUTION_HOLD_TIME = 3.5, -- seconds to stay visible
+	POLLUTION_BASE_ALPHA = 0.22, -- slightly more visible while lingering
+	POLLUTION_FADE_IN = 0.18,
+	POLLUTION_FADE_OUT = 0.22,
+	COLOR_STEPS = 6, -- equal steps (e.g., 6 = 0%, 20%, 40%, 60%, 80%, 100%)
+	COLOR_DARK_ORANGE = Color3.fromRGB(220, 130, 0),
+	COLOR_GREEN = Color3.fromRGB(0, 200, 120),
+	COLOR_RED = Color3.fromRGB(215, 50, 50),
+}
+Fx.ALARM_TTL = Fx.FADE_IN_TIME + (Fx.PULSE_UP_TIME + Fx.PULSE_DOWN_TIME) * Fx.PULSE_CYCLES + Fx.FADE_OUT_TIME + 0.05
+Fx.POLLUTION_TTL = Fx.POLLUTION_FADE_IN + Fx.POLLUTION_HOLD_TIME + Fx.POLLUTION_FADE_OUT + 0.05
 local _uxpSoundLastAt: {[Player]: {[string]: number}} = {}
 
 local function playUxpSound(player: Player?, kind: "Upgrade" | "Downgrade")
@@ -865,7 +903,7 @@ local function playUxpSound(player: Player?, kind: "Upgrade" | "Downgrade")
 	end
 
 	local last = perPlayer[kind] or 0
-	if now - last < UXP_SOUND_COOLDOWN then
+	if now - last < Fx.SOUND_COOLDOWN then
 		return
 	end
 
@@ -881,43 +919,18 @@ end)
 --    fade-in → pulse (scale up/down smoothly) for N cycles → fade-out → return to pool
 --    POLLUTION-ONLY: fade-in → hold (linger) → fade-out → return to pool
 
-local UXP_ALARM_FOLDER_NAME = "TempUxpAlarms"
 
 -- Timing / pulse shape (gentle vibe)
-local UXP_FADE_IN_TIME      = 0.15
-local UXP_PULSE_UP_TIME     = 0.25
-local UXP_PULSE_DOWN_TIME   = 0.25
-local UXP_PULSE_CYCLES      = 2         -- gentle, not spammy
-local UXP_FADE_OUT_TIME     = 0.18
-local UXP_ALARM_TTL         = UXP_FADE_IN_TIME + (UXP_PULSE_UP_TIME+UXP_PULSE_DOWN_TIME)*UXP_PULSE_CYCLES + UXP_FADE_OUT_TIME + 0.05
-
-local UXP_PULSE_SCALE       = 0.18      -- 18% bigger at peak
-local UXP_BASE_ALPHA        = 0.15      -- end-of-fade-in target (semi-opaque)
-local UXP_PEAK_ALPHA        = 0.00      -- most visible at pulse peak (0 = fully opaque for Image, 0 = fully opaque bg if you invert)
-local UXP_EASING            = Enum.EasingStyle.Sine
-local UXP_THROTTLE_PER_TILE = 0.12
 
 -- === NEW: pollution-only style ===
-local POLLUTION_TYPES = { AlarmPolution = true, AlarmPollution = true }
 
 -- Raise pollution alarms higher than default
-local UXP_ALARM_OFFSET_Y        = 6
-local UXP_POLLUTION_OFFSET_Y    = 9        -- ↑ higher Y only for pollution
 
 -- Linger profile (no pulse): fade in, HOLD, fade out
-local UXP_POLLUTION_HOLD_TIME   = 3.5      -- seconds to stay visible
-local UXP_POLLUTION_BASE_ALPHA  = 0.22     -- slightly more visible while lingering
-local UXP_POLLUTION_FADE_IN     = 0.18
-local UXP_POLLUTION_FADE_OUT    = 0.22
-local UXP_POLLUTION_TTL         = UXP_POLLUTION_FADE_IN + UXP_POLLUTION_HOLD_TIME + UXP_POLLUTION_FADE_OUT + 0.05
 
 -- === Progress color ramp (discrete steps) ===
-local UXP_COLOR_STEPS = 6  -- equal steps (e.g., 6 = 0%, 20%, 40%, 60%, 80%, 100%)
 
 -- Anchors for ramps
-local COLOR_DARK_ORANGE = Color3.fromRGB(220, 130,  0)
-local COLOR_GREEN       = Color3.fromRGB(  0, 200,120)
-local COLOR_RED         = Color3.fromRGB(215,  50, 50)
 
 -- still used as a “default red” elsewhere if needed
 CityInteractions._DOWNGRADE_COLOR = Color3.fromRGB(220, 64, 64)
@@ -935,14 +948,14 @@ end
 
 -- Progress (0..1) → discrete color for UPGRADE (dark orange → green)
 function CityInteractions._progressColorUp(p:number): Color3
-	local t = _q01(p, UXP_COLOR_STEPS)
-	return _lerpC(COLOR_DARK_ORANGE, COLOR_GREEN, t)
+	local t = _q01(p, Fx.COLOR_STEPS)
+	return _lerpC(Fx.COLOR_DARK_ORANGE, Fx.COLOR_GREEN, t)
 end
 
 -- Progress (0..1) → discrete color for DOWNGRADE (dark orange → red)
 function CityInteractions._progressColorDown(p:number): Color3
-	local t = _q01(p, UXP_COLOR_STEPS)
-	return _lerpC(COLOR_DARK_ORANGE, COLOR_RED, t)
+	local t = _q01(p, Fx.COLOR_STEPS)
+	return _lerpC(Fx.COLOR_DARK_ORANGE, Fx.COLOR_RED, t)
 end
 
 -- we accept both spellings for future-proofing
@@ -1215,10 +1228,10 @@ local function _returnUxpAlarm(part: BasePart)
 end
 
 local function _ensureUxpFolder(zoneModel: Instance): Folder
-	local f = zoneModel:FindFirstChild(UXP_ALARM_FOLDER_NAME)
+	local f = zoneModel:FindFirstChild(Fx.ALARM_FOLDER_NAME)
 	if not f then
 		f = Instance.new("Folder")
-		f.Name = UXP_ALARM_FOLDER_NAME
+		f.Name = Fx.ALARM_FOLDER_NAME
 		f.Parent = zoneModel
 	end
 	return f
@@ -1283,15 +1296,15 @@ local function _pulseGui(billboard: BillboardGui, cycles: number, token: number,
 		local basePxX = baseSize.X.Offset
 		local basePxY = baseSize.Y.Offset
 		local maxBase = math.max(math.abs(basePxX), math.abs(basePxY), 1)
-		local growPx  = math.max(2, math.floor(maxBase * UXP_PULSE_SCALE + 0.5))
+		local growPx  = math.max(2, math.floor(maxBase * Fx.PULSE_SCALE + 0.5))
 		local prePx   = math.max(1, math.floor(growPx * 0.1 + 0.5))
 
 		grown   = UDim2.fromOffset(basePxX + growPx, basePxY + growPx)
 		preGrow = UDim2.fromOffset(basePxX + prePx,  basePxY + prePx)
 	else
 		-- Scale pulse: multiply the scale channels
-		grown   = UDim2.new(baseSize.X.Scale * (1 + UXP_PULSE_SCALE), baseSize.X.Offset,
-			baseSize.Y.Scale * (1 + UXP_PULSE_SCALE), baseSize.Y.Offset)
+		grown   = UDim2.new(baseSize.X.Scale * (1 + Fx.PULSE_SCALE), baseSize.X.Offset,
+			baseSize.Y.Scale * (1 + Fx.PULSE_SCALE), baseSize.Y.Offset)
 		preGrow = UDim2.new(baseSize.X.Scale * 1.02, baseSize.X.Offset,
 			baseSize.Y.Scale * 1.02, baseSize.Y.Offset)
 	end
@@ -1299,15 +1312,15 @@ local function _pulseGui(billboard: BillboardGui, cycles: number, token: number,
 	-- Start fully hidden, then fade-in (Icon only; backgrounds untouched)
 	_setGuiAlpha(billboard, 1.0) -- 1.0 = fully hidden for ImageTransparency
 
-	local tiIn = TweenInfo.new(UXP_FADE_IN_TIME, UXP_EASING, Enum.EasingDirection.Out)
-	local targetAlpha = UXP_BASE_ALPHA
+	local tiIn = TweenInfo.new(Fx.FADE_IN_TIME, Fx.EASING, Enum.EasingDirection.Out)
+	local targetAlpha = Fx.BASE_ALPHA
 	billboard.Size = baseSize
 	_tween(billboard, tiIn, { Size = preGrow })
 
 	-- manual alpha tween to avoid per-child tweens
 	local fadeInStart = os.clock()
-	while os.clock() - fadeInStart < UXP_FADE_IN_TIME do
-		local t = (os.clock() - fadeInStart) / UXP_FADE_IN_TIME
+	while os.clock() - fadeInStart < Fx.FADE_IN_TIME do
+		local t = (os.clock() - fadeInStart) / Fx.FADE_IN_TIME
 		local aNow = (1 - t) * 1.0 + t * targetAlpha
 		_setGuiAlpha(billboard, aNow)
 		task.wait(0.016)
@@ -1319,28 +1332,28 @@ local function _pulseGui(billboard: BillboardGui, cycles: number, token: number,
 	for _ = 1, cycles do
 		local a = ActiveUxp[part]; if not a or a.token ~= token then return end
 		-- UP: size to 'grown', alpha to PEAK
-		local tiUp = TweenInfo.new(UXP_PULSE_UP_TIME, UXP_EASING, Enum.EasingDirection.Out)
+		local tiUp = TweenInfo.new(Fx.PULSE_UP_TIME, Fx.EASING, Enum.EasingDirection.Out)
 		_tween(billboard, tiUp, { Size = grown })
 		local upStart = os.clock()
-		while os.clock() - upStart < UXP_PULSE_UP_TIME do
-			local t = (os.clock() - upStart) / UXP_PULSE_UP_TIME
+		while os.clock() - upStart < Fx.PULSE_UP_TIME do
+			local t = (os.clock() - upStart) / Fx.PULSE_UP_TIME
 			local eased = math.sin(t * math.pi * 0.5) -- easeOutSine
-			local aNow = targetAlpha + (UXP_PEAK_ALPHA - targetAlpha) * eased
+			local aNow = targetAlpha + (Fx.PEAK_ALPHA - targetAlpha) * eased
 			_setGuiAlpha(billboard, aNow)
 			task.wait(0.016)
 			local a2 = ActiveUxp[part]; if not a2 or a2.token ~= token then return end
 		end
-		_setGuiAlpha(billboard, UXP_PEAK_ALPHA)
+		_setGuiAlpha(billboard, Fx.PEAK_ALPHA)
 
 		local a3 = ActiveUxp[part]; if not a3 or a3.token ~= token then return end
 		-- DOWN: size back to base, alpha back to base target
-		local tiDown = TweenInfo.new(UXP_PULSE_DOWN_TIME, UXP_EASING, Enum.EasingDirection.In)
+		local tiDown = TweenInfo.new(Fx.PULSE_DOWN_TIME, Fx.EASING, Enum.EasingDirection.In)
 		_tween(billboard, tiDown, { Size = baseSize })
 		local dnStart = os.clock()
-		while os.clock() - dnStart < UXP_PULSE_DOWN_TIME do
-			local t = (os.clock() - dnStart) / UXP_PULSE_DOWN_TIME
+		while os.clock() - dnStart < Fx.PULSE_DOWN_TIME do
+			local t = (os.clock() - dnStart) / Fx.PULSE_DOWN_TIME
 			local eased = 1 - math.cos(t * math.pi * 0.5) -- easeInSine
-			local aNow = UXP_PEAK_ALPHA + (targetAlpha - UXP_PEAK_ALPHA) * eased
+			local aNow = Fx.PEAK_ALPHA + (targetAlpha - Fx.PEAK_ALPHA) * eased
 			_setGuiAlpha(billboard, aNow)
 			task.wait(0.016)
 			local a4 = ActiveUxp[part]; if not a4 or a4.token ~= token then return end
@@ -1349,11 +1362,11 @@ local function _pulseGui(billboard: BillboardGui, cycles: number, token: number,
 	end
 
 	-- Fade out gently, keep size at base
-	local tiOut = TweenInfo.new(UXP_FADE_OUT_TIME, UXP_EASING, Enum.EasingDirection.In)
+	local tiOut = TweenInfo.new(Fx.FADE_OUT_TIME, Fx.EASING, Enum.EasingDirection.In)
 	_tween(billboard, tiOut, { Size = baseSize })
 	local outStart = os.clock()
-	while os.clock() - outStart < UXP_FADE_OUT_TIME do
-		local t = (os.clock() - outStart) / UXP_FADE_OUT_TIME
+	while os.clock() - outStart < Fx.FADE_OUT_TIME do
+		local t = (os.clock() - outStart) / Fx.FADE_OUT_TIME
 		local eased = 1 - math.cos(t * math.pi * 0.5)
 		local aNow = targetAlpha + (1.0 - targetAlpha) * eased
 		_setGuiAlpha(billboard, aNow)
@@ -1367,18 +1380,18 @@ end
 local function _lingerGui(billboard: BillboardGui, holdSeconds: number, token: number, part: BasePart)
 	-- Start fully hidden; fade in to pollution base alpha
 	_setGuiAlpha(billboard, 1.0)
-	local tiIn = TweenInfo.new(UXP_POLLUTION_FADE_IN, UXP_EASING, Enum.EasingDirection.Out)
+	local tiIn = TweenInfo.new(Fx.POLLUTION_FADE_IN, Fx.EASING, Enum.EasingDirection.Out)
 	_tween(billboard, tiIn, {}) -- keep size; only alpha via loop
 
 	local fadeInStart = os.clock()
-	while os.clock() - fadeInStart < UXP_POLLUTION_FADE_IN do
-		local t = (os.clock() - fadeInStart) / UXP_POLLUTION_FADE_IN
-		local aNow = (1 - t) * 1.0 + t * UXP_POLLUTION_BASE_ALPHA
+	while os.clock() - fadeInStart < Fx.POLLUTION_FADE_IN do
+		local t = (os.clock() - fadeInStart) / Fx.POLLUTION_FADE_IN
+		local aNow = (1 - t) * 1.0 + t * Fx.POLLUTION_BASE_ALPHA
 		_setGuiAlpha(billboard, aNow)
 		task.wait(0.016)
 		local a = ActiveUxp[part]; if not a or a.token ~= token then return end
 	end
-	_setGuiAlpha(billboard, UXP_POLLUTION_BASE_ALPHA)
+	_setGuiAlpha(billboard, Fx.POLLUTION_BASE_ALPHA)
 
 	-- Hold visibly
 	local holdStart = os.clock()
@@ -1388,12 +1401,12 @@ local function _lingerGui(billboard: BillboardGui, holdSeconds: number, token: n
 	end
 
 	-- Fade out
-	local tiOut = TweenInfo.new(UXP_POLLUTION_FADE_OUT, UXP_EASING, Enum.EasingDirection.In)
+	local tiOut = TweenInfo.new(Fx.POLLUTION_FADE_OUT, Fx.EASING, Enum.EasingDirection.In)
 	_tween(billboard, tiOut, {})
 	local outStart = os.clock()
-	while os.clock() - outStart < UXP_POLLUTION_FADE_OUT do
-		local t = (os.clock() - outStart) / UXP_POLLUTION_FADE_OUT
-		local aNow = UXP_POLLUTION_BASE_ALPHA + (1.0 - UXP_POLLUTION_BASE_ALPHA) * t
+	while os.clock() - outStart < Fx.POLLUTION_FADE_OUT do
+		local t = (os.clock() - outStart) / Fx.POLLUTION_FADE_OUT
+		local aNow = Fx.POLLUTION_BASE_ALPHA + (1.0 - Fx.POLLUTION_BASE_ALPHA) * t
 		_setGuiAlpha(billboard, aNow)
 		task.wait(0.016)
 		local a2 = ActiveUxp[part]; if not a2 or a2.token ~= token then return end
@@ -1406,10 +1419,12 @@ local function _throttleKey(player: Player, zoneId: string, alarmType: string, x
 end
 
 local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: number, alarmType: string, tint: Color3?)
+	-- Suppress FX during load-safe window
+	if _isLoadSafe(player) then return end
 	if not VALID_UXP_ALARM_TYPES[alarmType] then return end
 	local now = os.clock()
 	local key = _throttleKey(player, zoneId, alarmType, x, z)
-	if (_lastFlashAt[key] or 0) + UXP_THROTTLE_PER_TILE > now then
+	if (_lastFlashAt[key] or 0) + Fx.THROTTLE_PER_TILE > now then
 		return -- rate-limit micro-spam on rapid recompute
 	end
 	_lastFlashAt[key] = now
@@ -1433,7 +1448,7 @@ local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: numb
 	end
 
 	-- position (pollution sits higher)
-	local offsetY = POLLUTION_TYPES[alarmType] and UXP_POLLUTION_OFFSET_Y or UXP_ALARM_OFFSET_Y
+	local offsetY = Fx.POLLUTION_TYPES[alarmType] and Fx.POLLUTION_OFFSET_Y or Fx.ALARM_OFFSET_Y
 	local pos = _gridToWorld(playerPlot, x, z) + Vector3.new(0, offsetY, 0)
 	part.Position = pos
 
@@ -1442,7 +1457,7 @@ local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: numb
 	local token = ((ActiveUxp[part] and ActiveUxp[part].token) or 0) + 1
 
 	-- Per-type TTL
-	local ttl = POLLUTION_TYPES[alarmType] and UXP_POLLUTION_TTL or UXP_ALARM_TTL
+	local ttl = Fx.POLLUTION_TYPES[alarmType] and Fx.POLLUTION_TTL or Fx.ALARM_TTL
 	ActiveUxp[part] = { token = token, expires = now + ttl }
 
 	if billboard and billboard:IsA("BillboardGui") then
@@ -1460,7 +1475,7 @@ local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: numb
 					icon.ImageColor3 = Color3.fromRGB(32, 210, 120)
 				elseif alarmType == "AlarmDowngrade" then
 					icon.ImageColor3 = CityInteractions._DOWNGRADE_COLOR
-				elseif POLLUTION_TYPES[alarmType] then
+				elseif Fx.POLLUTION_TYPES[alarmType] then
 					-- Keep existing icon color if your template encodes a specific pollution hue.
 					-- (No change = respect template styling.)
 				end
@@ -1470,10 +1485,10 @@ local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: numb
 
 	task.spawn(function()
 		if billboard and billboard:IsA("BillboardGui") then
-			if POLLUTION_TYPES[alarmType] then
-				_lingerGui(billboard, UXP_POLLUTION_HOLD_TIME, token, part)
+			if Fx.POLLUTION_TYPES[alarmType] then
+				_lingerGui(billboard, Fx.POLLUTION_HOLD_TIME, token, part)
 			else
-				_pulseGui(billboard, UXP_PULSE_CYCLES, token, part)
+				_pulseGui(billboard, Fx.PULSE_CYCLES, token, part)
 			end
 		end
 	end)
@@ -1489,7 +1504,7 @@ end
 function CityInteractions._clearUxpAlarmsForZone(player: Player, zoneId: string)
 	local zoneModel = select(1, _getZoneModelFor(player, zoneId))
 	if not zoneModel then return end
-	local f = zoneModel:FindFirstChild(UXP_ALARM_FOLDER_NAME)
+	local f = zoneModel:FindFirstChild(Fx.ALARM_FOLDER_NAME)
 	if not f then return end
 	for _, ch in ipairs(f:GetChildren()) do
 		if ch:IsA("BasePart") then
@@ -1706,6 +1721,23 @@ end
 
 local function _shouldDeferWealthChanges(player: Player, zoneId: string): boolean
 	return _isZonePopulating(player, zoneId)
+end
+
+local function _drainBulkRebuild(player: Player, zoneId: string)
+	local map = _pendingBulkRebuild[player]
+	if not (map and map[zoneId]) then return end
+	map[zoneId] = nil
+	if not next(map) then
+		_pendingBulkRebuild[player] = nil
+	end
+	task.defer(function()
+		-- guard again in case the zone went back into populate mode mid-yield
+		if not _shouldDeferWealthChanges(player, zoneId) then
+			CityInteractions.bulkWealthRebuild(player, zoneId)
+		else
+			_queueBulkRebuild(player, zoneId)
+		end
+	end)
 end
 
 local function _queueWealthChanges(
@@ -2362,8 +2394,9 @@ function CityInteractions._fillZoneGapsAtWealth(
 		local wealthToRun, cellsToRun = RefillQueue.popOne(player, zoneId)
 		if not wealthToRun or not cellsToRun or #cellsToRun == 0 then break end
 
-		-- NEW: cluster & cap batch size
-		local clusters = SEED_CLUSTERING.enabled and _clusterSeedCells(cellsToRun, SEED_CLUSTERING) or { cellsToRun }
+		-- NEW: cluster & cap batch size (smaller during load-safe)
+		local cfg = _seedClusterCfgFor(player)
+		local clusters = cfg.enabled and _clusterSeedCells(cellsToRun, cfg) or { cellsToRun }
 		for _, cluster in ipairs(clusters) do
 			if shouldRefillStop() then
 				aborted = true
@@ -2382,7 +2415,7 @@ function CityInteractions._fillZoneGapsAtWealth(
 				break
 			end
 			-- polite yield to keep the server responsive
-			task.wait(SEED_CLUSTERING.yield_between or 0.02)
+			task.wait((cfg and cfg.yield_between) or 0.02)
 		end
 		if aborted then break end
 	end
@@ -2426,8 +2459,12 @@ function CityInteractions._applyWealthBatch(
 	-- =========================================================
 	-- FIX 3: micro-sweep around changed tiles to catch *newly*
 	-- orphaned cells created by multi-cell footprint changes.
+	-- Skip during load-safe to avoid extra work; gaps will be
+	-- handled by later bulk/scheduled passes.
 	-- =========================================================
-	_sweepLocalGapsAround(player, zoneId, mode, changes)
+	if not _isLoadSafe(player) then
+		_sweepLocalGapsAround(player, zoneId, mode, changes)
+	end
 end
 
 -- ===== UXP (with delta-triggered pulse) =====
@@ -2496,7 +2533,12 @@ function CityInteractions.calculateGridUXP(player: Player, zoneData: ZoneData)
 	end
 
 	-- ===== MAIN PER-TILE PASS =====
+	local lastYieldAt = os.clock()
 	for _, currentTile in ipairs(zoneData.gridList) do
+		if os.clock() - lastYieldAt > UXP_STEP_BUDGET_SEC then
+			task.wait()
+			lastYieldAt = os.clock()
+		end
 		dprintUXP(("• Checking tile %d, %d"):format(currentTile.x, currentTile.z))
 
 		-- Track best tier per category
@@ -2767,8 +2809,8 @@ end
 
 -- ===== Event entry points =====
 function CityInteractions.onZoneCreated(player: Player, zoneId: string, mode: string, gridList: { GridTile })
-	if IGNORE_ZONE_TYPES[mode] then print("[CityInteractions] Skipping cache and logic for excluded type:", mode) return end
-	print("[CityInteractions] onZoneCreated:", zoneId, mode, player.Name)
+	if IGNORE_ZONE_TYPES[mode] then log("[CityInteractions] Skipping cache and logic for excluded type:", mode) return end
+	log("[CityInteractions] onZoneCreated:", zoneId, mode, player.Name)
 	RefillQueue.cancel(player, zoneId)
 
 	if VALID_ZONE_TYPES[mode] then
@@ -2873,10 +2915,10 @@ end
 
 function CityInteractions.onZoneRemoved(player: Player, zoneId: string, mode: string, gridList: { GridTile }?)
 	if IGNORE_ZONE_TYPES[mode] then
-		print("[CityInteractions] Skipping zone removal for excluded type:", mode)
+		log("[CityInteractions] Skipping zone removal for excluded type:", mode)
 		return
 	end
-	print(string.format("[CityInteractions] onZoneRemoved: '%s' (%s)", zoneId, mode))
+	log(string.format("[CityInteractions] onZoneRemoved: '%s' (%s)", zoneId, mode))
 	RefillQueue.cancel(player, zoneId)
 	_clearZonePending(player, zoneId)
 
@@ -2993,10 +3035,17 @@ end
 function CityInteractions.onCityPreload(player: Player)
 	_loadPhase[player]  = true
 	_graceUntil[player] = os.clock() + DOWNGRADE_GRACE_SEC
+	_loadSafeUntil[player] = os.clock() + LOAD_SAFE_GRACE_SEC
 end
 
 function CityInteractions.onCityPostload(player: Player)
 	_loadPhase[player] = false
+	-- Keep a short load-safe window after postload for FX/CPU throttle
+	local target = os.clock() + LOAD_SAFE_GRACE_SEC
+	local existing = _loadSafeUntil[player]
+	if not existing or existing < target then
+		_loadSafeUntil[player] = target
+	end
 	CityInteractions.rebuildCacheFromTracker(player)
 	local cache = zoneCacheByPlayer[player]
 	if cache then
@@ -3031,6 +3080,7 @@ Players.PlayerRemoving:Connect(function(plr: Player)
 	_pollTickCursor[plr]   = nil
 	_positiveBonusTiles[plr] = nil
 	zoneSpatialIndexByPlayer[plr] = nil
+	_loadSafeUntil[plr]    = nil
 end)
 
 -- === INTENT-ONLY PASS: compute intended wealth for every tile (no side effects) ===
@@ -3161,3 +3211,4 @@ function CityInteractions.bulkWealthRebuild(player: Player, zoneId: string)
 end
 
 return CityInteractions
+

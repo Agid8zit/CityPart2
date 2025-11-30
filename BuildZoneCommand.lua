@@ -39,6 +39,11 @@ local zonePopulatedEvent     = BindableEvents:WaitForChild("ZonePopulated")
 local buildingsPlacedEvent   = BindableEvents:WaitForChild("BuildingsPlaced")
 local notifyZoneCreatedEvent = RemoteEvents:WaitForChild("NotifyZoneCreated")
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 local BldGen                  = Districts:WaitForChild("Building Gen")
 local BuildingGeneratorModule = require(BldGen:WaitForChild("BuildingGenerator"))
 local LayerManagerModule      = require(S3.Build.LayerManager)
@@ -52,7 +57,7 @@ local GridUtils = require(GridConf:WaitForChild("GridUtil"))
 local DEBUG = true
 local function debugPrint(...)
 	if DEBUG then
-		print("[BuildZoneCommand]", ...)
+		log("[BuildZoneCommand]", ...)
 	end
 end
 
@@ -465,7 +470,7 @@ function BuildZoneCommand:execute()
 		end
 	end
 
-	print("BuildZoneCommand: Execution complete for player:", self.player.Name)
+log("BuildZoneCommand: Execution complete for player:", self.player.Name)
 end
 
 -----------------------------------------------------------------------

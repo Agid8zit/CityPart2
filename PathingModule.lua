@@ -27,7 +27,7 @@ local adjacencyByOwner = {}            -- [ownerKey] = { [nodeKey] = { neighborK
 local nodeMetaByOwner  = {}            -- [ownerKey] = { [nodeKey] = meta }
 PathingModule.nodeMeta = nodeMetaByOwner
 
-local roadNetworks = {}                -- [zoneId] = { owner=<ownerKey>, ... }
+local roadNetworks = {}                -- ["owner::zoneId"] = { owner=<ownerKey>, id=<zoneId>, ... }
 local globalAdjacency = PathingModule.globalAdjacency  -- union view (read-only for consumers)
 
 -- Road Parallel helpers
@@ -50,6 +50,26 @@ local function ownerKey(owner)
 	local n = tonumber(owner)
 	if n then return tostring(n) end
 	return owner and tostring(owner) or "global"
+end
+
+local function roadKey(zoneId, owner)
+	return string.format("%s::%s", ownerKey(owner), tostring(zoneId or ""))
+end
+
+local function findNetworkKey(zoneId, owner)
+	local candidate = roadKey(zoneId, owner)
+	if roadNetworks[candidate] then
+		return candidate
+	end
+	-- Defensive: allow lookups by id when caller omitted owner (e.g., legacy paths)
+	for k, net in pairs(roadNetworks) do
+		if net and net.id == zoneId then
+			if not owner or net.owner == ownerKey(owner) then
+				return k
+			end
+		end
+	end
+	return candidate
 end
 
 local function getAdjacency(owner, create)
@@ -187,32 +207,19 @@ local function shouldConnectLateralAtEndpoints(eMeta, nMeta)
 	return (eMeta.role == "End") or (nMeta.role == "End")
 end
 
--- NEW: fillLineBetweenCoords (ensures no skipped cells along straight segments)
-local function fillLineBetweenCoords(coords)
-	if #coords < 2 then return coords end
-	local fullList = {}
-	table.insert(fullList, coords[1])
-	for i = 1, (#coords - 1) do
-		local c1 = coords[i]
-		local c2 = coords[i+1]
-		if c1.z == c2.z then
-			local z = c1.z
-			local step = (c2.x > c1.x) and 1 or -1
-			for x = c1.x + step, c2.x, step do
-				table.insert(fullList, { x = x, z = z })
+-- NEW: sanitize road coords (shallow copy + dedupe). Do NOT inject missing cells.
+local function normalizeRoadCoords(coords)
+	local out, seen = {}, {}
+	for _, c in ipairs(coords or {}) do
+		if typeof(c) == "table" and type(c.x) == "number" and type(c.z) == "number" then
+			local k = nodeKey(c)
+			if not seen[k] then
+				seen[k] = true
+				table.insert(out, { x = c.x, z = c.z })
 			end
-		elseif c1.x == c2.x then
-			local x = c1.x
-			local step = (c2.z > c1.z) and 1 or -1
-			for z = c1.z + step, c2.z, step do
-				table.insert(fullList, { x = x, z = z })
-			end
-		else
-			-- Only orthogonal roads supported; keep c2 to avoid gaps but won’t fill diagonals
-			table.insert(fullList, c2)
 		end
 	end
-	return fullList
+	return out
 end
 
 -- INTERNAL: addToNetwork
@@ -226,19 +233,22 @@ local function addToNetwork(zoneId, roadCoords, owner)
 	local meta = select(1, getNodeMeta(ownerKeyStr, true))
 
 	-- Build or update the per-road record
-	local network = roadNetworks[zoneId]
+	local key = roadKey(zoneId, owner)
+	local network = roadNetworks[key]
 	if not network then
 		network = {
 			id = zoneId,
 			segments = {},
 			overallDirection = "Undefined",
 			startCoord = nil,
-			endCoord = nil
+			endCoord = nil,
+			owner = ownerKeyStr,
 		}
-		roadNetworks[zoneId] = network
+		roadNetworks[key] = network
 	else
 		network.segments = {}
 	end
+	network.owner = ownerKeyStr
 
 	-- Build 'segments'
 	for i = 1, #roadCoords - 1 do
@@ -260,9 +270,16 @@ local function addToNetwork(zoneId, roadCoords, owner)
 		meta[k] = { groupId = zoneId, axis = axis, role = role }
 	end
 
-	-- Connect consecutive cells inside this path
+	-- Connect consecutive cells inside this path (neighbors only to avoid ghost links)
 	for i = 1, #roadCoords - 1 do
-		addEdge(adj, nodeKey(roadCoords[i]), nodeKey(roadCoords[i + 1]))
+		local a, b = roadCoords[i], roadCoords[i + 1]
+		if areNeighbors(a, b) then
+			addEdge(adj, nodeKey(a), nodeKey(b))
+		else
+			dwarn(string.format(
+				"[PathingModule] Skipping non-adjacent link (%d,%d) -> (%d,%d) for road %s",
+				a.x, a.z, b.x, b.z, tostring(zoneId)))
+		end
 	end
 
 	-- STITCH: to OTHER paths around every node
@@ -483,8 +500,11 @@ function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoo
 	dprint(string.format("[PathingModule] Registering road '%s' of type '%s' with grid coordinates:", zoneId, mode))
 	-- for _, coord in ipairs(gridCoords) do dprint(string.format("[PathingModule] (%d,%d)", coord.x, coord.z)) end
 
-	local filledCoords = fillLineBetweenCoords(gridCoords)
-	addToNetwork(zoneId, filledCoords, owner)
+	-- Always rebuild this road from scratch to avoid stale ghost nodes on re-register.
+	PathingModule.unregisterRoad(zoneId, owner)
+
+	local normCoords = normalizeRoadCoords(gridCoords)
+	addToNetwork(zoneId, normCoords, owner)
 
 	-- NEW: after adding this network, stitch endpoint laterals globally so
 	-- endpoints next to side-by-side roads become connected.
@@ -493,7 +513,8 @@ function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoo
 	local overallDirection = PathingModule.determineOverallDirection(startCoord, endCoord)
 	dprint(string.format("[PathingModule] Road '%s' is built in direction: %s", zoneId, overallDirection))
 
-	local network = roadNetworks[zoneId]
+	local key = roadKey(zoneId, owner)
+	local network = roadNetworks[key]
 	if network then
 		network.overallDirection = overallDirection
 		network.startCoord = startCoord
@@ -507,7 +528,8 @@ function PathingModule.registerRoad(zoneId, mode, gridCoords, startCoord, endCoo
 end
 
 function PathingModule.unregisterRoad(zoneId, owner)
-	local network = roadNetworks[zoneId]
+	local key = findNetworkKey(zoneId, owner)
+	local network = roadNetworks[key]
 	local ownerKeyStr = ownerKey(owner or (network and network.owner))
 	local adj = select(1, getAdjacency(ownerKeyStr, false)) or select(1, getAdjacency("global", false))
 	local meta = select(1, getNodeMeta(ownerKeyStr, false)) or select(1, getNodeMeta("global", false))
@@ -530,7 +552,7 @@ function PathingModule.unregisterRoad(zoneId, owner)
 				if meta then meta[k] = nil end
 			end
 		end
-		roadNetworks[zoneId] = nil
+		roadNetworks[key] = nil
 	else
 		dwarn(string.format("[PathingModule] Attempted to unregister non-existent road '%s'.", zoneId))
 	end

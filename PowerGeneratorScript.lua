@@ -16,6 +16,11 @@ local zoneAddedEvent     = BindableEvents:WaitForChild("ZoneAdded")     -- <— 
 local zoneRemovedEvent   = BindableEvents:WaitForChild("ZoneRemoved")
 local zoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Remove the duplicated ZoneCreated connection (you currently have it twice).
 -- Keep ZoneCreated only for UI/client notify flows if you want.
 -- (If you keep one, leave it, but power line population should hinge on ZoneAdded.)
@@ -47,9 +52,9 @@ end)
 
 zoneRemovedEvent.Event:Connect(function(player, zoneId, mode)
 	if powerZoneTypes[mode] then
-		print(("[PowerGeneratorScript] ZoneRemoved received. Cleaning up zone '%s' for '%s'."):format(zoneId, player.Name))
+		log(("[PowerGeneratorScript] ZoneRemoved received. Cleaning up zone '%s' for '%s'."):format(zoneId, player.Name))
 		PowerGeneratorModule.removeLines(player, zoneId)
 	end
 end)
 
-print("[PowerGeneratorScript] Module loaded and listening on ZoneAdded/ZoneReCreated/ZoneRemoved.")
+log("[PowerGeneratorScript] Module loaded and listening on ZoneAdded/ZoneReCreated/ZoneRemoved.")

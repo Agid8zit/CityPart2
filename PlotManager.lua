@@ -7,9 +7,14 @@ local GetAssignedPlotFunction = REFolder:WaitForChild("GetAssignedPlot")
 local PlotManager = {}
 PlotManager.PlayerPlot = nil
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Function to assign the plot
 local function assignPlot(plotName)
-	print("PlotManager: Assigning plot", plotName)
+	log("PlotManager: Assigning plot", plotName)
 
 	-- Wait for the plot to appear in the workspace
 	local plot
@@ -22,7 +27,7 @@ local function assignPlot(plotName)
 	until plot
 
 	PlotManager.PlayerPlot = plot
-	print("PlotManager: Found plot", plot.Name)
+	log("PlotManager: Found plot", plot.Name)
 
 	-- Proceed to set PrimaryPart
 	local primaryPartName = plot:GetAttribute("PrimaryPartName")
@@ -30,7 +35,7 @@ local function assignPlot(plotName)
 		local primaryPart = plot:FindFirstChild(primaryPartName, true)
 		if primaryPart then
 			plot.PrimaryPart = primaryPart
-			print("PlotManager: Set PrimaryPart to", primaryPart.Name)
+			log("PlotManager: Set PrimaryPart to", primaryPart.Name)
 		else
 			warn("PlotManager: Could not find PrimaryPart named", primaryPartName)
 		end
@@ -49,10 +54,10 @@ task.defer(function()
 	if not PlotManager.PlayerPlot then
 		local plotName = GetAssignedPlotFunction:InvokeServer()
 		if plotName then
-			print("PlotManager: Retrieved plot name from server:", plotName)
+			log("PlotManager: Retrieved plot name from server:", plotName)
 			assignPlot(plotName)
 		else
-			print("PlotManager: No plot assigned to player.")
+			log("PlotManager: No plot assigned to player.")
 		end
 	end
 end)

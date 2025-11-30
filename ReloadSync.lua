@@ -234,6 +234,9 @@ local function attach(ev)
 	if ev and ev.IsA and ev:IsA("BindableEvent") then
 		ev.Event:Connect(function(player)
 			-- After SaveManager finishes (zones recreated + visuals), rebuild the logical graph:
+			if PathingModule.resetForPlayer then
+				pcall(PathingModule.resetForPlayer, player)
+			end
 			rebuildRoadGraphForPlayer(player)
 			-- Your UnifiedTraffic listens to NetworksPostLoad and will recompute its sinks on unsuspend.
 		end)

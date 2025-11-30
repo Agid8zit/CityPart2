@@ -1,6 +1,7 @@
 local BadgeService = {}
 
 local RobloxBadgeService = game:GetService("BadgeService")
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
@@ -412,6 +413,28 @@ end
 
 function BadgeService.AwardMoney1B(player: Player)
 	return BadgeService.Award(player, BADGE_KEYS.Money1B)
+end
+
+-- Ensure the first-session badge gets attempted for everyone as soon as their data is ready.
+local function awardFirstSessionOnJoin(player: Player)
+	if not player then
+		return
+	end
+	if PlayerDataService.WaitForPlayerData and not PlayerDataService.WaitForPlayerData(player) then
+		warn(string.format("[BadgeService] Skipping first-session badge; data failed to load for %s", player.Name))
+		return
+	end
+	local ok, reason = BadgeService.AwardFirstSession(player)
+	if not ok and reason ~= "AlreadyRecorded" and reason ~= "AlreadyOwned" then
+		warn(string.format("[BadgeService] Failed to award first-session badge to %s (%s)", player.Name, tostring(reason)))
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.defer(awardFirstSessionOnJoin, player)
+end)
+for _, plr in ipairs(Players:GetPlayers()) do
+	task.defer(awardFirstSessionOnJoin, plr)
 end
 
 return BadgeService

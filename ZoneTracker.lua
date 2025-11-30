@@ -473,6 +473,24 @@ function ZoneTrackerModule.isGridOccupied(player, x, z, options)
 
 	local changed = false
 
+	-- Normalize prefix exclusions (string or array of strings)
+	local function _hasExcludedPrefix(occId)
+		local pref = options.excludeOccupantIdPrefix
+		if not pref or type(occId) ~= "string" then
+			return false
+		end
+		if type(pref) == "string" then
+			return occId:sub(1, #pref) == pref
+		elseif type(pref) == "table" then
+			for _, p in ipairs(pref) do
+				if type(p) == "string" and occId:sub(1, #p) == p then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	-- Scan stack top → bottom
 	for i = #stack, 1, -1 do
 		local occ = stack[i]
@@ -482,6 +500,8 @@ function ZoneTrackerModule.isGridOccupied(player, x, z, options)
 				-- skip this occupant, but keep it in stack
 			elseif options.excludeOccupantId and occ.occupantId == options.excludeOccupantId then
 				-- skip
+			elseif _hasExcludedPrefix(occ.occupantId) then
+				-- skip occupants with the provided prefix(es)
 			elseif options.excludeZoneTypes and occ.zoneType and options.excludeZoneTypes[occ.zoneType] then
 				-- skip
 			else

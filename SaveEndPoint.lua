@@ -65,6 +65,11 @@ local PlayerDataService: any = require(ServerScriptService.Services.PlayerDataSe
 local OnboardingService: any = require(ServerScriptService.Players.OnboardingService)
 local DefaultData: any       = PlayerDataService.GetDefaultData()
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Types
 type SaveLite = { id: string, cityName: string?, lastPlayed: number?, hasData: boolean? }
 type GetSaveSlotsResult = { current: string, slots: {SaveLite} }
@@ -142,7 +147,7 @@ SwitchToSlotRF.OnServerInvoke = function(player: Player, slotId: any, createIfMi
 			return false
 		end
 
-		print(("[SaveEndpoints] SwitchToSlot slot=%s createIfMissing=%s by %s")
+		log(("[SaveEndpoints] SwitchToSlot slot=%s createIfMissing=%s by %s")
 			:format(target, tostring(createIfMissing), player.Name))
 
 		-- 1) Save current city first (flush + wait)
@@ -226,7 +231,7 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 			return true
 		end
 
-		print(("[SaveEndpoints] DeleteSaveFile slot=%s by %s"):format(target, player.Name))
+		log(("[SaveEndpoints] DeleteSaveFile slot=%s by %s"):format(target, player.Name))
 
 		local deletingCurrent = (pd.currentSaveFile == target)
 

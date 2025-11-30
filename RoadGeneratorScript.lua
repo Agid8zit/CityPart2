@@ -12,12 +12,17 @@ local roadTypes = {
 	-- Add any other valid road modes here
 }
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Listen for ZoneCreated event
 local zoneCreatedEvent = BindableEvents:WaitForChild("ZoneCreated")
 zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, selectedCoords)
 	-- Only handle recognized road modes
 	if roadTypes[mode] then
-		print(string.format(
+		log(string.format(
 			"RoadGeneratorScript: Generating road for Zone '%s' of type '%s'",
 			zoneId, mode
 			))
@@ -61,4 +66,4 @@ zoneRemovedEvent.Event:Connect(function(player, zoneId, mode)
 	end
 end)
 
-print("RoadGeneratorScript loaded.")
+log("RoadGeneratorScript loaded.")

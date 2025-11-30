@@ -46,6 +46,11 @@ local Bld = ServerScriptService.Build
 local LayerManagerModule = require(Bld.LayerManager)
 local OverlayZoneTypes   = ZoneValidation.OverlayZoneTypes
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Configuration
 local BUILDING_INTERVAL = 0.25  -- seconds between stages (0.25)
 local function getBuildingInterval()
@@ -74,7 +79,7 @@ local OverlapExclusions = {
 local DEBUG = false
 local function debugPrint(...)
 	if DEBUG then
-		print("[BuildingGenerator]", ...)
+		log("[BuildingGenerator]", ...)
 	end
 end
 
@@ -132,6 +137,37 @@ local function addAmbientLoopForZone(zoneType: string, model: Instance?)
 		RollOffMinDistance = soundConfig.RollOffMinDistance,
 		pitchRange = soundConfig.pitchRange,
 	})
+end
+
+-- Defer ambient loop creation when we are silently replaying saved zones to avoid a load-time spike.
+local DEFER_AMBIENT_ON_SKIP = true
+local AMBIENT_DEFER_STEP    = 0.02
+local _ambientQueue         = {}
+local _ambientQueueIndex    = 1
+local _ambientPumpRunning   = false
+
+local function queueAmbientLoop(mode: string, model: Instance?)
+	if not (mode and model and model.Parent) then
+		return
+	end
+	table.insert(_ambientQueue, { mode = mode, model = model })
+	if _ambientPumpRunning then
+		return
+	end
+	_ambientPumpRunning = true
+	task.spawn(function()
+		while _ambientQueueIndex <= #_ambientQueue do
+			local item = _ambientQueue[_ambientQueueIndex]
+			_ambientQueueIndex += 1
+			if item and item.mode and item.model and item.model.Parent then
+				addAmbientLoopForZone(item.mode, item.model)
+			end
+			task.wait(AMBIENT_DEFER_STEP)
+		end
+		_ambientQueue       = {}
+		_ambientQueueIndex  = 1
+		_ambientPumpRunning = false
+	end)
 end
 
 local function playBuildUISound(player: Player?)
@@ -280,6 +316,9 @@ local BuildSpeed = {
 	enabled    = true,  -- true in Studio, false on live by default
 	multiplier = 10.0,                    -- 1.0 = normal; 4.0 = 4x faster; 0.5 = slower
 }
+
+-- Zones that should suppress Stage1 previews (e.g., world reloads)
+local SUPPRESS_STAGE1_BY_ZONE = {}
 
 local _refillBusy     = {}  -- key: uid|zoneId -> boolean
 local _refillSeeds    = {}  -- key: uid|zoneId -> { [wealth]=set("x|z") }
@@ -447,7 +486,7 @@ local function shouldAbort(player, zoneId)
 	local uid = _uid(player)
 	if uid and Abort[uid] and Abort[uid][zoneId] then
 		if DEBUG then
-			print(("[BuildingGenerator][Abort] explicit tombstone for %s (user=%s)"):format(zoneId, tostring(uid)))
+			log(("[BuildingGenerator][Abort] explicit tombstone for %s (user=%s)"):format(zoneId, tostring(uid)))
 		end
 		return true
 	end
@@ -456,7 +495,7 @@ local function shouldAbort(player, zoneId)
 	local exists = ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
 	if not exists then
 		if DEBUG then
-			print(("[BuildingGenerator][Abort?] ZoneTracker missing entry for %s (STRICT=%s)"):format(
+			log(("[BuildingGenerator][Abort?] ZoneTracker missing entry for %s (STRICT=%s)"):format(
 				zoneId, tostring(STRICT_ABORT_ON_MISSING_ZONE)))
 		end
 		return STRICT_ABORT_ON_MISSING_ZONE
@@ -890,7 +929,7 @@ local function removeAndArchiveUnderlyingBuildings(player, zoneId, gridX, gridZ,
 		end
 	end
 
-return impactedZones
+	return impactedZones
 end
 
 local function footprintHasBlockingOccupant(player, zoneId, startX, startZ, width, depth)
@@ -900,7 +939,11 @@ local function footprintHasBlockingOccupant(player, zoneId, startX, startZ, widt
 			if ZoneTrackerModule.isGridOccupied(player, x, z, {
 				excludeOccupantId = zoneId,
 				excludeOccupantType = "zone",
-			}) then
+				excludeOccupantIdPrefix = {
+					zoneId .. "_",           -- standard building ids for this zone
+					"building/" .. zoneId,   -- legacy building ids
+				},
+				}) then
 				return true
 			end
 		end
@@ -1299,7 +1342,7 @@ local function attachRandomServiceDrops(padPole : Instance)
 	makeDropRope(poleAtt[2], roofAtt)
 
 	if DEBUG then
-		print("[ServiceDrop]",
+		log("[ServiceDrop]",
 			"target:", targetModel and targetModel.Name or "nil",
 			"span:", (poleAtt[1].WorldPosition - roofAtt.WorldPosition).Magnitude
 		)
@@ -1689,10 +1732,11 @@ function BuildingGeneratorModule.generateBuilding(
 		end
 
 		-- Stage flow
-		local finalStageClone
+	local finalStageClone
 		if not skipStages then
 			local stage1Clones = {}
 			local allTracks    = {}
+			local suppressStage1 = SUPPRESS_STAGE1_BY_ZONE[zoneId] == true
 
 			local function collectAnimations(root)
 				local out = {}
@@ -1704,58 +1748,61 @@ function BuildingGeneratorModule.generateBuilding(
 				return out
 			end
 
-			for dx = 0, rotatedWidth - 1 do
-				for dz = 0, rotatedDepth - 1 do
-					local cx, _, cz = GridUtils.globalGridToWorldPosition(
-						gridCoord.x + dx,
-						gridCoord.z + dz,
-						gBounds, gTerrains
-					)
-					local pos = Vector3.new(
-						cx,
-						terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
-						cz
-					)
-
-					local preview = buildingData.stages.Stage1:Clone()
-					if preview:IsA("Model") and preview.PrimaryPart then
-						preview:SetPrimaryPartCFrame(
-							CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-								CFrame.Angles(0, math.rad(rotationY), 0)
+			if not suppressStage1 then
+				-- Full per-cell Stage1 previews during normal gameplay
+				for dx = 0, rotatedWidth - 1 do
+					for dz = 0, rotatedDepth - 1 do
+						local cx, _, cz = GridUtils.globalGridToWorldPosition(
+							gridCoord.x + dx,
+							gridCoord.z + dz,
+							gBounds, gTerrains
 						)
-					else
-						preview.CFrame =
-							CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-							CFrame.Angles(0, math.rad(rotationY), 0)
-					end
-					preview.Parent = parentFolder
-					preview:SetAttribute("ZoneId", zoneId)
-					preview:SetAttribute("BuildingName", buildingData.name)
-					preview:SetAttribute("WealthState", wealthState or "Poor")
-					preview:SetAttribute("GridX", gridCoord.x)
-					preview:SetAttribute("GridZ", gridCoord.z)
-					preview:SetAttribute("RotationY", rotationY)
-					if isUtility then preview:SetAttribute("IsUtility", true) end
+						local pos = Vector3.new(
+							cx,
+							terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
+							cz
+						)
 
-					table.insert(stage1Clones, preview)
-
-					-- Try to gather an animation to play
-					local animator, animations = nil, {}
-					local animController = preview:FindFirstChild("AnimationController", true)
-					if animController then
-						animator   = animController:FindFirstChildOfClass("Animator", true)
-						animations = collectAnimations(animator or animController)
-					end
-					if (not animator) or #animations == 0 then
-						local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
-						if humanoid then
-							animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
-							animations = collectAnimations(animator)
+						local preview = buildingData.stages.Stage1:Clone()
+						if preview:IsA("Model") and preview.PrimaryPart then
+							preview:SetPrimaryPartCFrame(
+								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+									CFrame.Angles(0, math.rad(rotationY), 0)
+							)
+						else
+							preview.CFrame =
+								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+								CFrame.Angles(0, math.rad(rotationY), 0)
 						end
-					end
-					if animator and #animations > 0 then
-						local track = animator:LoadAnimation(animations[1])
-						table.insert(allTracks, track)
+						preview.Parent = parentFolder
+						preview:SetAttribute("ZoneId", zoneId)
+						preview:SetAttribute("BuildingName", buildingData.name)
+						preview:SetAttribute("WealthState", wealthState or "Poor")
+						preview:SetAttribute("GridX", gridCoord.x)
+						preview:SetAttribute("GridZ", gridCoord.z)
+						preview:SetAttribute("RotationY", rotationY)
+						if isUtility then preview:SetAttribute("IsUtility", true) end
+
+						table.insert(stage1Clones, preview)
+
+						-- Try to gather an animation to play
+						local animator, animations = nil, {}
+						local animController = preview:FindFirstChild("AnimationController", true)
+						if animController then
+							animator   = animController:FindFirstChildOfClass("Animator", true)
+							animations = collectAnimations(animator or animController)
+						end
+						if (not animator) or #animations == 0 then
+							local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
+							if humanoid then
+								animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
+								animations = collectAnimations(animator)
+							end
+						end
+						if animator and #animations > 0 then
+							local track = animator:LoadAnimation(animations[1])
+							table.insert(allTracks, track)
+						end
 					end
 				end
 			end
@@ -1930,7 +1977,11 @@ function BuildingGeneratorModule.generateBuilding(
 			finalStageClone:SetAttribute("OriginalOrientationY", finalStageClone.Orientation.Y)
 		end
 
-		addAmbientLoopForZone(mode, finalStageClone)
+		if skipStages and DEFER_AMBIENT_ON_SKIP then
+			queueAmbientLoop(mode, finalStageClone)
+		else
+			addAmbientLoopForZone(mode, finalStageClone)
+		end
 
 		recordQuotaPlacement(quotaCtx, mode, wealthState or "Poor", buildingData and buildingData.name)
 
@@ -2108,7 +2159,40 @@ local function isRoadInstance(inst : Instance) : boolean
 	return type(inst.Name) == "string" and inst.Name:match("^RoadZone_") ~= nil
 end
 
-local function nearestRoadTargetFor(buildingInstance : Instance, maxDistanceStuds : number?) : Vector3?
+local ROAD_TARGET_CACHE = {}
+local ROAD_TARGET_CACHE_TTL = 1.0
+
+local function collectRoadTargets(plot : Instance?) : { Vector3 }?
+	if not plot then return nil end
+	local now = os.clock()
+	local cached = ROAD_TARGET_CACHE[plot]
+	if cached and cached.targets and (now - cached.ts) < ROAD_TARGET_CACHE_TTL then
+		return cached.targets
+	end
+
+	local targets = {}
+	local function addFromFolder(folder : Instance?, descend : boolean)
+		if not folder then return end
+		local children = descend and folder:GetDescendants() or folder:GetChildren()
+		for _, inst in ipairs(children) do
+			if isRoadInstance(inst) then
+				local cf = inst:IsA("Model") and select(1, inst:GetBoundingBox()) or inst.CFrame
+				table.insert(targets, cf.Position)
+			end
+		end
+	end
+	addFromFolder(plot:FindFirstChild("PlayerZones"), false)
+	addFromFolder(plot:FindFirstChild("Roads"), true)
+
+	if #targets == 0 then
+		return nil
+	end
+
+	ROAD_TARGET_CACHE[plot] = { targets = targets, ts = now }
+	return targets
+end
+
+local function nearestRoadTargetFor(buildingInstance : Instance, maxDistanceStuds : number?, roadTargets : { Vector3 }?) : Vector3?
 	local plot = getOwningPlotFor(buildingInstance)
 	if not plot then return nil end
 	local populated = plot:FindFirstChild("Buildings")
@@ -2138,23 +2222,18 @@ local function nearestRoadTargetFor(buildingInstance : Instance, maxDistanceStud
 	local bestDistSq
 	local maxDistSq = maxDistanceStuds and (maxDistanceStuds * maxDistanceStuds) or nil
 
-	for _, entry in ipairs(candidateFolders) do
-		local folder = entry.folder
-		local descend = entry.descend
-		local children = descend and folder:GetDescendants() or folder:GetChildren()
+	local positions = roadTargets or collectRoadTargets(plot)
+	if not positions then
+		return nil
+	end
 
-		for _, inst in ipairs(children) do
-			if isRoadInstance(inst) then
-				local cf = inst:IsA("Model") and select(1, inst:GetBoundingBox()) or inst.CFrame
-				local pos = cf.Position
-				local dx = pos.X - bpos.X
-				local dz = pos.Z - bpos.Z
-				local distSq = dx * dx + dz * dz
-				if not maxDistSq or distSq <= maxDistSq then
-					if not bestDistSq or distSq < bestDistSq then
-						bestDistSq, bestPos = distSq, pos
-					end
-				end
+	for _, pos in ipairs(positions) do
+		local dx = pos.X - bpos.X
+		local dz = pos.Z - bpos.Z
+		local distSq = dx * dx + dz * dz
+		if not maxDistSq or distSq <= maxDistSq then
+			if not bestDistSq or distSq < bestDistSq then
+				bestDistSq, bestPos = distSq, pos
 			end
 		end
 	end
@@ -2177,11 +2256,14 @@ local function orientZoneBuildingsTowardRoads(player, zoneId)
 	local zoneFolder = populated:FindFirstChild(zoneId)
 	if not zoneFolder then return end
 
+	local roadTargets = collectRoadTargets(plot)
+	if not roadTargets or #roadTargets == 0 then return end
+
 	for _, inst in ipairs(zoneFolder:GetChildren()) do
 		if (inst:IsA("Model") or inst:IsA("BasePart"))
 			and inst:GetAttribute("ZoneId") == zoneId
 		then
-			local target = nearestRoadTargetFor(inst, ROAD_ORIENTATION_RADIUS_STUDS)
+			local target = nearestRoadTargetFor(inst, ROAD_ORIENTATION_RADIUS_STUDS, roadTargets)
 			if target then
 				BuildingGeneratorModule.orientBuildingToward(inst, target)
 			end
@@ -2203,7 +2285,8 @@ local function orientBuildingOnPlacement(player, zoneId, payload)
 	local mode = payload.mode or (zd and zd.mode)
 	if not (mode and SQUARE_ONLY_MODES[mode]) then return end
 
-	local target = nearestRoadTargetFor(building, ROAD_ORIENTATION_RADIUS_STUDS)
+	local roadTargets = collectRoadTargets(getOwningPlotFor(building))
+	local target = nearestRoadTargetFor(building, ROAD_ORIENTATION_RADIUS_STUDS, roadTargets)
 	if target then
 		BuildingGeneratorModule.orientBuildingToward(building, target)
 	end
@@ -2778,9 +2861,14 @@ function BuildingGeneratorModule.populateZone(
 	end
 
 	task.spawn(function()
+		local function clearStage1Suppression()
+			SUPPRESS_STAGE1_BY_ZONE[zoneId] = nil
+		end
+
 		if shouldAbort(player, zoneId) then
 			ZoneTrackerModule.setZonePopulating(player, zoneId, false)
 			zonePopulatedEvent:Fire(player, zoneId, {})
+			clearStage1Suppression()
 			return
 		end
 
@@ -2794,6 +2882,7 @@ function BuildingGeneratorModule.populateZone(
 			warn("BuildingGeneratorModule: Player plot '" .. plotName .. "' not found in Workspace.PlayerPlots.")
 			ZoneTrackerModule.setZonePopulating(player, zoneId, false)
 			zonePopulatedEvent:Fire(player, zoneId, {})
+			clearStage1Suppression()
 			return
 		end
 
@@ -2802,6 +2891,7 @@ function BuildingGeneratorModule.populateZone(
 			warn("BuildingGeneratorModule: 'TestTerrain' not found in player plot '" .. plotName .. "'.")
 			ZoneTrackerModule.setZonePopulating(player, zoneId, false)
 			zonePopulatedEvent:Fire(player, zoneId, {})
+			clearStage1Suppression()
 			return
 		end
 
@@ -2809,6 +2899,7 @@ function BuildingGeneratorModule.populateZone(
 		if not buildingsFolder then
 			ZoneTrackerModule.setZonePopulating(player, zoneId, false)
 			zonePopulatedEvent:Fire(player, zoneId, {})
+			clearStage1Suppression()
 			return
 		end
 
@@ -2842,6 +2933,8 @@ function BuildingGeneratorModule.populateZone(
 
 		-- Detect whether we are replaying saved blueprints
 		local replay = (type(predefinedBuildings) == "table" and #predefinedBuildings > 0)
+		-- Only suppress Stage1 previews for silent/speedy replays (e.g., load), not for undo/redo.
+		SUPPRESS_STAGE1_BY_ZONE[zoneId] = (replay and skipStages) and true or nil
 
 		-- (Optional) Make procedural RNG deterministic only when NOT replaying
 		if not replay then
@@ -2998,6 +3091,7 @@ function BuildingGeneratorModule.populateZone(
 			warn(string.format("BuildingGeneratorModule: No buildings available for mode '%s'.", mode))
 			ZoneTrackerModule.setZonePopulating(player, zoneId, false)
 			zonePopulatedEvent:Fire(player, zoneId, {})
+			clearStage1Suppression()
 			return
 		end
 
@@ -3018,7 +3112,7 @@ function BuildingGeneratorModule.populateZone(
 			buildingsPlacedCounter += 1
 			if buildingsPlacedCounter >= nextEventThreshold then
 				buildingsPlacedEvent:Fire(player, zoneId, buildingsPlacedCounter)
-				if shouldPlayBuildUISound(mode) then
+				if (not skipStages) and shouldPlayBuildUISound(mode) then
 					playBuildUISound(player)
 				end
 				debugPrint(string.format("Fired BuildingsPlaced event for Zone '%s' after %d buildings placed.",
@@ -3208,7 +3302,7 @@ function BuildingGeneratorModule.populateZone(
 
 		if buildingsPlacedCounter > 0 then
 			buildingsPlacedEvent:Fire(player, zoneId, buildingsPlacedCounter)
-			if shouldPlayBuildUISound(mode) then
+			if (not skipStages) and shouldPlayBuildUISound(mode) then
 				playBuildUISound(player)
 			end
 			debugPrint(string.format(
@@ -3222,6 +3316,7 @@ function BuildingGeneratorModule.populateZone(
 		zonePopulatedEvent:Fire(player, zoneId, placedBuildingsData)
 		ZoneTrackerModule.setZonePopulated(player, zoneId, true)
 		worldDirtyEvent:Fire(player, "PopulateZone|" .. tostring(zoneId))
+		clearStage1Suppression()
 	end)
 end
 

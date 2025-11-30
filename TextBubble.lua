@@ -181,7 +181,7 @@ local function findOwningPlot(model: Instance): Instance?
 	end
 
 	-- Fallback: infer from OwnerUserId attribute.
-	local ownerId = model:GetAttribute("OwnerUserId")
+	local ownerId = model:GetAttribute("OwnerUserId") or model:GetAttribute("ownerId")
 	if ownerId ~= nil then
 		return pp:FindFirstChild("Plot_" .. tostring(ownerId))
 	end

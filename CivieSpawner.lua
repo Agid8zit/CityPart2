@@ -57,6 +57,7 @@ local CFG = {
 	-- populations
 	MaxAlivePerZone      = 1,
 	GlobalMaxAlive       = 40,    -- per-player ceiling
+	ServerGlobalMaxAlive = 120,   -- hard ceiling across all players (failsafe)
 	TargetMin            = 1,
 	TargetMax            = 1,
 	ZoneTypesEligible    = { Residential=true, ResDense=true, Commercial=true, CommDense=true, Industrial=true, IndusDense=true },
@@ -485,74 +486,121 @@ end
 -- =========================================================
 -- Steady-state accounting + registry
 -- =========================================================
-local alivePerZone     = {}   -- zoneId -> current alive
-local targetPerZone    = {}   -- zoneId -> desired steady-state
-local zoneActive       = {}   -- zoneId -> bool
-local zoneOwner        = {}   -- zoneId -> Player (for deferred maintain)
-local civByZone        = {}   -- zoneId -> { [Model]=true }
-local civFolderByZone  = {}   -- zoneId -> Folder
-local folderWatcher    = {}   -- zoneId -> RBXScriptConnection
+local function zoneKey(playerOrUid, zoneId)
+	local uid = nil
+	if typeof(playerOrUid) == "Instance" and playerOrUid:IsA("Player") then
+		uid = playerOrUid.UserId
+	elseif type(playerOrUid) == "number" then
+		uid = playerOrUid
+	end
+	if not uid then
+		return tostring(zoneId)
+	end
+	return tostring(uid) .. "::" .. tostring(zoneId)
+end
+
+local function splitZoneKey(zKey)
+	if type(zKey) ~= "string" then return nil, zKey end
+	local sep = string.find(zKey, "::", 1, true)
+	if not sep then return nil, zKey end
+	local uid = tonumber(string.sub(zKey, 1, sep - 1))
+	local zid = string.sub(zKey, sep + 2)
+	return uid, zid
+end
+
+local function resolveZoneKey(player, zoneId)
+	if player then
+		return zoneKey(player, zoneId), player
+	end
+	for k, owner in pairs(zoneOwner) do
+		local _, zid = splitZoneKey(k)
+		if tostring(zid) == tostring(zoneId) then
+			return k, owner
+		end
+	end
+	return zoneKey(player, zoneId), player
+end
+
+local alivePerZone     = {}   -- zoneKey -> current alive
+local targetPerZone    = {}   -- zoneKey -> desired steady-state
+local zoneActive       = {}   -- zoneKey -> bool
+local zoneOwner        = {}   -- zoneKey -> Player (for deferred maintain)
+local civByZone        = {}   -- zoneKey -> { [Model]=true }
+local civFolderByZone  = {}   -- zoneKey -> Folder
+local folderWatcher    = {}   -- zoneKey -> RBXScriptConnection
 local globalAliveByPlayer = {} -- [userId] -> alive count (per owner)
 local seededPlayers    = {}   -- userId -> true once seeded
+local function serverAliveCount()
+	local total = 0
+	for _, n in pairs(globalAliveByPlayer) do
+		total += n or 0
+	end
+	return total
+end
 
 local function globalCapEnabled()
 	return (CFG.GlobalMaxAlive and CFG.GlobalMaxAlive > 0)
 end
 
-local function getTargetFor(zoneId)
-	local t = targetPerZone[zoneId]
+local function getTargetForKey(zKey)
+	local t = targetPerZone[zKey]
 	if not t then
 		t = math.random(math.min(CFG.TargetMin, CFG.TargetMax), math.max(CFG.TargetMin, CFG.TargetMax))
-		targetPerZone[zoneId] = math.clamp(t, 0, CFG.MaxAlivePerZone)
+		targetPerZone[zKey] = math.clamp(t, 0, CFG.MaxAlivePerZone)
 	end
-	return targetPerZone[zoneId]
+	return targetPerZone[zKey]
 end
 
-local function setActive(zoneId, v) zoneActive[zoneId] = v and true or nil end
-local function incAlive(zoneId, n)
+local function setActive(zKey, v) zoneActive[zKey] = v and true or nil end
+local function incAlive(zKey, owner, n)
 	local delta = n or 1
 	if delta <= 0 then return end
-	alivePerZone[zoneId] = (alivePerZone[zoneId] or 0) + delta
-	local owner = zoneOwner[zoneId]
+	alivePerZone[zKey] = (alivePerZone[zKey] or 0) + delta
+	owner = owner or zoneOwner[zKey]
 	local uid = owner and owner.UserId
 	if uid then
 		globalAliveByPlayer[uid] = (globalAliveByPlayer[uid] or 0) + delta
 	end
 end
-local function decAlive(zoneId, n)
+local function decAlive(zKey, n)
 	local delta = n or 1
 	if delta <= 0 then return end
-	local current = alivePerZone[zoneId] or 0
+	local current = alivePerZone[zKey] or 0
 	local applied = math.min(delta, current)
-	alivePerZone[zoneId] = math.max(0, current - delta)
-	local owner = zoneOwner[zoneId]
+	alivePerZone[zKey] = math.max(0, current - delta)
+	local owner = zoneOwner[zKey]
 	local uid = owner and owner.UserId
 	if uid then
 		local nextCount = math.max(0, (globalAliveByPlayer[uid] or 0) - applied)
 		globalAliveByPlayer[uid] = nextCount
 	end
 end
-local function canSpawn(zoneId)
+local function canSpawn(zKey)
+	if CFG.ServerGlobalMaxAlive and CFG.ServerGlobalMaxAlive > 0 then
+		if serverAliveCount() >= CFG.ServerGlobalMaxAlive then
+			return false
+		end
+	end
 	if globalCapEnabled() then
-		local owner = zoneOwner[zoneId]
+		local owner = zoneOwner[zKey]
 		local uid = owner and owner.UserId
 		if uid and (globalAliveByPlayer[uid] or 0) >= CFG.GlobalMaxAlive then
 			return false
 		end
 	end
-	return (alivePerZone[zoneId] or 0) < CFG.MaxAlivePerZone
+	return (alivePerZone[zKey] or 0) < CFG.MaxAlivePerZone
 end
 
-local function registerCiv(zoneId, model)
-	civByZone[zoneId] = civByZone[zoneId] or {}
-	civByZone[zoneId][model] = true
+local function registerCiv(zKey, model)
+	civByZone[zKey] = civByZone[zKey] or {}
+	civByZone[zKey][model] = true
 end
 
-local function unregisterCiv(zoneId, model)
-	local bucket = civByZone[zoneId]
+local function unregisterCiv(zKey, model)
+	local bucket = civByZone[zKey]
 	if bucket and bucket[model] then
 		bucket[model] = nil
-		if next(bucket) == nil then civByZone[zoneId] = nil end
+		if next(bucket) == nil then civByZone[zKey] = nil end
 	end
 end
 
@@ -590,35 +638,35 @@ end
 local maintainZoneSteadyState  -- FIX: explicit local forward declaration
 
 -- folder-level watcher (replaces per-model AncestryChanged)
-local function clearZoneFolderWatcher(zoneId)
-	if folderWatcher[zoneId] then
-		folderWatcher[zoneId]:Disconnect()
-		folderWatcher[zoneId] = nil
+local function clearZoneFolderWatcher(zKey)
+	if folderWatcher[zKey] then
+		folderWatcher[zKey]:Disconnect()
+		folderWatcher[zKey] = nil
 	end
 end
 
-local function ensureZoneFolderWatcher(zoneId, folder)
-	clearZoneFolderWatcher(zoneId)
+local function ensureZoneFolderWatcher(zKey, zoneId, folder)
+	clearZoneFolderWatcher(zKey)
 	if not folder then return end
 
-	folderWatcher[zoneId] = folder.ChildRemoved:Connect(function(child)
+	folderWatcher[zKey] = folder.ChildRemoved:Connect(function(child)
 		if not child or not child:IsA("Model") then return end
 
 		-- FIX: drive accounting off registry membership (not the CivAlive attr),
 		-- so we still decrement/top-up even if something pre-cleared the attribute.
-		local bucket = civByZone[zoneId]
+		local bucket = civByZone[zKey]
 		if not (bucket and bucket[child]) then return end
 
 		-- mark + account exactly once
 		child:SetAttribute("CivAlive", false)
-		decAlive(zoneId, 1)
-		unregisterCiv(zoneId, child)
-		dprint(("ChildRemoved: zone %s alive=%d"):format(zoneId, alivePerZone[zoneId] or 0))
+		decAlive(zKey, 1)
+		unregisterCiv(zKey, child)
+		dprint(("ChildRemoved: zone %s alive=%d"):format(zoneId, alivePerZone[zKey] or 0))
 
-		local owner = zoneOwner[zoneId]
-		if owner and zoneActive[zoneId] then
+		local owner = zoneOwner[zKey]
+		if owner and zoneActive[zKey] then
 			task.defer(function()
-				if zoneActive[zoneId] and canSpawn(zoneId) then
+				if zoneActive[zKey] and canSpawn(zKey) then
 					maintainZoneSteadyState(owner, zoneId)
 				end
 			end)
@@ -665,7 +713,7 @@ end)
 -- =========================================================
 -- Ready-await helper
 -- =========================================================
-local readyAwaiters = {}  -- zoneId -> true while queued
+local readyAwaiters = {}  -- zoneKey -> true while queued
 local readyQueueByPlayer = {} -- [uid] = { player=Player, list={}, meta={}, running=false }
 
 local function computeReadyPollInterval(player, zoneId)
@@ -681,29 +729,30 @@ local function runReadyQueue(uid)
 	bucket.running = true
 	task.spawn(function()
 		while bucket.player.Parent and #bucket.list > 0 do
-			local zoneId = table.remove(bucket.list, 1)
-			local meta = bucket.meta[zoneId]
-			bucket.meta[zoneId] = nil
-			if meta and zoneActive[zoneId] then
+			local zKey = table.remove(bucket.list, 1)
+			local meta = bucket.meta[zKey]
+			bucket.meta[zKey] = nil
+			if meta and zoneActive[zKey] then
+				local zoneId = meta.zoneId
 				local tries = 0
 				local sleep = meta.sleep
-				while zoneActive[zoneId] and not isZoneReady(meta.player, zoneId) and tries < meta.maxTries do
+				while zoneActive[zKey] and not isZoneReady(meta.player, zoneId) and tries < meta.maxTries do
 					tries += 1
 					task.wait(sleep)
 				end
-				if zoneActive[zoneId] and isZoneReady(meta.player, zoneId) then
+				if zoneActive[zKey] and isZoneReady(meta.player, zoneId) then
 					dprint(("[Ready] zone %s became ready after %d checks; topping up"):format(zoneId, tries))
 					maintainZoneSteadyState(meta.player, zoneId)
 				else
-					dprint(("[Ready] zone %s waiter exit (active=%s, tries=%d)"):format(zoneId, tostring(zoneActive[zoneId]), tries))
+					dprint(("[Ready] zone %s waiter exit (active=%s, tries=%d)"):format(zoneId, tostring(zoneActive[zKey]), tries))
 				end
 			end
-			readyAwaiters[zoneId] = nil
+			readyAwaiters[zKey] = nil
 		end
 		bucket.running = false
 		if #bucket.list > 0 then
-			for _, pendingZone in ipairs(bucket.list) do
-				readyAwaiters[pendingZone] = nil
+			for _, pendingKey in ipairs(bucket.list) do
+				readyAwaiters[pendingKey] = nil
 			end
 		end
 		readyQueueByPlayer[uid] = nil
@@ -711,8 +760,9 @@ local function runReadyQueue(uid)
 end
 
 local function scheduleReadyTopUp(player, zoneId, opts)
-	if readyAwaiters[zoneId] then return end
-	readyAwaiters[zoneId] = true
+	local zKey = zoneKey(player, zoneId)
+	if readyAwaiters[zKey] then return end
+	readyAwaiters[zKey] = true
 
 	local uid = player.UserId
 	local bucket = readyQueueByPlayer[uid]
@@ -721,13 +771,13 @@ local function scheduleReadyTopUp(player, zoneId, opts)
 		readyQueueByPlayer[uid] = bucket
 	end
 
-	if bucket.meta[zoneId] then return end
+	if bucket.meta[zKey] then return end
 
 	local sleep = (opts and opts.sleep) or computeReadyPollInterval(player, zoneId)
 	local maxTries = (opts and opts.maxTries) or math.ceil(180 / sleep)
 
-	bucket.meta[zoneId] = { player = player, sleep = sleep, maxTries = maxTries }
-	table.insert(bucket.list, zoneId)
+	bucket.meta[zKey] = { player = player, zoneId = zoneId, sleep = sleep, maxTries = maxTries }
+	table.insert(bucket.list, zKey)
 	runReadyQueue(uid)
 end
 
@@ -736,13 +786,15 @@ end
 -- =========================================================
 local spawnOneCivilianFlexible
 maintainZoneSteadyState = function(player, zoneId)
-	if not zoneActive[zoneId] then return end
-	if not isZoneReady(player, zoneId) then return end
-	local target  = getTargetFor(zoneId)
-	local alive   = alivePerZone[zoneId] or 0
+	local zKey, owner = resolveZoneKey(player, zoneId)
+	owner = owner or zoneOwner[zKey] or player
+	if not zKey or not owner then return end
+	if not zoneActive[zKey] then return end
+	if not isZoneReady(owner, zoneId) then return end
+	local target  = getTargetForKey(zKey)
+	local alive   = alivePerZone[zKey] or 0
 	local deficit = math.max(0, math.min(target, CFG.MaxAlivePerZone) - alive)
 	if deficit <= 0 then return end
-	local owner = zoneOwner[zoneId] or player
 	local uid = owner and owner.UserId
 	local ownerAlive = (uid and globalAliveByPlayer[uid]) or 0
 	if globalCapEnabled() and ownerAlive >= CFG.GlobalMaxAlive then
@@ -751,7 +803,7 @@ maintainZoneSteadyState = function(player, zoneId)
 		return
 	end
 	dprint(("[Maintain] zone=%s target=%d alive=%d deficit=%d"):format(zoneId, target, alive, deficit))
-	local ok, err = pcall(spawnOneCivilianFlexible, player, zoneId)
+	local ok, err = pcall(spawnOneCivilianFlexible, owner, zoneId)
 	if not ok then dwarn("maintain spawn error:", err) end
 end
 
@@ -765,9 +817,10 @@ local function pickCivilian()
 end
 
 spawnOneCivilianFlexible = function(player, zoneId)
-	if not zoneActive[zoneId] then return end
+	local zKey = zoneKey(player, zoneId)
+	if not zoneActive[zKey] then return end
 	if not isZoneReady(player, zoneId) then return end
-	if not canSpawn(zoneId) then return end
+	if not canSpawn(zKey) then return end
 
 	local zones = getZonesSnapshot(player)
 	local zone  = zones and zones[zoneId]
@@ -777,11 +830,11 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if not plot then dwarn("No player plot for", player.Name) return end
 
 	-- Ensure per-zone folder present + watched
-	local zoneFolder = civFolderByZone[zoneId]
+	local zoneFolder = civFolderByZone[zKey]
 	if not (zoneFolder and zoneFolder.Parent) then
 		zoneFolder = getOrCreateZoneCivFolder(plot, zoneId)
-		civFolderByZone[zoneId] = zoneFolder
-		ensureZoneFolderWatcher(zoneId, zoneFolder)
+		civFolderByZone[zKey] = zoneFolder
+		ensureZoneFolderWatcher(zKey, zoneId, zoneFolder)
 	end
 
 	local wpath
@@ -870,8 +923,8 @@ spawnOneCivilianFlexible = function(player, zoneId)
 		hrp.CFrame = CFrame.new(p + Vector3.new(0, CFG.InitialYLift, 0))
 	end
 
-	incAlive(zoneId, 1)
-	registerCiv(zoneId, model)
+	incAlive(zKey, player, 1)
+	registerCiv(zKey, model)
 
 	if CFG.DebugFreezeAll then
 		local hum = model:FindFirstChildOfClass("Humanoid")
@@ -895,9 +948,10 @@ spawnOneCivilianFlexible = function(player, zoneId)
 end
 
 local function seedTargetAndFill(player, zoneId)
-	setActive(zoneId, true)
-	getTargetFor(zoneId)
-	alivePerZone[zoneId] = alivePerZone[zoneId] or 0
+	local zKey = zoneKey(player, zoneId)
+	setActive(zKey, true)
+	getTargetForKey(zKey)
+	alivePerZone[zKey] = alivePerZone[zKey] or 0
 	maintainZoneSteadyState(player, zoneId)
 end
 
@@ -905,12 +959,13 @@ end
 -- Zone lifecycle wiring + hard cleanup
 -- =========================================================
 local function activateZone(player, zoneId)
-	zoneOwner[zoneId] = player
+	local zKey = zoneKey(player, zoneId)
+	zoneOwner[zKey] = player
 	local plot = getPlayerPlot(player)
 	if plot then
 		local folder = getOrCreateZoneCivFolder(plot, zoneId)
-		civFolderByZone[zoneId] = folder
-		ensureZoneFolderWatcher(zoneId, folder)
+		civFolderByZone[zKey] = folder
+		ensureZoneFolderWatcher(zKey, zoneId, folder)
 	end
 
 	seedTargetAndFill(player, zoneId)          -- best-effort immediate try
@@ -940,54 +995,56 @@ end
 -- Optional: kick a top-up right when build pipeline reports populated
 if ZonePopulatedEvent then
 	ZonePopulatedEvent.Event:Connect(function(player, zoneId)
-		local owner = player or zoneOwner[zoneId]
-		if not owner then return end
+		local zKey, owner = resolveZoneKey(player, zoneId)
+		owner = owner or player
+		if not (owner and zKey) then return end
 		-- ensure watcher exists (defensive)
 		local plot = getPlayerPlot(owner)
 		if plot then
 			local folder = getOrCreateZoneCivFolder(plot, zoneId)
-			civFolderByZone[zoneId] = folder
-			ensureZoneFolderWatcher(zoneId, folder)
+			civFolderByZone[zKey] = folder
+			ensureZoneFolderWatcher(zKey, zoneId, folder)
 		end
-		setActive(zoneId, true)
-		getTargetFor(zoneId)
-		alivePerZone[zoneId] = alivePerZone[zoneId] or 0
+		setActive(zKey, true)
+		getTargetForKey(zKey)
+		alivePerZone[zKey] = alivePerZone[zKey] or 0
 		maintainZoneSteadyState(owner, zoneId)
 	end)
 end
 
-local function destroyAllCivsForZone(zoneId)
+local function destroyAllCivsForZone(zKey)
 	-- fast path: unparent entire folder subtree; counters are reset below anyway
-	local zFolder = civFolderByZone[zoneId]
+	local zFolder = civFolderByZone[zKey]
 	if zFolder then
 		if zFolder.Parent then
 			enqueueDelete(zFolder) -- de-replicate now, destroy paced
 		end
 	end
-	civFolderByZone[zoneId] = nil
-	clearZoneFolderWatcher(zoneId)
+	civFolderByZone[zKey] = nil
+	clearZoneFolderWatcher(zKey)
 
-	local alive = alivePerZone[zoneId] or 0
+	local alive = alivePerZone[zKey] or 0
 	if alive > 0 then
-		decAlive(zoneId, alive)
+		decAlive(zKey, alive)
 	end
-	alivePerZone[zoneId] = 0
+	alivePerZone[zKey] = 0
 
 	-- clear registry (defensive)
-	civByZone[zoneId] = nil
+	civByZone[zKey] = nil
 end
 
 -- When *any* zone is removed, stop moves, prevent respawn, and hard-clean.
 ZoneRemovedEvent.Event:Connect(function(player, removedZoneId, _mode, _gridList)
 	bumpZoneCellsVersion(player)
 	CivilianMovement.stopMovesForKey(removedZoneId)
-	setActive(removedZoneId, false)
-	readyAwaiters[removedZoneId] = nil  -- cancel any waiters
+	local zKey = zoneKey(player, removedZoneId)
+	setActive(zKey, false)
+	readyAwaiters[zKey] = nil  -- cancel any waiters
 
-	destroyAllCivsForZone(removedZoneId)
+	destroyAllCivsForZone(zKey)
 
 	-- destroy any civ currently headed *to* this zone (paced)
-	for zoneId, bucket in pairs(civByZone) do
+	for zoneKeyCur, bucket in pairs(civByZone) do
 		for mdl in pairs(bucket) do
 			if mdl and mdl.Parent and (mdl:GetAttribute("DestinationZoneId") == removedZoneId) then
 				mdl:SetAttribute("CivAlive", false)
@@ -996,18 +1053,24 @@ ZoneRemovedEvent.Event:Connect(function(player, removedZoneId, _mode, _gridList)
 		end
 	end
 
-	alivePerZone[removedZoneId]  = 0
-	targetPerZone[removedZoneId] = nil
+	alivePerZone[zKey]  = 0
+	targetPerZone[zKey] = nil
+	zoneOwner[zKey]     = nil
 end)
 
 -- Manual stop by zone id
 stopEvt.Event:Connect(function(zoneId)
 	CivilianMovement.stopMovesForKey(zoneId)
-	setActive(zoneId, false)
-	readyAwaiters[zoneId] = nil  -- cancel any waiters
-	destroyAllCivsForZone(zoneId)
-	alivePerZone[zoneId]  = 0
-	targetPerZone[zoneId] = nil
+	for zKey, _owner in pairs(zoneOwner) do
+		local _, zid = splitZoneKey(zKey)
+		if tostring(zid) == tostring(zoneId) then
+			setActive(zKey, false)
+			readyAwaiters[zKey] = nil  -- cancel any waiters
+			destroyAllCivsForZone(zKey)
+			alivePerZone[zKey]  = 0
+			targetPerZone[zKey] = nil
+		end
+	end
 end)
 
 -- Force a test spawn against an eligible zone
@@ -1015,9 +1078,10 @@ ForceCivTest.Event:Connect(function(player, zoneId)
 	if not ZoneTrackerModule.getZoneById(player, zoneId) then
 		warn("[CivTest] unknown zone:", zoneId); return
 	end
-	zoneOwner[zoneId] = player
-	setActive(zoneId, true)
-	targetPerZone[zoneId] = math.clamp(getTargetFor(zoneId), 1, CFG.MaxAlivePerZone)
+	local zKey = zoneKey(player, zoneId)
+	zoneOwner[zKey] = player
+	setActive(zKey, true)
+	targetPerZone[zKey] = math.clamp(getTargetForKey(zKey), 1, CFG.MaxAlivePerZone)
 	maintainZoneSteadyState(player, zoneId)
 	-- if not ready yet, await readiness then top-up
 	if not isZoneReady(player, zoneId) then
@@ -1035,7 +1099,8 @@ local function seedExistingZonesForPlayer(player)
 	end
 	local seededAny = false
 	for zoneId, zone in pairs(zones) do
-		if zone and CFG.ZoneTypesEligible[zone.mode] and not zoneActive[zoneId] then
+		local zKey = zoneKey(player, zoneId)
+		if zone and CFG.ZoneTypesEligible[zone.mode] and not zoneActive[zKey] then
 			activateZone(player, zoneId)
 			seededAny = true
 		end
@@ -1126,9 +1191,16 @@ Players.PlayerRemoving:Connect(function(player)
 		bucket.meta = {}
 		readyQueueByPlayer[uid] = nil
 	end
-	for zoneId, owner in pairs(zoneOwner) do
+	for zKey, owner in pairs(zoneOwner) do
 		if owner == player then
-			readyAwaiters[zoneId] = nil
+			readyAwaiters[zKey] = nil
+			zoneActive[zKey] = nil
+			targetPerZone[zKey] = nil
+			alivePerZone[zKey] = nil
+			civByZone[zKey] = nil
+			civFolderByZone[zKey] = nil
+			clearZoneFolderWatcher(zKey)
+			zoneOwner[zKey] = nil
 		end
 	end
 end)
