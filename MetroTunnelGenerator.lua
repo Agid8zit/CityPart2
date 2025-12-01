@@ -189,7 +189,7 @@ end)
 --  Public: generateMetro – overlay-friendly, idempotent per zone
 --  pathCoords: array of {x=int, z=int}
 ---------------------------------------------------------------------
-function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoords)
+function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoords, isReload)
 	-- Validate / locate plot
 	local myPlot = plots and plots:FindFirstChild("Plot_" .. _uid(player))
 	if not myPlot then return end
@@ -299,7 +299,9 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 			end
 
 			_releaseHandle(handle)
-			task.wait(BUILD_INTERVAL)
+			if not isReload then
+				task.wait(BUILD_INTERVAL)
+			end
 		end
 	end
 

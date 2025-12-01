@@ -1,7 +1,6 @@
 return {
-	APPLY_CHANGES = false,
+	APPLY_CHANGES = true,
 	ENV = "Release", -- "Studio" | "Release"
-	RUN_AUDIT_ON_BOOT = false, -- gate the expensive SaveAuditor pass unless explicitly enabled
 
 	PLAYER_DS_BY_ENV = {
 		Studio = "PlayerData_PublicTest2",
@@ -25,7 +24,8 @@ return {
 	DEDUPE_BY_HASH = true,
 
 	LIMITS = {
-		PER_SAVE_BYTES = 250 * 1024,
+		-- Soft limits; PlayerDataService will refuse to commit when PER_SAVE_BYTES is exceeded.
+		PER_SAVE_BYTES = 1024 * 1024, -- allow up to ~1MB payloads
 		ROADS_B64_MAX = 200 * 1024,
 		ZONES_B64_MAX = 200 * 1024,
 	},

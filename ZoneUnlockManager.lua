@@ -135,6 +135,13 @@ local function findOwningPlot(inst: Instance): Model?
 	return nil
 end
 
+local function playerOwnsPlot(player: Player, inst: Instance): boolean
+	local plot = findOwningPlot(inst)
+	if not plot then return false end
+	local ownerId = plot:GetAttribute("PlotOwnerId")
+	return typeof(ownerId) == "number" and ownerId == player.UserId
+end
+
 local function pivotOf(inst: Instance): CFrame
 	if inst:IsA("Model") then
 		local m = inst :: Model
@@ -322,6 +329,11 @@ local function getUnlockCost(unlockName: string): number
 	return 0
 end
 
+local function playerAlreadyHasUnlock(player: Player, unlockName: string): boolean
+	local tbl = InMemoryUnlocks[player]
+	return tbl ~= nil and tbl[unlockName] == true
+end
+
 ---------------------------------------------------------------------
 -- Proximity Prompt setup (optional unlock UX)
 ---------------------------------------------------------------------
@@ -344,7 +356,13 @@ local function setupProximityPromptsForUnlock(unlockModel: Instance)
 	end
 
 	prompt.Triggered:Connect(function(player: Player)
+		if not playerOwnsPlot(player, unlockModel) then
+			return
+		end
 		local nameToUnlock = unlockModel.Name
+		if playerAlreadyHasUnlock(player, nameToUnlock) then
+			return
+		end
 		local cost = getUnlockCost(nameToUnlock)
 		if cost > 0 and not EconomyService.chargePlayer(player, cost) then
 			return
@@ -458,6 +476,9 @@ end
 
 UnlockEvent.OnServerEvent:Connect(function(player: Player, unlockName: string)
 	if type(unlockName) ~= "string" or unlockName == "" then return end
+	if playerAlreadyHasUnlock(player, unlockName) then
+		return
+	end
 	local cost = getUnlockCost(unlockName)
 	if cost > 0 and not EconomyService.chargePlayer(player, cost) then
 		return -- insufficient funds

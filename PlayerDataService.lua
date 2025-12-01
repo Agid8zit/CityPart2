@@ -742,13 +742,15 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 		local meta = _lastEnvelopeMeta[Player]
 		local now = os.time()
 
-		if env._envelope.approxBytes > SavePolicy.LIMITS.PER_SAVE_BYTES then
-			warn(("[DEDUP][SIZE] payload exceeds soft limit (%d bytes) for %s"):format(env._envelope.approxBytes, Player.UserId))
+		-- Hard guard: never overwrite a good save with an oversized payload (common when a player leaves mid-load).
+		local oversize = env._envelope.approxBytes > SavePolicy.LIMITS.PER_SAVE_BYTES
+		if oversize then
+			warn(("[DEDUP][SIZE] payload exceeds soft limit (%d bytes) for %s; skipping commit"):format(env._envelope.approxBytes, Player.UserId))
 		end
 
-		if SavePolicy.DEDUPE_BY_HASH and meta and meta.hash == env._envelope.hash and not flush then
+		if not oversize and SavePolicy.DEDUPE_BY_HASH and meta and meta.hash == env._envelope.hash and not flush then
 			log(("[DEDUP] Skip unchanged save user=%s reason=%s"):format(Player.UserId, tostring(reason)))
-		else
+		elseif not oversize then
 			local lastTime = meta and meta.updatedAt or 0
 			local since = now - lastTime
 			if not flush and lastTime > 0 and since < SavePolicy.MIN_COMMIT_INTERVAL_SECONDS then

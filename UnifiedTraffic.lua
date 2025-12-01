@@ -192,10 +192,11 @@ local INCLUDE_TURNS_AS_STOPS = false
 -- [DRIVE MODE] CONFIG
 --========================
 local DRIVE_RESPAWN_DELAY   = 1.0     -- time between trips
-local DRIVE_MOVE_DIST_STOP  = 6.0     -- studs from start pos (2D)
-local DRIVE_MOVE_SPEED_STOP = 7.0     -- studs/sec (rough walking+)
+local DRIVE_MOVE_DIST_STOP  = 60.0    -- studs from start pos (2D) before we auto-cancel
+local DRIVE_MOVE_SPEED_STOP = 40.0    -- ignore normal walking or being seated in the drive car
 local DRIVE_TOGGLE_DEBOUNCE = 0.5     -- per-toggle server cooldown
-local DRIVE_MOVE_GRACE_SEC  = 0.75    -- grace window after toggling on
+local DRIVE_MOVE_GRACE_SEC  = 1.0     -- grace window after toggling on
+local DRIVE_NEAR_CAR_RADIUS = 45      -- if the player is near/inside a drive car, don't cancel
 local DRIVE_SPAWN_OVERRIDES = { skipTokens = true, skipCarLimit = true }
 
 --======================================================================
@@ -1229,6 +1230,19 @@ local function getHRP(player)
 	return char:FindFirstChild("HumanoidRootPart")
 end
 
+local function nearDriveCar(hrp: BasePart?, driveState)
+	if not (driveState and driveState.cars and hrp) then return false end
+	local pos = hrp.Position
+	for car,_ in pairs(driveState.cars) do
+		if car and car.Parent and car.PrimaryPart then
+			if (car.PrimaryPart.Position - pos).Magnitude <= DRIVE_NEAR_CAR_RADIUS then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 local function movedTooMuch(player, driveState)
 	if not driveState or not driveState.startPos then return false end
 	if driveState.moveGraceUntil and os.clock() < driveState.moveGraceUntil then
@@ -1236,12 +1250,16 @@ local function movedTooMuch(player, driveState)
 	end
 	local hrp = getHRP(player)
 	if not hrp then return false end
-	-- 2D distance (XZ) + linear speed check
+	if nearDriveCar(hrp, driveState) then
+		return false
+	end
+	-- 2D distance (XZ) + planar speed check
 	local a = Vector2.new(hrp.Position.X, hrp.Position.Z)
 	local b = Vector2.new(driveState.startPos.X, driveState.startPos.Z)
 	local dist = (a - b).Magnitude
-	local speed = hrp.AssemblyLinearVelocity.Magnitude
-	return (dist >= DRIVE_MOVE_DIST_STOP) or (speed >= DRIVE_MOVE_SPEED_STOP)
+	local vel = hrp.AssemblyLinearVelocity
+	local planarSpeed = Vector2.new(vel.X, vel.Z).Magnitude
+	return (dist >= DRIVE_MOVE_DIST_STOP) or (planarSpeed >= DRIVE_MOVE_SPEED_STOP)
 end
 
 local function trackDriveCar(driveState, car)

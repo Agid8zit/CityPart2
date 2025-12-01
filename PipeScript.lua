@@ -21,7 +21,7 @@ local function isUtilityMode(mode: string?): boolean
 end
 
 -- Recreate idempotently: clear this zone's pipes, then regenerate from coords
-local function recreatePipes(player: Player, zoneId: string, mode: string, coords: {any})
+local function recreatePipes(player: Player, zoneId: string, mode: string, coords: {any}, isReload: boolean?)
 	if not isUtilityMode(mode) then return end
 	if type(coords) ~= "table" or #coords == 0 then
 		warn(("[PipeGeneratorScript] No coords to (re)create for %s (%s)"):format(zoneId, tostring(mode)))
@@ -34,7 +34,7 @@ local function recreatePipes(player: Player, zoneId: string, mode: string, coord
 	end
 
 	-- Generate fresh from the path coordinates (no stored snapshot required)
-	PipeGeneratorModule.generatePipe(player, zoneId, mode, coords)
+	PipeGeneratorModule.generatePipe(player, zoneId, mode, coords, isReload)
 end
 
 -- Events ----------------------------------------------------------------------
@@ -50,10 +50,10 @@ end)
 -- 2) Zone re-creation (e.g., on load) — SaveManager fires this with coords
 -- Signature: (player, zoneId, mode, coords, payloadOrSnapshot, rotationOr0)
 local ZoneReCreated = BindableEvents:WaitForChild("ZoneReCreated")
-ZoneReCreated.Event:Connect(function(player: Player, zoneId: string, mode: string, coords: {any})
+ZoneReCreated.Event:Connect(function(player: Player, zoneId: string, mode: string, coords: {any}, _payload, _rot, isReload)
 	if not isUtilityMode(mode) then return end
 	--print(string.format("[PipeGeneratorScript] Recreate: %s (%s)", zoneId, mode))
-	recreatePipes(player, zoneId, mode, coords)
+	recreatePipes(player, zoneId, mode, coords, isReload)
 end)
 
 -- 3) Zone removal → clean up occupancy and visuals so future placements aren’t blocked

@@ -1655,14 +1655,15 @@ end
 
 
 -- populateZone
-function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedRoads)
+function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedRoads, rotation, skipStages, isReload)
 	task.spawn(function()
+		local isFastReload = isReload == true
 		local _roadReserve = nil
 		-- ===== pre-populate guards / cleanup =====================================
 		ZoneTrackerModule.setZonePopulating(player, zoneId, true)
 		-- Reserve the footprint so we can safely coexist with power/others (roads only block roads)
 		local _roadReserve = select(1, GridUtils.reserveArea(player, zoneId, "road", gridList, { ttl = 20.0 }))
-		if not _roadReserve then
+		if not _roadReserve and not isFastReload then
 			-- One gentle retry after transient in-flight work clears
 			local tries = 0
 			while tries < 5 do
@@ -1795,6 +1796,9 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 		else
 			-- Road / Bridge state machine
 			local bridging = false
+			local function needsBridge(supportType)
+				return supportType == "Cliff" or supportType == "Water" or supportType == "Void"
+			end
 
 			for i, cell in ipairs(gridList) do
 				-- Roads are allowed to overlap overlays/utilities; only block on non-utility conflicts.
@@ -1817,18 +1821,15 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 				local support = getSupportTypeForCell(probe)
 				probe:Destroy()
 
-				-- 2) Choose asset & toggle bridging
-				local asset = forcedRoad
-				if not bridging then
-					if support == "Cliff" and bridgeAsset then
-						bridging, asset = true, bridgeAsset
-					end
-				else
-					if support == "Cliff" then
-						asset, bridging = bridgeAsset, false -- tail
-					else
-						asset = bridgeAsset                  -- mid-span
-					end
+				-- 2) Choose asset & toggle bridging based on terrain support
+				local spanCell = needsBridge(support)
+				if not bridging and spanCell and bridgeAsset then
+					bridging = true
+				end
+
+				local asset = (bridging and bridgeAsset) or forcedRoad
+				if bridging and not spanCell then
+					bridging = false -- first land cell after a span gets the tail piece
 				end
 
 				-- 3) Compute rotation
@@ -1853,7 +1854,9 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 					gridZ    = cell.z
 				})
 
-				task.wait(BUILD_INTERVAL)
+				if not isFastReload then
+					task.wait(BUILD_INTERVAL)
+				end
 			end
 		end
 
@@ -1890,7 +1893,7 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 end
 
 
-function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation)
+function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation, isReload)
 	normalizeLegacyEvenPlotData(player, gridList, saved)
 	-- Case A: full snapshot
 	if typeof(saved) == "table" and saved.segments and #saved.segments > 0 then
@@ -1898,10 +1901,10 @@ function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList
 	end
 	-- Case B: legacy "placedRoadsData" list
 	if typeof(saved) == "table" and #saved > 0 and saved[1].gridX then
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true, isReload)
 	end
 	-- Fallback: procedural
-	return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil)
+	return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true, isReload)
 end
 
 function RoadGeneratorModule.recalculateIntersectionsForPlot(player, zoneWhitelist)  -- zoneWhitelist: array of zoneIds or nil

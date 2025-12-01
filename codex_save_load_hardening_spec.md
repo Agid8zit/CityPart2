@@ -129,7 +129,7 @@ return {
 
 	-- Size guards (approximate; keep generous):
 	LIMITS = {
-		PER_SAVE_BYTES = 250 * 1024,      -- total envelope+payload soft ceiling
+		PER_SAVE_BYTES = 1024 * 1024,     -- total envelope+payload soft ceiling
 		ROADS_B64_MAX = 200 * 1024,
 		ZONES_B64_MAX = 200 * 1024,
 	},

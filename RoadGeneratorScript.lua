@@ -32,7 +32,7 @@ end)
 
 -- Listen for ZoneReCreated event (rebuild roads)
 local zoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
-zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved, rotation)
+zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved, rotation, isReload)
 	if not roadTypes[mode] then return end
 
 	--print(string.format("RoadGeneratorScript: Re-creating road zone '%s' (%s) for player '%s'",zoneId, mode, player.Name))
@@ -47,12 +47,12 @@ zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved,
 		(typeof(saved) == "table") and (#saved > 0) and (typeof(saved[1]) == "table") and (saved[1].gridX ~= nil)
 
 	if isSnapshot and typeof(RoadGeneratorModule.populateZoneFromSave) == "function" then
-		return RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation)
+		return RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation, isReload)
 	elseif isPlacedList then
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true, isReload)
 	else
 		-- Treat as no predefined content (procedural rebuild)
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true, isReload)
 	end
 end)
 

@@ -36,7 +36,7 @@ zoneAddedEvent.Event:Connect(function(player, zoneId, zoneData)
 	PowerGeneratorModule.populateZone(player, zoneId, zoneData.mode, zoneData.gridList)
 end)
 
-zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predefinedLines, rotation)
+zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predefinedLines, rotation, isReload)
 	if not powerZoneTypes[mode] then return end
 
 	--print(("[PowerGeneratorScript] ZoneReCreated received. Rebuilding zone '%s' for '%s'."):format(zoneId, player.Name))
@@ -47,7 +47,7 @@ zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predef
 	end
 
 	-- Replay saved geometry if present, else regenerate
-	PowerGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedLines, rotation, true)
+	PowerGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedLines, rotation, true, isReload)
 end)
 
 zoneRemovedEvent.Event:Connect(function(player, zoneId, mode)

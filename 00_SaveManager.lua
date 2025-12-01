@@ -28,6 +28,7 @@ end
 local Players            = game:GetService("Players")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local Workspace          = game:GetService("Workspace")
+local ServerStorage      = game:GetService("ServerStorage")
 local HttpService        = game:GetService("HttpService")
 local RunService         = game:GetService("RunService")
 local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
@@ -256,7 +257,8 @@ local function readUnlockTableFor(player: Player): { [string]: boolean }
 		return LastUnlockCacheByUid[player.UserId] or {}
 	end
 	local ok, t = pcall(function() return GetUnlocksForPlayer:Invoke(player) end)
-	if ok and type(t) == "table" and next(t) then
+	-- Accept empty tables as authoritative (fresh cities); only fall back on errors or bad types.
+	if ok and type(t) == "table" then
 		return t
 	end
 	return LastUnlockCacheByUid[player.UserId] or {}
@@ -470,6 +472,94 @@ end
 local InflightPopByUid : { [number]: number } = {}
 local InReload         : { [Player]: boolean } = {}
 
+----------------------------------------------------------------
+--  Reload occlusion cube (to force culling while world swaps)
+----------------------------------------------------------------
+local OcclusionCubeByPlayer : { [Player]: Model } = {}
+
+local function findOcclusionCubeTemplate(): Model?
+	local container = ServerStorage:FindFirstChild("CUBE CONTAINMENT")
+	if not container then
+		container = ReplicatedStorage:FindFirstChild("CUBE CONTAINMENT")
+	end
+	if not container then
+		return nil
+	end
+
+	local cube = container:FindFirstChild("THE CUBE")
+	if cube and cube:IsA("Model") then
+		return cube
+	end
+	return nil
+end
+
+local function destroyOcclusionCube(player: Player)
+	local existing = OcclusionCubeByPlayer[player]
+	if existing then
+		OcclusionCubeByPlayer[player] = nil
+		existing:Destroy()
+	end
+end
+
+local function placeOcclusionCube(player: Player)
+	local template = findOcclusionCubeTemplate()
+	if not (template and player) then return end
+
+	local plotsFolder = Workspace:FindFirstChild("PlayerPlots")
+	local plot = plotsFolder and plotsFolder:FindFirstChild("Plot_" .. player.UserId)
+	if not plot then return end
+
+	destroyOcclusionCube(player)
+
+	local clone = template:Clone()
+	clone.Parent = plot
+
+	-- Compute target from placement attributes so it matches manual drop-in.
+	local px = plot:GetAttribute("PlacementPosX")
+	local py = plot:GetAttribute("PlacementPosY")
+	local pz = plot:GetAttribute("PlacementPosZ")
+	local yawDeg = plot:GetAttribute("PlacementYaw") or 0
+
+	local basePos = (typeof(px) == "number" and typeof(py) == "number" and typeof(pz) == "number")
+		and Vector3.new(px, py, pz)
+		or ((plot.PrimaryPart and plot.PrimaryPart.Position) or plot:GetPivot().Position)
+
+	-- Hardcoded targets per known plot placement (rounded PlacementPosX/Z key).
+	local anchorKey = string.format("%d|%d", math.floor((px or basePos.X) + 0.5), math.floor((pz or basePos.Z) + 0.5))
+	local targetPos = nil
+	local TARGETS = {
+		["205|-4615"]   = Vector3.new(204.766, 13.945, -4743),
+		["209|-4387"]   = Vector3.new(204.766, 12.545, -4254.8),
+		["-295|-4615"]  = Vector3.new(-295.234, 13.945, -4743),
+		["-291|-4387"]  = Vector3.new(-290.766, 13.995, -4259),
+		["-795|-4615"]  = Vector3.new(-795.234, 13.945, -4743),
+		["-791|-4387"]  = Vector3.new(-790.766, 13.995, -4259),
+		["-1295|-4615"] = Vector3.new(-1295.234, 13.945, -4743),
+		["-1291|-4387"] = Vector3.new(-1290.766, 13.995, -4259),
+	}
+	targetPos = TARGETS[anchorKey]
+
+	-- Fallback to generic offset if we don't have a hardcoded target.
+	if not targetPos then
+		local CUBE_LOCAL_OFFSET = Vector3.new(0.234, 15.445, 128.0)
+		local yawRad = math.rad(yawDeg)
+		local baseCF = CFrame.new(basePos) * CFrame.Angles(0, yawRad, 0)
+		local worldOffset = baseCF:VectorToWorldSpace(CUBE_LOCAL_OFFSET)
+		targetPos = basePos + worldOffset
+	end
+
+	local yawRad = math.rad(yawDeg)
+	local targetCF = CFrame.new(targetPos) * CFrame.Angles(0, yawRad + math.pi, 0)
+	local ok, err = pcall(function()
+		clone:PivotTo(targetCF)
+	end)
+	if not ok then
+		warn("[SaveManager] Failed to position occlusion cube:", err)
+	end
+
+	OcclusionCubeByPlayer[player] = clone
+end
+
 -- Drain barrier: wait briefly for zone population pipeline to quiesce
 local function awaitZonePipelinesToDrain(player: Player, timeoutSec: number?): boolean
 	local uid = player.UserId
@@ -509,11 +599,13 @@ end)
 -- Hook reload window (relay to client)
 WorldReloadBeginBE.Event:Connect(function(player: Player)
 	InReload[player] = true
+	placeOcclusionCube(player)
 	WorldReloadRE:FireClient(player, "begin")
 	-- Optional early seed of progress band A:
 	WorldReloadRE:FireClient(player, "progress", 2, "LOAD_Preparing")
 end)
 WorldReloadEndBE.Event:Connect(function(player: Player)
+	destroyOcclusionCube(player)
 	InReload[player] = nil
 	WorldReloadRE:FireClient(player, "end")
 end)
@@ -1240,7 +1332,7 @@ local function runLoadSlice(state, budgetMs)
 		while state.idxRoads <= #state.zoneRows do
 			local r = state.zoneRows[state.idxRoads]
 			if isRoadRow(r) then
-				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, ensureRoadPayloadFor(state, r), 0)
+				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, ensureRoadPayloadFor(state, r), 0, true)
 
 				-- progress
 				state.doneRoads += 1
@@ -1270,9 +1362,9 @@ local function runLoadSlice(state, budgetMs)
 			if (not isRoadRow(r)) and (not isNetworkRow(r)) then
 				local predefined = ensurePredefinedCache(state, r.id, r)
 				if predefined and #predefined > 0 then
-					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, predefined, 0)
+					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, predefined, 0, true)
 				else
-					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0)
+					ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0, true)
 				end
 
 				-- progress
@@ -1301,7 +1393,7 @@ local function runLoadSlice(state, budgetMs)
 		while state.idxNet <= #state.zoneRows do
 			local r = state.zoneRows[state.idxNet]
 			if isNetworkRow(r) then
-				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0)
+				ZoneReCreated:Fire(player, r.id, r.mode, r.coords, nil, 0, true)
 
 				-- progress
 				state.doneNetworks += 1
@@ -1861,6 +1953,7 @@ Players.PlayerRemoving:Connect(function(plr)
 
 	InflightPopByUid[plr.UserId] = 0
 	InReload[plr] = nil
+	destroyOcclusionCube(plr)
 
 	local firedPlayerSaved = false
 

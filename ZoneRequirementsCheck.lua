@@ -108,6 +108,19 @@ end
 
 -- Track world-reload windows fired by SaveManager (if present)
 local WorldReloadActiveByUid = {}
+local DeferredRechecksByUid   = {} -- zones to re-run after reload
+
+local function _isReloading(player)
+	local uid = player and player.UserId
+	return uid and WorldReloadActiveByUid[uid] == true or false
+end
+
+local function _queueDeferredRecheck(player, zoneId)
+	local uid = player and player.UserId
+	if not uid or not zoneId then return end
+	DeferredRechecksByUid[uid] = DeferredRechecksByUid[uid] or {}
+	DeferredRechecksByUid[uid][zoneId] = true
+end
 
 do
 	local WorldReloadBeginBE = BindableEvents:FindFirstChild("WorldReloadBegin")
@@ -126,6 +139,20 @@ do
 		WorldReloadEndBE.Event:Connect(function(player)
 			if player and player.UserId then
 				WorldReloadActiveByUid[player.UserId] = nil
+				-- Drain deferred requirement checks after reload finishes
+				local uid = player.UserId
+				local pending = DeferredRechecksByUid[uid]
+				DeferredRechecksByUid[uid] = nil
+				if pending then
+					for zoneId in pairs(pending) do
+						task.spawn(function()
+							local z = ZoneTrackerModule.getZoneById(player, zoneId)
+							if z then
+								ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, z.mode, z.gridList or {}, { runSync = false })
+							end
+						end)
+					end
+				end
 				-- >>> ADDED: sequences not strictly needed to clear here since zone-wise clears happen elsewhere
 			end
 		end)
@@ -1983,6 +2010,13 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 	if not player or not player:IsA("Player") then return end
 	if type(zoneId) ~= "string" or type(mode) ~= "string" or type(gridList) ~= "table" then return end
 
+	-- During a SaveManager reload, defer expensive checks and mark to recompute after reload ends.
+	if _isReloading(player) then
+		_queueDeferredRecheck(player, zoneId)
+		if opts.onFinished then pcall(opts.onFinished) end
+		return
+	end
+
 	if not ZoneRequirementsChecker.isBuildingZone(mode) then
 		if opts.onFinished then pcall(opts.onFinished) end
 		return
@@ -2056,6 +2090,10 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 end
 
 function ZoneRequirementsChecker.checkNearbyRoad(player, zoneId, mode, gridList)
+	if _isReloading(player) then
+		_queueDeferredRecheck(player, zoneId)
+		return true
+	end
 	for _, coord in pairs(gridList) do
 		if type(coord) == "table" and type(coord.x) == "number" and type(coord.z) == "number" then
 			local nearbyRoads = roadSpatialGrid:getNearbyZones(coord.x, coord.z, SEARCH_RADIUS)
@@ -2077,6 +2115,10 @@ function ZoneRequirementsChecker.checkNearbyRoad(player, zoneId, mode, gridList)
 end
 
 function ZoneRequirementsChecker.zoneHasWater(player, zoneId, gridList, radius)
+	if _isReloading(player) then
+		_queueDeferredRecheck(player, zoneId)
+		return true
+	end
 	for _, coord in ipairs(gridList) do
 		local nearbyWaters = waterSpatialGrid:getNearbyZones(coord.x, coord.z, radius)
 		for _, waterZone in ipairs(nearbyWaters) do
@@ -2098,6 +2140,10 @@ function ZoneRequirementsChecker.zoneHasWater(player, zoneId, gridList, radius)
 end
 
 function ZoneRequirementsChecker.zoneHasPower(player, zoneId, gridList, radius)
+	if _isReloading(player) then
+		_queueDeferredRecheck(player, zoneId)
+		return true
+	end
 	for _, coord in ipairs(gridList) do
 		local nearbyPowers = powerSpatialGrid:getNearbyZones(coord.x, coord.z, radius)
 		for _, powerZone in ipairs(nearbyPowers) do

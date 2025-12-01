@@ -1259,10 +1259,11 @@ end
 ---------------------------------------------------------------------
 --  Main placement routine
 ---------------------------------------------------------------------
-function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
+function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList, _predefinedLines, _rotation, _skipStages, isReload)
 	--print("[PowerGeneratorModule] populateZone CALLED:", player, zoneId, mode)
 
 	task.spawn(function()
+		local isFastReload = isReload == true
 		debugPrint("Populating Power Zone:", zoneId, "(mode:", mode, ")")
 
 		-----------------------------------------------------------------
@@ -1271,7 +1272,7 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 		ZoneTrackerModule.setZonePopulating(player, zoneId, true) -- NEW
 
 		local _powerReserve = select(1, GridUtils.reserveArea(player, zoneId, "power", gridList or {}, { ttl = 20.0 }))
-		if not _powerReserve then
+		if not _powerReserve and not isFastReload then
 			local tries = 0
 			while tries < 5 do
 				task.wait(0.2); tries += 1
@@ -1632,7 +1633,9 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 				lastPoleInstance = newInstance
 
 				table.insert(placedLinesData, {lineName = basePower.name or "PowerLines", gridX = cell.x, gridZ = cell.z})
-				task.wait(BUILD_INTERVAL)
+				if not isFastReload then
+					task.wait(BUILD_INTERVAL)
+				end
 			else
 				debugPrint(("Skipping (%d,%d) — occ:%s road:%s bld:%s")
 					:format(cell.x, cell.z, tostring(occupied), tostring(hasRoad), tostring(hasBuilding)))

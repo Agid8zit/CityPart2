@@ -185,7 +185,7 @@ end)
 --  Public: generatePipe – overlay-friendly, idempotent per zone
 --  pathCoords: array of {x=int, z=int}
 ---------------------------------------------------------------------
-function PipeGeneratorModule.generatePipe(player, zoneId, mode, pathCoords)
+function PipeGeneratorModule.generatePipe(player, zoneId, mode, pathCoords, isReload)
 	-- Validate / locate plot
 	local myPlot = plots and plots:FindFirstChild("Plot_" .. _uid(player))
 	if not myPlot then return end
@@ -292,7 +292,9 @@ function PipeGeneratorModule.generatePipe(player, zoneId, mode, pathCoords)
 			end
 
 			_releaseHandle(handle)
-			task.wait(BUILD_INTERVAL)
+			if not isReload then
+				task.wait(BUILD_INTERVAL)
+			end
 		end
 	end
 
