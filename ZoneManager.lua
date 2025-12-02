@@ -53,6 +53,18 @@ local GridUtils = require(GridConf:WaitForChild("GridUtil"))
 local PathingModule = require(S3:WaitForChild("Build"):WaitForChild("Transport"):WaitForChild("Roads"):WaitForChild("CoreConcepts"):WaitForChild("Pathing"):WaitForChild("PathingModule"))
 local CC = Zones:WaitForChild("CoreConcepts"):WaitForChild("PowerGen")
 local PowerLinePath = require(CC:WaitForChild("PowerLinePath"))
+local LayerManagerModule = require(Build:WaitForChild("LayerManager"))
+
+-- Building generator (for gap refills after suppressor zones are deleted)
+local Districts = Zones:WaitForChild("CoreConcepts"):WaitForChild("Districts")
+local BG = Districts:WaitForChild("Building Gen")
+local BuildingGeneratorModule = require(BG:WaitForChild("BuildingGenerator"))
+
+-- Build zones that can host buildings and should be refilled if suppressed
+local SUPPRESSIBLE = {
+	Residential = true, Commercial = true, Industrial = true,
+	ResDense    = true, CommDense   = true, IndusDense   = true,
+}
 -- Current Mode per player
 local playerModes = {}
 
@@ -995,6 +1007,62 @@ function ZoneManager.onRemoveZone(player, zoneId)
 		return ZoneManager.removePowerLine(player, zoneId)
 
 	else
+		-- Attempt to restore anything this zone suppressed (common for overlays like SolarPanels).
+		local restoredBuildings = LayerManagerModule.restoreRemovedObjects(player, zoneId, "Buildings", "Buildings") or 0
+		LayerManagerModule.restoreRemovedObjects(player, zoneId, "NatureZones", "NatureZones")
+
+		-- If no cached suppression exists (e.g., after a reload), request a gap refill on underlying buildable zones.
+		if restoredBuildings == 0
+			and BuildingGeneratorModule
+			and type(BuildingGeneratorModule._refillZoneGaps) == "function"
+		then
+			local impacted = {}
+			for _, cell in ipairs(z.gridList or {}) do
+				local underId = ZoneTrackerModule.getOtherZoneIdAtGrid(player, cell.x, cell.z, zoneId)
+				if underId then
+					local u = ZoneTrackerModule.getZoneById(player, underId)
+					if u and SUPPRESSIBLE[u.mode] then
+						local bucket = impacted[underId]
+						if not bucket then
+							bucket = { mode = u.mode, seeds = {} }
+							impacted[underId] = bucket
+						end
+						bucket.seeds[cell.x .. "|" .. cell.z] = true
+					end
+				end
+			end
+
+			for targetId, data in pairs(impacted) do
+				if data.seeds and next(data.seeds) then
+					local seeds = {}
+					for k in pairs(data.seeds) do
+						local sep = string.find(k, "|", 1, true)
+						if sep then
+							local gx = tonumber(string.sub(k, 1, sep - 1))
+							local gz = tonumber(string.sub(k, sep + 1))
+							if gx and gz then
+								table.insert(seeds, { x = gx, z = gz })
+							end
+						end
+					end
+					if #seeds > 0 then
+						task.defer(function()
+							BuildingGeneratorModule._refillZoneGaps(
+								player,
+								targetId,
+								data.mode,
+								nil, -- wealthOverride
+								nil, -- rotation
+								nil, -- styleOverride
+								nil, -- refillSourceZoneId (permanent refill)
+								seeds
+							)
+						end)
+					end
+				end
+			end
+		end
+
 		-- Generic zones fall back to ID-only removal
 		local ok = ZoneTrackerModule.removeZoneById(player, zoneId)
 		if ok then

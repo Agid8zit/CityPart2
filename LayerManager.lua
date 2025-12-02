@@ -42,6 +42,16 @@ local function _ensureOwnerBucket(player: Player?, zoneId: string?)
 	return _removedByOwner[key], key
 end
 
+local function _sourceZoneIsAlive(player: Player?, zoneId: string?)
+	if type(zoneId) ~= "string" then
+		return true
+	end
+	if ZoneTrackerModule.isZoneTombstoned and ZoneTrackerModule.isZoneTombstoned(player, zoneId) then
+		return false
+	end
+	return ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
+end
+
 local function getPlayerPlot(player: Player): Instance?
 	if not player then return nil end
 	local plots = Workspace:FindFirstChild("PlayerPlots")
@@ -310,6 +320,18 @@ function LayerManager.restoreRemovedObjects(player: Player, zoneId: string, obje
 	for _, record in ipairs(items) do
 		local clone = record.instanceClone
 		if clone and clone.Parent == nil then
+			local sourceZoneId = record.zoneId
+			if not sourceZoneId and clone.GetAttribute then
+				local attr = clone:GetAttribute("ZoneId")
+				if attr then
+					sourceZoneId = tostring(attr)
+				end
+			end
+			if not _sourceZoneIsAlive(player, sourceZoneId) then
+				clone:Destroy()
+				continue
+			end
+
 			local parent = resolveParent(player, containerName, record)
 			if parent then
 				clone.Parent = parent

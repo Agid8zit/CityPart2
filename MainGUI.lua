@@ -295,6 +295,8 @@ local UI_CityNameLabel = UI.cityLevel.background.CityName
 local UI_DriveBtn = UI.left.drive.ImageButton
 local UI_PopulationBtn = UI.top.population.Background  -- (already present in your code)
 
+local OnboardingToggleEvent = BindableEvents:FindFirstChild("OnboardingToggle")
+
 -- Networking
 local UIUpdateEvent = ReplicatedStorage.Events.RemoteEvents:WaitForChild("UpdateStatsUI")
 local RE_EquipBoombox = ReplicatedStorage.Events.RemoteEvents.EquipBoombox
@@ -315,6 +317,27 @@ local activeFollowConn
 local deleteMode   = false
 local selectedPart = nil
 local DELETE_MODE_TRANSPARENCY = 0.75 -- match build-mode plate alpha
+local onboardingLocked = false
+local removalTrayVisibleBeforeLock = nil
+
+local function setRemovalButtonsEnabled(enabled: boolean)
+	local function apply(btn)
+		if btn and btn:IsA("GuiButton") then
+			btn.Active = enabled
+			if btn.AutoButtonColor ~= nil then
+				btn.AutoButtonColor = enabled
+			end
+		end
+	end
+
+	apply(UI_DestroyButton)
+	apply(UI_DeleteButton)
+	apply(UI_RedoButton)
+	apply(UI_UndoButton)
+	apply(UI_DeleteGamepadButton)
+	apply(UI_RedoGamepadButton)
+	apply(UI_UndoGamepadButton)
+end
 
 local function ensureDisableDeleteModeEvent(): BindableEvent
 	local evt = BindableEvents:FindFirstChild("DisableDeleteMode")
@@ -705,6 +728,9 @@ end
 
 -- ▲ enable / disable delete mode ----------------------------------------------
 local function toggleDeleteMode(on: boolean)
+	if onboardingLocked and on then
+		return
+	end
 	if deleteMode == on then return end
 	deleteMode = on
 	print("[toggleDeleteMode] switched to", deleteMode)
@@ -849,6 +875,36 @@ end
 DisableDeleteModeEvent.Event:Connect(function()
 	MainGui.DisableDeleteMode()
 end)
+
+-- Onboarding guard: disable delete/undo/redo while the tutorial is active
+local function applyOnboardingLock(active: boolean?)
+	local locking = active == true
+	onboardingLocked = locking
+
+	setRemovalButtonsEnabled(not locking)
+
+	if locking then
+		removalTrayVisibleBeforeLock = UI.right.removal.Delete.Visible
+		UI.right.removal.Delete.Visible = false
+		UI.right.removal.Redo.Visible = false
+		UI.right.removal.Undo.Visible = false
+		MainGui.DisableDeleteMode()
+	elseif removalTrayVisibleBeforeLock ~= nil then
+		UI.right.removal.Delete.Visible = removalTrayVisibleBeforeLock
+		UI.right.removal.Redo.Visible = removalTrayVisibleBeforeLock
+		UI.right.removal.Undo.Visible = removalTrayVisibleBeforeLock
+		removalTrayVisibleBeforeLock = nil
+	end
+end
+
+if OnboardingToggleEvent then
+	OnboardingToggleEvent.Event:Connect(function(enabled)
+		-- Only lock when explicitly enabled; nil/false should unlock for post-onboarding players.
+		applyOnboardingLock(enabled == true)
+	end)
+end
+
+applyOnboardingLock(_G.OB_ENABLED == true)
 
 -- Module Functions
 function MainGui.SetChartButton_GreenFillbar(Alpha: number)
@@ -1063,6 +1119,7 @@ function MainGui.Init()
 			end
 
 		elseif InputObject.KeyCode == Enum.KeyCode.V then
+			if onboardingLocked then return end
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			local newVisible = not UI.right.removal.Delete.Visible
 			UI.right.removal.Delete.Visible = newVisible
@@ -1099,10 +1156,12 @@ function MainGui.Init()
 			require(PlayerGui.BuildMenu.Logic).Toggle()
 
 		elseif InputObject.KeyCode == Enum.KeyCode.Z then
+			if onboardingLocked then return end
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			ReplicatedStorage.Events.RemoteEvents.UndoCommand:FireServer()
 
 		elseif InputObject.KeyCode == Enum.KeyCode.Y then
+			if onboardingLocked then return end
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			ReplicatedStorage.Events.RemoteEvents.RedoCommand:FireServer()
 
@@ -1111,6 +1170,7 @@ function MainGui.Init()
 			warn("TODO")
 
 		elseif InputObject.KeyCode == Enum.KeyCode.DPadRight then
+			if onboardingLocked then return end
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			ReplicatedStorage.Events.RemoteEvents.RedoCommand:FireServer()
 
@@ -1120,6 +1180,7 @@ function MainGui.Init()
 			end
 
 		elseif InputObject.KeyCode == Enum.KeyCode.DPadLeft then
+			if onboardingLocked then return end
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			ReplicatedStorage.Events.RemoteEvents.UndoCommand:FireServer()
 		end
@@ -1142,6 +1203,7 @@ function MainGui.Init()
 	local mouse = LocalPlayer:GetMouse()
 
 	mouse.Button1Down:Connect(function()
+		if onboardingLocked then return end
 		if not deleteMode then return end
 		if PlayerGui.BuildMenu.Enabled then return end   -- don’t allow while building
 
@@ -1227,6 +1289,7 @@ function MainGui.Init()
 	end)
 	
 	UI_DestroyButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		local newVisible = not UI.right.removal.Delete.Visible
 		UI.right.removal.Delete.Visible = newVisible
@@ -1238,31 +1301,37 @@ function MainGui.Init()
 	end)
 
 	UI_DeleteButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		print("[DeleteButton] CLICKED – current deleteMode =", deleteMode)
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		toggleDeleteMode(not deleteMode)
 	end)
 
 	UI_DeleteGamepadButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		print("[DeleteGamepadButton] CLICKED – current deleteMode =", deleteMode)
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		toggleDeleteMode(not deleteMode)
 	end)
 
 	UI_RedoButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		ReplicatedStorage.Events.RemoteEvents.RedoCommand:FireServer()
 	end)
 	UI_RedoGamepadButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		ReplicatedStorage.Events.RemoteEvents.RedoCommand:FireServer()
 	end)
 
 	UI_UndoButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		ReplicatedStorage.Events.RemoteEvents.UndoCommand:FireServer()
 	end)
 	UI_UndoGamepadButton.MouseButton1Down:Connect(function()
+		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		ReplicatedStorage.Events.RemoteEvents.UndoCommand:FireServer()
 	end)
@@ -1566,6 +1635,7 @@ function MainGui.Init()
 			or not PlayerPlot:FindFirstChild("CornerPoint2")
 		then
 			UI_HotbarHomeButton.Parent.Visible = false
+			return -- plot not ready; skip bounds math until corner points exist
 		end
 
 		UI_HotbarHomeButton.Parent.Visible = true

@@ -553,12 +553,22 @@ function BuildZoneCommand:undo()
 	end
 
 	-- Windowed coin refund (aggregate for the command)
-	-- Use the youngest createdAt among the zones built by this command
-	local youngest = 0
+	-- Use the youngest refund clock (populated time) among the zones built by this command
+	local youngest = nil
 	for _, z in ipairs(self.createdZones) do
-		if z.createdAt and z.createdAt > youngest then youngest = z.createdAt end
+		local startAt = ZoneTrackerModule.getRefundClockAt(self.player, z.zoneId)
+			or z.refundClockAt
+		if (not startAt) and z.requirements and z.requirements.Populated then
+			startAt = z.createdAt
+		end
+
+		if type(startAt) == "number" and startAt > 0 then
+			if not youngest or startAt > youngest then
+				youngest = startAt
+			end
+		end
 	end
-	local age = os.time() - (youngest ~= 0 and youngest or os.time())
+	local age = youngest and math.max(0, os.time() - youngest) or 0
 
 	if self.cost and self.cost > 0 and age <= COIN_REFUND_WINDOW then
 		debugPrint(string.format("[UNDO] Refunding cost: %d to %s (age=%ds ≤ %ds)",

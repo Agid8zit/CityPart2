@@ -48,16 +48,34 @@ end
 
 --------------------------------------------------------------------- helpers
 local function computeAgeSeconds(self)
-	-- Prefer a server-authored createdAt on the zone record; fall back to XP timestamp; else "infinite"
-	local createdAt = self.zoneData and self.zoneData.createdAt
-	if type(createdAt) == "number" and createdAt > 0 then
-		return os.time() - createdAt
+	-- Prefer the refund clock (starts on population); if the zone never populated, treat age as 0.
+	local populated = self.zoneData and self.zoneData.requirements and self.zoneData.requirements.Populated
+
+	local startAt = ZoneTracker.getRefundClockAt(self.player, self.zoneId)
+	if not startAt and self.zoneData then
+		-- Allow a late-set refund clock from persisted data (populated-on-save)
+		startAt = self.zoneData.refundClockAt
+		-- Only fall back to createdAt if the zone was already populated in the snapshot
+		if not startAt and populated then
+			startAt = self.zoneData.createdAt
+		end
 	end
+
+	if type(startAt) == "number" and startAt > 0 then
+		return math.max(0, os.time() - startAt)
+	end
+
+	-- If never populated, do NOT fall back to XP timestamps; window hasn’t started.
+	if not populated then
+		return 0
+	end
+
 	local t0 = XPManager.getZoneAwardTimestamp(self.player, self.zoneId)
 	if type(t0) == "number" and t0 > 0 then
-		return os.time() - t0
+		return math.max(0, os.time() - t0)
 	end
-	return math.huge
+
+	return 0
 end
 
 local function removeZone(self)

@@ -117,6 +117,25 @@ ZoneTrackerModule.zoneRemovedEvent = BindableEvents:FindFirstChild("ZoneRemoved"
 ZoneTrackerModule.zoneRequirementChangedEvent = BindableEvents:FindFirstChild("ZoneRequirementChanged")
 ZoneTrackerModule.demandUpdatedEvent = BindableEvents:FindFirstChild("DemandUpdated")
 
+-- Returns when the refund window should start for the given zone
+local function refundClockAt(zoneData)
+	if not zoneData then
+		return nil
+	end
+
+	if typeof(zoneData.refundClockAt) == "number" and zoneData.refundClockAt > 0 then
+		return zoneData.refundClockAt
+	end
+
+	-- If we don't have an explicit timestamp yet but the zone is already populated,
+	-- fall back to creation time so legacy zones keep their original window.
+	if zoneData.requirements and zoneData.requirements.Populated then
+		return zoneData.createdAt
+	end
+
+	return nil
+end
+
 
 
 
@@ -186,6 +205,10 @@ function ZoneTrackerModule.setZonePopulated(player, zoneId, state)
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
 	if z then
 		z.requirements.Populated = state
+		-- Start the refund clock the first time the zone is marked populated
+		if state and not refundClockAt(z) then
+			z.refundClockAt = os.time()
+		end
 		-- NEW: population flips change demand pressures immediately
 		ZoneTrackerModule.publishDemand(player)
 	end
@@ -194,6 +217,11 @@ end
 function ZoneTrackerModule.isZonePopulated(player, zoneId)
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
 	return z and z.requirements.Populated or false
+end
+
+-- Returns the timestamp that should be used for refund-window age checks
+function ZoneTrackerModule.getRefundClockAt(player, zoneId)
+	return refundClockAt(ZoneTrackerModule.getZoneById(player, zoneId))
 end
 
 function ZoneTrackerModule.addZone(player, zoneId, mode, gridList, props)
@@ -225,6 +253,13 @@ function ZoneTrackerModule.addZone(player, zoneId, mode, gridList, props)
 	if props and typeof(props.createdAt) == "number" and props.createdAt > 0 then
 		createdAt = props.createdAt
 	end
+	local refundClock = nil
+	if props and typeof(props.refundClockAt) == "number" and props.refundClockAt > 0 then
+		refundClock = props.refundClockAt
+	end
+	if not refundClock and props and typeof(props.requirements) == "table" and props.requirements.Populated then
+		refundClock = createdAt
+	end
 	local zoneData = {
 		zoneId       = zoneId,
 		player       = player,
@@ -233,6 +268,7 @@ function ZoneTrackerModule.addZone(player, zoneId, mode, gridList, props)
 		requirements = { Road = false, Water = false, Power = false, Populated = false },
 		wealth       = {},
 		createdAt    = createdAt,
+		refundClockAt= refundClock,
 		isPopulating = false,
 	}
 
@@ -473,6 +509,30 @@ function ZoneTrackerModule.isGridOccupied(player, x, z, options)
 
 	local changed = false
 
+	-- Support either a single occupantType string or a table (array or set) of types
+	local function _isExcludedType(occType)
+		local ex = options.excludeOccupantType
+		if not ex then
+			return false
+		end
+		local t = type(ex)
+		if t == "string" then
+			return occType == ex
+		elseif t == "table" then
+			-- set-style table wins
+			if ex[occType] ~= nil then
+				return ex[occType] == true
+			end
+			-- otherwise treat as array
+			for _, v in ipairs(ex) do
+				if v == occType then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	-- Normalize prefix exclusions (string or array of strings)
 	local function _hasExcludedPrefix(occId)
 		local pref = options.excludeOccupantIdPrefix
@@ -496,7 +556,7 @@ function ZoneTrackerModule.isGridOccupied(player, x, z, options)
 		local occ = stack[i]
 		if occ then
 			-- Exclusion filters
-			if options.excludeOccupantType and occ.occupantType == options.excludeOccupantType then
+			if _isExcludedType(occ.occupantType) then
 				-- skip this occupant, but keep it in stack
 			elseif options.excludeOccupantId and occ.occupantId == options.excludeOccupantId then
 				-- skip

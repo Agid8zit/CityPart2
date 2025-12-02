@@ -74,6 +74,12 @@ local OverlapExclusions = {
 	MetroTunnelZone = true,   -- << ADD (some systems prefix/alias the zoneType)
 }
 
+-- Modes where we only allow rotation if Stage3 footprint is square (n x n cells) or 180-degree flips otherwise
+local SQUARE_ONLY_MODES : { [string]: boolean } = {
+	Residential = true, Commercial = true, Industrial = true,
+	ResDense    = true, CommDense   = true, IndusDense   = true,
+}
+
 
 -- Debug Configuration
 local DEBUG = false
@@ -1615,6 +1621,16 @@ function BuildingGeneratorModule.generateBuilding(
 	end
 
 	local playerPlot = terrain.Parent
+	if not playerPlot or not playerPlot:IsA("Model") then
+		-- Fallback: find the player's plot by name to avoid nil-parent crashes during late rebuilds
+		local plots = Workspace:FindFirstChild("PlayerPlots")
+		if player and plots then
+			playerPlot = plots:FindFirstChild("Plot_" .. player.UserId)
+		end
+	end
+	if not playerPlot then
+		return _abortEarly("missing player plot for terrain")
+	end
 	local gBounds, gTerrains = getGlobalBoundsForPlot(playerPlot)
 
 	local terrainSize = terrain.Size
@@ -1905,7 +1921,10 @@ function BuildingGeneratorModule.generateBuilding(
 			buildingId = zoneId .. "_" .. gridCoord.x .. "_" .. gridCoord.z
 		}
 		-- Overlay zones can arrive without a clean reservation/clear, so run an explicit guard.
-		if OverlayZoneTypes[mode] and impactedZones and next(impactedZones) then
+		-- Only enforce this for the square-only modes (the procedural/residential-style stuff) to avoid
+		-- blocking unique/non-square buildings.
+		local enforceFootprintGuard = OverlayZoneTypes[mode] and impactedZones and next(impactedZones) and SQUARE_ONLY_MODES[mode]
+		if enforceFootprintGuard then
 			local function _footprintBlocked()
 				return footprintHasBlockingOccupant(player, zoneId, gridCoord.x, gridCoord.z, rotatedWidth, rotatedDepth)
 			end
@@ -2118,11 +2137,6 @@ local function getPlayerFromInstance(inst : Instance)
 	return game:GetService("Players"):GetPlayerByUserId(uid)
 end
 
--- Modes where we only allow rotation if Stage3 footprint is square (n x n cells) or 180° flips otherwise
-local SQUARE_ONLY_MODES : { [string]: boolean } = {
-	Residential = true, Commercial = true, Industrial = true,
-	ResDense    = true, CommDense   = true, IndusDense   = true,
-}
 
 -- True if the building's Stage3 footprint at its current RotationY is n x n cells
 local function isSquareFootprint(buildingInstance : Instance) : boolean
@@ -2946,6 +2960,19 @@ function BuildingGeneratorModule.populateZone(
 
 		local buildingsList       = {}
 		local isUtility           = false
+		local function footprintOverlapsRoad(startX: number?, startZ: number?, width: number?, depth: number?)
+			if not (startX and startZ and width and depth) then
+				return false
+			end
+			for x = startX, startX + width - 1 do
+				for z = startZ, startZ + depth - 1 do
+					if ZoneTrackerModule.isGridOccupiedByOccupantType(player, x, z, "road") then
+						return true
+					end
+				end
+			end
+			return false
+		end
 
 		-- Mode routing (unchanged behavior)
 		if mode == "WaterTower" then
@@ -3211,27 +3238,38 @@ function BuildingGeneratorModule.populateZone(
 						rotForThis = CARDINALS[math.floor((rotForThis + 45) / 90) % 4 + 1]
 					end
 
-					BuildingGeneratorModule.generateBuilding(
-						terrain, parentFolder, player, zoneId, mode,
-						{ x = bData.gridX, z = bData.gridZ },
-						selected,
-						bData.isUtility,
-						rotForThis,
-						onBuildingPlaced,
-						cellWealth,
-						skipStages,
-						nil,
-						quotaCtx
-					)
+					-- If a road now occupies this saved footprint, skip restoring it.
+					local wCells, dCells = _stage3FootprintCells(selected.name or bData.buildingName, rotForThis)
+					local skipThisSaved = footprintOverlapsRoad(bData.gridX, bData.gridZ, wCells, dCells)
+					if skipThisSaved then
+						debugPrint(("[restore] skipping %s at (%d,%d) because of road overlap.")
+							:format(tostring(selected.name or bData.buildingName),
+								tonumber(bData.gridX) or -1, tonumber(bData.gridZ) or -1))
+					end
 
-					previewsPlaced += 1
-					table.insert(placedBuildingsData, {
-						buildingName = bData.buildingName,
-						rotation     = bData.rotation,
-						gridX        = bData.gridX,
-						gridZ        = bData.gridZ,
-						isUtility    = bData.isUtility
-					})
+					if not skipThisSaved then
+						BuildingGeneratorModule.generateBuilding(
+							terrain, parentFolder, player, zoneId, mode,
+							{ x = bData.gridX, z = bData.gridZ },
+							selected,
+							bData.isUtility,
+							rotForThis,
+							onBuildingPlaced,
+							cellWealth,
+							skipStages,
+							nil,
+							quotaCtx
+						)
+
+						previewsPlaced += 1
+						table.insert(placedBuildingsData, {
+							buildingName = bData.buildingName,
+							rotation     = bData.rotation,
+							gridX        = bData.gridX,
+							gridZ        = bData.gridZ,
+							isUtility    = bData.isUtility
+						})
+					end
 				else
 					warn("[BuildingGenerator] restore: failed to select/hydrate Stage3 for", bData.buildingName)
 				end

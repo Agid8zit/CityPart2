@@ -635,6 +635,10 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 	OverlapExclusions["WaterPipe"]   = true
 	OverlapExclusions["PowerLines"]  = true
 	OverlapExclusions["MetroTunnel"] = true
+	local OccupantTypeExclusions = {
+		power = true,
+		water = true,
+	}
 
 	-- === Roads can cross buildings ===
 	if RoadTypes[mode] then
@@ -650,6 +654,7 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 				player, coord.x, coord.z,
 				{
 					excludeZoneTypes    = OverlapExclusions,
+					excludeOccupantType = OccupantTypeExclusions,
 				}
 			)
 			if not occupied then
@@ -680,6 +685,7 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 					player, coord.x, coord.z,
 					{
 						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
 					}
 					) then
 					cIsValid = false
@@ -712,7 +718,10 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 			for _, coord in ipairs(component) do
 				if ZoneTrackerModule.isGridOccupied(
 					player, coord.x, coord.z,
-					{ excludeZoneTypes = OverlapExclusions }
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
 					) then
 					cIsValid = false
 					debugPrint(string.format("Grid (%d, %d) is occupied by a non-road zone. Excluding component.", coord.x, coord.z))
@@ -784,6 +793,11 @@ end
 function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 	debugPrint("Validating single grid for player:", player and player.Name or "nil", "Mode:", mode)
 
+	local OccupantTypeExclusions = {
+		power = true,
+		water = true,
+	}
+
 	if not isValidPlayer(player) then
 		warn("validateSingleGrid: Invalid player provided.")
 		pushLangNotification(player, "Cant overlap zones")
@@ -814,7 +828,10 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 
 		if ZoneTrackerModule.isGridOccupied(
 			player, gridPosition.x, gridPosition.z,
-			{ excludeZoneTypes = exclusions }
+			{
+				excludeZoneTypes    = exclusions,
+				excludeOccupantType = OccupantTypeExclusions,
+			}
 			) then
 			pushLangNotification(player, "Cant build on unique buildings")
 			return false, ("You cannot place %s on top of existing zones."):format(mode)
@@ -840,6 +857,7 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 			player, gridPosition.x, gridPosition.z,
 			{
 				excludeZoneTypes    = exclusions,
+				excludeOccupantType = OccupantTypeExclusions,
 			}
 		)
 		if blocked then
@@ -850,7 +868,10 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 	end
 
 	-- Default
-	if ZoneTrackerModule.isGridOccupied(player, gridPosition.x, gridPosition.z) then
+	if ZoneTrackerModule.isGridOccupied(
+		player, gridPosition.x, gridPosition.z,
+		{ excludeOccupantType = OccupantTypeExclusions }
+	) then
 		warn(string.format("validateSingleGrid: Grid position (%d, %d) is already occupied.", gridPosition.x, gridPosition.z))
 		pushLangNotification(player, "Cant overlap zones")
 		return false, "Selected grid is already occupied."
@@ -925,6 +946,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 		OverlapExclusions["WaterPipe"]   = true
 		OverlapExclusions["PowerLines"]  = true
 		OverlapExclusions["MetroTunnel"] = true
+		local OccupantTypeExclusions = {
+			power = true,
+			water = true,
+		}
 
 		-- Utilities: commit as-is
 		if mode == "WaterPipe" or mode == "PowerLines" or mode == "MetroTunnel" then
@@ -953,7 +978,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 			for zt,_ in pairs(BuildZoneTypes) do exclusions[zt] = true end
 
 			for _, c in ipairs(gridList) do
-				if ZoneTrackerModule.isGridOccupied(player, c.x, c.z, { excludeZoneTypes = exclusions }) then
+				if ZoneTrackerModule.isGridOccupied(
+					player, c.x, c.z,
+					{
+						excludeZoneTypes    = exclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
+				) then
 					pushLangNotification(player, "Cant build on unique buildings")
 					return false, ("You cannot place %s on top of existing zones."):format(mode)
 				end
@@ -981,7 +1012,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 				-- Keep building occupants in the check so overlay/IgnoreValidation zones remain blocking.
 				local blocked = ZoneTrackerModule.isGridOccupied(
 					player, c.x, c.z,
-					{ excludeZoneTypes = OverlapExclusions }
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
 				)
 				if not blocked then table.insert(filtered, c) end
 			end
@@ -1001,7 +1035,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 				for _, c in ipairs(comp) do
 					local blocked = ZoneTrackerModule.isGridOccupied(
 						player, c.x, c.z,
-						{ excludeZoneTypes = OverlapExclusions }
+						{
+							excludeZoneTypes    = OverlapExclusions,
+							excludeOccupantType = OccupantTypeExclusions,
+						}
 					)
 					if blocked then
 						pushLangNotification(player, "Cant build on roads")
@@ -1032,7 +1069,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 			-- ensure cells not occupied by non-excluded things
 			local compOk = true
 			for _, c in ipairs(comp) do
-				if ZoneTrackerModule.isGridOccupied(player, c.x, c.z, { excludeZoneTypes = OverlapExclusions }) then
+				if ZoneTrackerModule.isGridOccupied(
+					player, c.x, c.z,
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
+				) then
 					compOk = false; break
 				end
 			end

@@ -56,19 +56,31 @@ local function isOwner(player: Player, zoneId: string): boolean
 end
 
 local function computeAgeSeconds(player: Player, zoneId: string, zoneData)
-	if typeof(zoneData) == "table" then
-		local createdAt = zoneData.createdAt
-		if typeof(createdAt) == "number" and createdAt > 0 then
-			return os.time() - createdAt
+	local populated = zoneData and zoneData.requirements and zoneData.requirements.Populated
+	local startAt = ZoneTracker.getRefundClockAt(player, zoneId)
+	if not startAt and typeof(zoneData) == "table" then
+		startAt = zoneData.refundClockAt
+		if not startAt and populated then
+			startAt = zoneData.createdAt
 		end
+	end
+
+	if typeof(startAt) == "number" and startAt > 0 then
+		return math.max(0, os.time() - startAt)
+	end
+
+	-- If never populated, do NOT fall back to XP timestamps; window hasn’t started.
+	if not populated then
+		return 0
 	end
 
 	local awardedAt = XPManager.getZoneAwardTimestamp(player, zoneId)
 	if typeof(awardedAt) == "number" and awardedAt > 0 then
-		return os.time() - awardedAt
+		return math.max(0, os.time() - awardedAt)
 	end
 
-	return math.huge
+	-- No population yet => treat as age 0 so refund window hasn’t started
+	return 0
 end
 
 local function computeCoinRefund(mode, cost, ageSeconds)

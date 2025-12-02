@@ -219,6 +219,80 @@ end
 -- Track which placeholder each player is using so we can
 local assignedPlaceholders = {}
 
+local function getPlaceholderOwnerId(placeholder: Model?): number?
+	if not placeholder then return nil end
+	local ownerAttr = placeholder:GetAttribute("AssignedOwnerId")
+	if typeof(ownerAttr) == "number" then
+		return ownerAttr
+	end
+	return nil
+end
+
+local function claimPlaceholderForPlayer(player: Player, placeholder: Model?)
+	if not (player and placeholder) then return end
+	assignedPlaceholders[player.UserId] = placeholder
+	placeholder:SetAttribute("Assigned", true)
+	placeholder:SetAttribute("AssignedOwnerId", player.UserId)
+	placeholder.Parent = nil
+end
+
+local function releasePlaceholder(placeholder: Model?)
+	if not placeholder then return end
+	placeholder:SetAttribute("Assigned", false)
+	placeholder:SetAttribute("AssignedOwnerId", nil)
+	placeholder.Parent = placeholderPlotsFolder
+end
+
+local function findPlaceholderForPlayer(player: Player, plot: Model?): Model?
+	if not player then return nil end
+
+	-- 1) Prefer explicit owner tag.
+	for _, placeholder in ipairs(placeholderPlots) do
+		if getPlaceholderOwnerId(placeholder) == player.UserId then
+			return placeholder
+		end
+	end
+
+	-- 2) Fall back to the nearest assigned placeholder to the plot's pivot, then to nearest free one.
+	if plot then
+		local pivot = plot:GetPivot()
+		local pivotPos = pivot.Position
+
+		local function nearestPlaceholder(filterFn)
+			local best, bestDistSq
+			for _, placeholder in ipairs(placeholderPlots) do
+				if filterFn(placeholder) then
+					local anchor = resolvePlacementPrimaryPart(placeholder)
+					local pos = anchor and anchor.Position or (placeholder.PrimaryPart and placeholder.PrimaryPart.Position)
+					if pos then
+						local distSq = (pos - pivotPos).Magnitude ^ 2
+						if not best or distSq < bestDistSq then
+							best = placeholder
+							bestDistSq = distSq
+						end
+					end
+				end
+			end
+			return best
+		end
+
+		local best = nearestPlaceholder(function(ph)
+			if not ph:GetAttribute("Assigned") then return false end
+			local owner = getPlaceholderOwnerId(ph)
+			return (owner == nil) or (owner == player.UserId)
+		end)
+		if best then
+			return best
+		end
+
+		return nearestPlaceholder(function(ph)
+			return not ph:GetAttribute("Assigned")
+		end)
+	end
+
+	return nil
+end
+
 local function disableQueryingInPlot(plotModel)
 	-- Set CanQuery = false on the model itself if applicable
 	if plotModel:IsA("BasePart") then
@@ -279,9 +353,99 @@ end
 
 assert(ServerStorage.PlotTemplates.TestTerrain.PrimaryPart, "Missing PrimaryPart for ServerStorage/PlotTemplates/TestTerrain")
 
+local function connectTeleportHandlers(player: Player, playerPlot: Model)
+	local function onCharacterAdded(character)
+
+		local Timeout = os.time() + 10
+		while not character.PrimaryPart
+			and not character:FindFirstChildWhichIsA("Humanoid")
+			and not character:IsDescendantOf(workspace)
+		do
+			if os.time() > Timeout then return end
+			task.wait()
+		end
+
+		game:GetService("RunService").Stepped:Wait()
+
+		teleportPlayerToPlot(player, playerPlot)
+	end
+
+	player.CharacterAdded:Connect(onCharacterAdded)
+	player.CharacterAppearanceLoaded:Connect(onCharacterAdded)
+
+	if player.Character then
+		onCharacterAdded(player.Character)
+	end
+end
+
 -- Event: Player Added
 Players.PlayerAdded:Connect(function(player)
-	--print(string.format("PlayerAdded: '%s' has joined the game.", player.Name))
+	local userId = player.UserId
+	local existingPlots = {}
+	for _, model in ipairs(plotsFolder:GetChildren()) do
+		if model:IsA("Model") and model.Name == ("Plot_" .. userId) then
+			existingPlots[#existingPlots + 1] = model
+		end
+	end
+
+	-- If a plot already exists for this user, reuse it instead of cloning a new one.
+	if #existingPlots > 0 then
+		table.sort(existingPlots, function(a, b)
+			return #a:GetDescendants() > #b:GetDescendants()
+		end)
+
+		local playerPlot = existingPlots[1]
+
+		-- Clear any stray duplicates for this player.
+		for i = 2, #existingPlots do
+			local extra = existingPlots[i]
+			local extraPlaceholder = findPlaceholderForPlayer(player, extra)
+			if extraPlaceholder then
+				releasePlaceholder(extraPlaceholder)
+			end
+			extra:Destroy()
+			warn(("PlotAssigner: Removed duplicate plot '%s' for %s"):format(extra.Name, player.Name))
+		end
+
+		local placeholder = findPlaceholderForPlayer(player, playerPlot)
+		if placeholder then
+			claimPlaceholderForPlayer(player, placeholder)
+		end
+
+		disableQueryingInPlot(playerPlot)
+		playerPlot:SetAttribute("IsPlayerPlot", true)
+		playerPlot:SetAttribute("PlotOwnerId", userId)
+
+		if not playerPlot.PrimaryPart then
+			local primaryName = playerPlot:GetAttribute("PrimaryPartName")
+			if typeof(primaryName) == "string" then
+				local found = playerPlot:FindFirstChild(primaryName, true)
+				if found and found:IsA("BasePart") then
+					playerPlot.PrimaryPart = found
+				end
+			end
+		end
+
+		if playerPlot.PrimaryPart and not playerPlot:GetAttribute("PrimaryPartName") then
+			playerPlot:SetAttribute("PrimaryPartName", playerPlot.PrimaryPart.Name)
+		end
+
+		setPlotOddEvenAttributes(playerPlot)
+		local axisDirX = playerPlot:GetAttribute("GridAxisDirX") or 1
+		local axisDirZ = playerPlot:GetAttribute("GridAxisDirZ") or 1
+		GridConfig.setAxisDirectionsForPlot(playerPlot, axisDirX, axisDirZ)
+
+		local roadStart = playerPlot:FindFirstChild("RoadStart")
+		if roadStart then
+			GridConfig.setStableAnchorFromPart(roadStart)
+		end
+
+		PlotDataModule:AssignPlot(player, playerPlot)
+		player:SetAttribute("PlotName", playerPlot.Name)
+		connectTeleportHandlers(player, playerPlot)
+		plotAssignedBE:Fire(player, playerPlot)
+		return
+	end
 
 	-- Find the next available placeholder plot
 	local placeholder = getNextAvailablePlot()
@@ -295,10 +459,10 @@ Players.PlayerAdded:Connect(function(player)
 	-- Clone the plot template
 	local playerPlot = plotTemplate:Clone()
 	disableQueryingInPlot(playerPlot)
-	playerPlot.Name = "Plot_" .. player.UserId
+	playerPlot.Name = "Plot_" .. userId
 	playerPlot:SetAttribute("IsPlayerPlot", true)
-	playerPlot:SetAttribute("PlotOwnerId", player.UserId)
-	playerPlot.OwnerSign.SurfaceGui.TextLabel.Text = player.Name.."'s Plot"
+	playerPlot:SetAttribute("PlotOwnerId", userId)
+	playerPlot.OwnerSign.SurfaceGui.TextLabel.Text = player.Name.."'s Plot"
 	playerPlot.Parent = plotsFolder
 
 	local buildingsFolder = Instance.new("Folder")
@@ -320,65 +484,6 @@ Players.PlayerAdded:Connect(function(player)
 	local PowerLinesZonesFolder = Instance.new("Folder")
 	PowerLinesZonesFolder.Name = "PowerLinesZones"
 	PowerLinesZonesFolder.Parent = playerPlot
-
-	-- Ensure the template has a PrimaryPart set
-	--if not playerPlot.PrimaryPart then
-	--	local firstPart = playerPlot:FindFirstChildWhichIsA("BasePart", true)
-	--	if firstPart then
-	--		playerPlot.PrimaryPart = firstPart
-	--		print(string.format("Set PrimaryPart of plot '%s' to '%s'.", playerPlot.Name, firstPart.Name))
-	--	else
-	--		warn("PlotAssigner: Plot template has no BaseParts to set as PrimaryPart.")
-	--		playerPlot:Destroy()
-	--		return
-	--	end
-	--end
-
-
-
-	local function disableQueryingInPlot(plotModel)
-		-- Set CanQuery = false on the model itself if applicable
-		if plotModel:IsA("BasePart") then
-			plotModel.CanQuery = false
-		end
-
-		-- Set CanQuery = false for all BaseParts in the model
-		for _, descendant in ipairs(plotModel:GetDescendants()) do
-			if descendant:IsA("BasePart") then
-				descendant.CanQuery = false
-			end
-		end
-
-		-- Specifically disable CanQuery in NatureZones
-		local natureZones = plotModel:FindFirstChild("NatureZones")
-		if natureZones then
-			for _, obj in ipairs(natureZones:GetDescendants()) do
-				if obj:IsA("BasePart") then
-					obj.CanQuery = false
-				end
-			end
-		end
-
-		-- Disable CanQuery in Unlocks > Unlock# > Segment#
-		local unlocksFolder = plotModel:FindFirstChild("Unlocks")
-		if unlocksFolder then
-			for _, unlock in ipairs(unlocksFolder:GetChildren()) do
-				if unlock:IsA("Model") then
-					for _, segment in ipairs(unlock:GetChildren()) do
-						if segment:IsA("Model") then
-							for _, part in ipairs(segment:GetDescendants()) do
-								if part:IsA("BasePart") then
-									part.CanQuery = false
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-
-
 
 	-- Set an attribute to inform the client of the PrimaryPart
 	playerPlot:SetAttribute("PrimaryPartName", playerPlot.PrimaryPart.Name)
@@ -408,84 +513,45 @@ Players.PlayerAdded:Connect(function(player)
 	playerPlot:SetAttribute("GridAxisDirZ", axisDirZ)
 	GridConfig.setAxisDirectionsForPlot(playerPlot, axisDirX, axisDirZ)
 
-	local GridConfigServer = require(ReplicatedStorage.Scripts.Grid.GridConfig)
-
 	local roadStart = playerPlot:WaitForChild("RoadStart", 2)
 	if roadStart then
-		GridConfigServer.setStableAnchorFromPart(roadStart)
+		GridConfig.setStableAnchorFromPart(roadStart)
 	else
 		warn("PlotAssigner: RoadStart missing on "..playerPlot.Name)
 	end
 
-	--playerPlot:SetPrimaryPartCFrame(placeholder.PrimaryPart.CFrame)
 	log(string.format("Assigned plot '%s' to placeholder '%s'.", playerPlot.Name, placeholder.Name))
 
 	-- Assign the plot using the PlotDataModule
 	PlotDataModule:AssignPlot(player, playerPlot)
 
 	-- Mark the placeholder as assigned and remove it from the workspace
-	placeholder:SetAttribute("Assigned", true)
-	assignedPlaceholders[player.UserId] = placeholder
-	placeholder.Parent = nil  -- Removes the placeholder model from Workspace
+	claimPlaceholderForPlayer(player, placeholder)
 
 	-- Set the player's PlotName attribute so that the unlock manager can find the plot later.
 	player:SetAttribute("PlotName", playerPlot.Name)
 
-	-- Function to handle teleportation when the character is added
-	local function onCharacterAdded(character)
-
-		local Timeout = os.time() + 10
-		while not character.PrimaryPart
-			and not character:FindFirstChildWhichIsA("Humanoid")
-			and not character:IsDescendantOf(workspace)
-		do
-			if os.time() > Timeout then return end
-			task.wait()
-		end
-
-		game:GetService("RunService").Stepped:Wait()
-
-		teleportPlayerToPlot(player, playerPlot)
-
-		--print(string.format("CharacterAdded: '%s' character spawned.", player.Name))
-		-- Use a coroutine to ensure teleportation happens after a short delay
-		--coroutine.wrap(function()
-		--	-- Small delay to ensure character parts are fully loaded
-		--	task.wait(1)
-		--	teleportPlayerToPlot(player, playerPlot)
-		--end)()
-	end
-
-	-- Connect CharacterAdded before checking if player.Character exists
-	player.CharacterAdded:Connect(onCharacterAdded)
-	player.CharacterAppearanceLoaded:Connect(onCharacterAdded)
-
-	-- If the character already exists, teleport them immediately
-	if player.Character then
-		onCharacterAdded(player.Character)
-	end
-
-	-- Notify the client about the assigned plot using its name
-	--plotAssignedEvent:FireClient(player, playerPlot.Name)
+	connectTeleportHandlers(player, playerPlot)
 
 	-- Fire the BindableEvent to notify server-side modules
 	plotAssignedBE:Fire(player, playerPlot)
-
-	--print(string.format("PlotAssigner: Assigned plot '%s' to player '%s' at placeholder '%s'.", playerPlot.Name, player.Name, placeholder.Name))
 end)
-
 local function cleanupPlotForPlayer(player)
-	-- The body below is 100 % identical to what you had inside
-	-- Players.PlayerRemoving.  Only indentation was changed.
 	local plot = PlotDataModule:GetPlot(player)
 	if plot then
 		-- restore placeholder
-		local placeholder = assignedPlaceholders[player.UserId]
+		local placeholder = assignedPlaceholders[player.UserId] or findPlaceholderForPlayer(player, plot)
 		if placeholder then
-			placeholder.Parent = placeholderPlotsFolder
-			placeholder:SetAttribute("Assigned", false)
+			releasePlaceholder(placeholder)
 			assignedPlaceholders[player.UserId] = nil
 			log(string.format("Cleared assignment and restored placeholder '%s'.", placeholder.Name))
+		end
+
+		-- Also release any other placeholders tagged for this user (defensive).
+		for _, ph in ipairs(placeholderPlots) do
+			if ph ~= placeholder and getPlaceholderOwnerId(ph) == player.UserId then
+				releasePlaceholder(ph)
+			end
 		end
 
 		-- destroy cloned plot

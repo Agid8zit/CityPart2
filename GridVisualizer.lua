@@ -514,10 +514,21 @@ end
 
 local zoneHighlights = {}
 
-local function clearZoneHighlights()
-	for _, part in ipairs(zoneHighlights) do
+-- Restore a grid part to either its guarded highlight or its base styling.
+local function restoreGridVisual(part)
+	if not part then return end
+	if guardMarks[part] then
+		part.Color = YELLOW
+		part.Transparency = 0.3
+	else
 		part.Color        = part:GetAttribute("BaseColor") or part.Color
 		part.Transparency = GRID_TRANSPARENCY
+	end
+end
+
+local function clearZoneHighlights()
+	for _, part in ipairs(zoneHighlights) do
+		restoreGridVisual(part)
 	end
 	zoneHighlights = {}
 end
@@ -561,8 +572,7 @@ end
 -- CLEAR FOOTPRINT HIGHLIGHTS
 local function clearFootprintHighlights()
 	for _, part in ipairs(highlightSquares) do
-		part.Color = part:GetAttribute("BaseColor") or part.Color
-		part.Transparency = GRID_TRANSPARENCY
+		restoreGridVisual(part)
 	end
 	highlightSquares = {}
 end
