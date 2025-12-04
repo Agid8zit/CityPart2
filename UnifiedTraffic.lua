@@ -132,6 +132,56 @@ local MAX_NEAR_ZONE_SINKS       = 16
 --   "OriginToSinks"        -> legacy behavior (SOURCE_COORD -> sinks [+ optional mirror])
 local DISPATCH_MODE = "ZoneToOriginAndBack"
 
+local TrafficTierConfig = {
+	["desktop-high"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC,
+		maxConcurrent    = MAX_CONCURRENT_PER_PLAYER,
+		tokenRate        = TOKEN_BUCKET_RATE,
+		tokenMax         = TOKEN_BUCKET_MAX,
+		maxNearZoneSinks = MAX_NEAR_ZONE_SINKS,
+		dispatchMode     = DISPATCH_MODE,
+	},
+	["desktop-balanced"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.2,
+		maxConcurrent    = math.max(6, math.floor(MAX_CONCURRENT_PER_PLAYER * 0.8 + 0.5)),
+		tokenRate        = TOKEN_BUCKET_RATE * 0.9,
+		tokenMax         = math.max(3, TOKEN_BUCKET_MAX - 1),
+		maxNearZoneSinks = math.max(10, MAX_NEAR_ZONE_SINKS - 4),
+		dispatchMode     = "ZoneToOriginOnly",
+	},
+	["desktop-low"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.35,
+		maxConcurrent    = math.max(4, math.floor(MAX_CONCURRENT_PER_PLAYER * 0.6 + 0.5)),
+		tokenRate        = TOKEN_BUCKET_RATE * 0.7,
+		tokenMax         = math.max(2, TOKEN_BUCKET_MAX - 2),
+		maxNearZoneSinks = math.max(8, MAX_NEAR_ZONE_SINKS - 6),
+		dispatchMode     = "ZoneToOriginOnly",
+	},
+	["mobile-low"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.6,
+		maxConcurrent    = 4,
+		tokenRate        = TOKEN_BUCKET_RATE * 0.5,
+		tokenMax         = 2,
+		maxNearZoneSinks = math.max(6, math.floor(MAX_NEAR_ZONE_SINKS * 0.5 + 0.5)),
+		dispatchMode     = "OriginToSinks",
+	},
+}
+
+local function perfTier(player)
+	local t = player and player:GetAttribute("PerfTier")
+	if t == "mobile" then return "mobile-low" end
+	if t == "desktop" then return "desktop-high" end
+	if t == "desktop-high" or t == "desktop-balanced" or t == "desktop-low" or t == "mobile-low" then
+		return t
+	end
+	return "desktop-high"
+end
+
+local function trafficConfigFor(player)
+	local tier = perfTier(player)
+	return TrafficTierConfig[tier] or TrafficTierConfig["desktop-high"]
+end
+
 --======================================================================
 --  STATE
 --======================================================================
@@ -150,6 +200,28 @@ local variantsWithSiren    = { Fire = true, Police = true, Health = true }
 local activeAmbienceCount  = 0
 local activeSirenCount     = 0
 local lastHornAt           = 0
+
+local function applyTrafficConfig(ctx, player)
+	if not ctx then return end
+	local cfg = trafficConfigFor(player)
+	-- cache tier string on cfg so we can check changes
+	local tier = perfTier(player)
+	if ctx._tier == tier and ctx.config == cfg then return end
+	ctx._tier = tier
+	ctx.config = cfg
+	-- clamp tokens and live counts to the new caps
+	ctx.tokens = math.min(cfg.tokenMax or TOKEN_BUCKET_MAX, ctx.tokens or 0)
+	if ctx.carCount and cfg.maxConcurrent and ctx.carCount > cfg.maxConcurrent then
+		ctx.carCount = cfg.maxConcurrent
+	end
+end
+
+local function currentDispatchMode(ctx)
+	if ctx and ctx.config and ctx.config.dispatchMode then
+		return ctx.config.dispatchMode
+	end
+	return DISPATCH_MODE
+end
 
 local templates = {
 	default = {},
@@ -247,9 +319,12 @@ end
 
 -- Token bucket
 local function addTokens(ctx)
+	local cfg = ctx and ctx.config or TrafficTierConfig["desktop-high"]
 	local t = os.clock()
 	local dt = t - (ctx.last or t)
-	ctx.tokens = math.min(TOKEN_BUCKET_MAX, (ctx.tokens or 0) + dt * TOKEN_BUCKET_RATE)
+	local rate = cfg.tokenRate or TOKEN_BUCKET_RATE
+	local max  = cfg.tokenMax  or TOKEN_BUCKET_MAX
+	ctx.tokens = math.min(max, (ctx.tokens or 0) + dt * rate)
 	ctx.last = t
 end
 local function trySpend(ctx, cost)
@@ -835,7 +910,9 @@ end
 
 local function collectNearZoneSinks(player, ctx)
 	ctx = ctx or ensureCtx(player)
+	applyTrafficConfig(ctx, player)
 	local sinks, count = {}, 0
+	local cap = (ctx.config and ctx.config.maxNearZoneSinks) or MAX_NEAR_ZONE_SINKS
 	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
 		if z.mode ~= "DirtRoad" and z.mode ~= "Pavement" and z.mode ~= "Highway" then
 			local center = zoneCenterCoord(z)
@@ -844,7 +921,7 @@ local function collectNearZoneSinks(player, ctx)
 				if near and nodeOwnedByPlayer(player, near.key, ctx) then
 					sinks[#sinks+1] = { x = near.x, z = near.z }
 					count += 1
-					if count >= MAX_NEAR_ZONE_SINKS then break end
+					if count >= cap then break end
 				end
 			end
 		end
@@ -948,13 +1025,15 @@ end
 local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel, spawnConfig)
 	if ctx.suspended then return end
 	if not worldPath or #worldPath < 2 then return end
+	applyTrafficConfig(ctx, player)
+	local cfg = ctx.config or trafficConfigFor(player)
 	local skipTokens    = spawnConfig and spawnConfig.skipTokens
 	local skipCarLimit  = spawnConfig and spawnConfig.skipCarLimit
 	if not skipTokens and not trySpend(ctx, 1.0) then return end
 
 	if not skipCarLimit then
 		local live = ctx.carCount or 0
-		if live >= MAX_CONCURRENT_PER_PLAYER then return end
+		if live >= (cfg.maxConcurrent or MAX_CONCURRENT_PER_PLAYER) then return end
 	end
 
 	local template, chosenVariant = pickTemplateForPlayer(player)
@@ -1042,7 +1121,8 @@ local function spawnOnceZoneToOriginMode(player, ctx)
 	local worldPath = worldPathFor(ctx.plot, gridPath)
 	spawnCarAlongPath(player, ctx, gridPath, worldPath, nil)
 
-	if DISPATCH_MODE ~= "ZoneToOriginAndBack" then return end
+	local mode = currentDispatchMode(ctx)
+	if mode ~= "ZoneToOriginAndBack" then return end
 	local revGrid = reversedGridPath(gridPath)
 	if not revGrid or #revGrid < MIN_PATH_CELLS then return end
 	local revWorld = worldPathFor(ctx.plot, revGrid)
@@ -1051,7 +1131,8 @@ local function spawnOnceZoneToOriginMode(player, ctx)
 end
 
 local function spawnOnce(player, ctx)
-	if DISPATCH_MODE == "OriginToSinks" then
+	local mode = currentDispatchMode(ctx or ensureCtx(player))
+	if mode == "OriginToSinks" then
 		return spawnOnceOriginToSinksMode(player, ctx)
 	else
 		return spawnOnceZoneToOriginMode(player, ctx)
@@ -1137,17 +1218,18 @@ local recomputeQueued = {} -- [uid] = true
 function ensureCtx(player)
 	local uid = player.UserId
 	local ctx = ctxByUserId[uid]
+	local cfg = trafficConfigFor(player)
 	if not ctx then
 		ctx = {
 			plot = getPlotForUserId(uid),
 			suspended = false,
-			tokens = TOKEN_BUCKET_MAX * 0.5,
+			tokens = (cfg.tokenMax or TOKEN_BUCKET_MAX) * 0.5,
 			last = os.clock(),
 			cars = {},
 			carCount = 0,
 			sinks = {},
 			zoneSources = {},
-			nextSpawnAt = os.clock() + math.random() * RANDOM_JITTER_SEC,
+			nextSpawnAt = os.clock() + (cfg.spawnInterval or SPAWN_INTERVAL_SEC) + math.random() * RANDOM_JITTER_SEC,
 
 			-- [DRIVE MODE] per-player session
 			drive = nil, -- { active=bool, loopTask=thread, startPos=Vector3 }
@@ -1155,6 +1237,9 @@ function ensureCtx(player)
 		}
 		ctxByUserId[uid] = ctx
 	end
+	ctx.config = cfg
+	ctx._tier = perfTier(player)
+	applyTrafficConfig(ctx, player)
 	-- keep a reference to player (for camera reset on stop)
 	ctx.player = player
 	if not ctx.plot or ctx.plot.Parent == nil then
@@ -1166,11 +1251,13 @@ end
 local function recomputeForPlayer(player)
 	local ctx = ensureCtx(player)
 	if ctx.suspended then return end
+	applyTrafficConfig(ctx, player)
 	refreshOwnRoadZones(player, ctx)
 
 	if originLiveForPlayer(player, ctx) then
 		ensureBfsSnapshot(player, ctx)
-		if DISPATCH_MODE == "OriginToSinks" then
+		local mode = currentDispatchMode(ctx)
+		if mode == "OriginToSinks" then
 			ctx.sinks = computeSinksForPlayer(player, ctx)
 			ctx.zoneSources = {}
 			dprint(("Player %s sinks=%d (origin->sinks mode)"):format(player.Name, #ctx.sinks))
@@ -1205,6 +1292,7 @@ local function ensureSpawnLoop(player)
 	if ctx.spawnLoop then return end
 	ctx.spawnLoop = task.spawn(function()
 		while Players:GetPlayerByUserId(uid) do
+			applyTrafficConfig(ctx, player)
 			if ctx.suspended then
 				task.wait(0.5)
 			else
@@ -1212,7 +1300,8 @@ local function ensureSpawnLoop(player)
 				local nextAt = ctx.nextSpawnAt or now
 				if now >= nextAt then
 					pcall(function() spawnOnce(player, ctx) end)
-					ctx.nextSpawnAt = os.clock() + SPAWN_INTERVAL_SEC + math.random() * RANDOM_JITTER_SEC
+					local cfg = ctx.config or trafficConfigFor(player)
+					ctx.nextSpawnAt = os.clock() + (cfg.spawnInterval or SPAWN_INTERVAL_SEC) + math.random() * RANDOM_JITTER_SEC
 				else
 					task.wait(math.min(nextAt - now, 0.5))
 				end
@@ -1547,5 +1636,6 @@ task.spawn(function()
 	end
 end)
 
+local defaultDispatchMode = (TrafficTierConfig["desktop-high"] and TrafficTierConfig["desktop-high"].dispatchMode) or DISPATCH_MODE
 print(("[UnifiedTraffic] online - DispatchMode=%s; origin=(%d,%d) - Bus/Service variants (Fire/Police/Health/Trash) where supported")
-	:format(DISPATCH_MODE, SOURCE_COORD.x, SOURCE_COORD.z))
+	:format(defaultDispatchMode, SOURCE_COORD.x, SOURCE_COORD.z))

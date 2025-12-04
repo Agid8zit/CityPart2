@@ -5,7 +5,29 @@ local Workspace         = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Debris            = game:GetService("Debris")
 local RunService        = game:GetService("RunService")
-local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceScheduler)
+
+-- Safe scheduler: if the shared scheduler errors (e.g., RenderStepped on server), fall back to direct RunService.
+local RunServiceScheduler
+do
+	local ok, sched = pcall(function()
+		-- Prefer the shared scheduler if present
+		local scripts = ReplicatedStorage:FindFirstChild("Scripts")
+		local mod = scripts and scripts:FindFirstChild("RunServiceScheduler")
+		return mod and require(mod) or require(ReplicatedStorage.Scripts.RunServiceScheduler)
+	end)
+	if ok and sched then
+		RunServiceScheduler = sched
+	else
+		warn("[CivilianSpawner] RunServiceScheduler unavailable; using direct RunService fallback. Error:", sched)
+		RunServiceScheduler = {
+			onHeartbeat = function(cb) return RunService.Heartbeat:Connect(cb) end,
+			onStepped   = function(cb) return RunService.Stepped:Connect(cb) end,
+			onRenderStepped = function()
+				error("[CivilianSpawner] RenderStepped is client-only; fallback does not support it on the server.")
+			end,
+		}
+	end
+end
 
 local GridConfig        = require(ReplicatedStorage.Scripts.Grid.GridConfig)
 local GridUtil          = require(ReplicatedStorage.Scripts.Grid.GridUtil)
@@ -37,6 +59,7 @@ local CiviliansFolder   = ReplicatedStorage:WaitForChild("FuncTestGroundRS"):Wai
 local zoneCellsCache   = {}
 local zoneCellsVersion = {}
 local zoneSnapshotCache = {}
+local zoneOwner        = {}   -- zoneKey -> Player (for deferred maintain)
 
 local civTemplates = {}
 local function refreshCivTemplates()
@@ -52,6 +75,13 @@ end)
 CiviliansFolder.ChildRemoved:Connect(function()
 	task.defer(refreshCivTemplates)
 end)
+
+local function yieldEveryN(counter: number, interval: number?)
+	interval = interval or 200
+	if interval > 0 and counter % interval == 0 then
+		task.wait()
+	end
+end
 
 local CFG = {
 	-- populations
@@ -92,6 +122,66 @@ local CFG = {
 	DespawnAtTargetEdge      = true,  -- NEW: clip final waypoint to the border outside the destination zone
 	DespawnEdgePreferAlign   = true,  -- NEW: bias dest-edge pick toward final approach vector
 }
+
+local function mergeCfg(base, override)
+	local out = {}
+	for k, v in pairs(base) do out[k] = v end
+	for k, v in pairs(override) do out[k] = v end
+	return out
+end
+
+local CFG_BY_TIER = {
+	["desktop-high"] = CFG,
+	["desktop-balanced"] = mergeCfg(CFG, {
+		GlobalMaxAlive       = 32,
+		ServerGlobalMaxAlive = 110,
+		LifeSeconds          = 200,
+		TTLJitterSeconds     = 45,
+		GridStrideCells      = 4,
+		FallbackMaxNodes     = 14000,
+		MaxUnparentPerStep   = 14,
+		MaxDestroyPerStep    = 7,
+	}),
+	["desktop-low"] = mergeCfg(CFG, {
+		GlobalMaxAlive       = 26,
+		ServerGlobalMaxAlive = 95,
+		LifeSeconds          = 160,
+		TTLJitterSeconds     = 40,
+		GridStrideCells      = 4,
+		FallbackMaxNodes     = 10000,
+		MaxUnparentPerStep   = 12,
+		MaxDestroyPerStep    = 6,
+	}),
+	["mobile-low"] = mergeCfg(CFG, {
+		GlobalMaxAlive       = 18,
+		ServerGlobalMaxAlive = 80,
+		LifeSeconds          = 130,
+		TTLJitterSeconds     = 35,
+		GridStrideCells      = 5,
+		FallbackMaxNodes     = 8000,
+		MaxUnparentPerStep   = 10,
+		MaxDestroyPerStep    = 5,
+	}),
+}
+
+local function perfTier(player)
+	local t = player and player:GetAttribute("PerfTier")
+	if t == "mobile" then return "mobile-low" end
+	if t == "desktop" then return "desktop-high" end
+	if t == "desktop-high" or t == "desktop-balanced" or t == "desktop-low" or t == "mobile-low" then
+		return t
+	end
+	return "desktop-high"
+end
+
+local function cfgForPlayer(player)
+	return CFG_BY_TIER[perfTier(player)] or CFG
+end
+
+local function cfgForZoneKey(zKey)
+	local owner = zoneOwner[zKey]
+	return cfgForPlayer(owner)
+end
 
 local function dprint(...) if CFG.Debug then print("[CivilianSpawner]", ...) end end
 local function dwarn (...) if CFG.Debug then warn ("[CivilianSpawner]", ...) end end
@@ -475,7 +565,7 @@ local function buildFallbackEdgePath(plot, player, srcZone, srcZoneId, dstZone, 
 		blocked        = blocked,
 		allowDiagonals = true,
 		noCornerCut    = true,
-		maxNodes       = CFG.FallbackMaxNodes,
+		maxNodes       = cfgForPlayer(player).FallbackMaxNodes,
 	})
 	if not gpath or #gpath < 2 then
 		return nil
@@ -524,7 +614,6 @@ end
 local alivePerZone     = {}   -- zoneKey -> current alive
 local targetPerZone    = {}   -- zoneKey -> desired steady-state
 local zoneActive       = {}   -- zoneKey -> bool
-local zoneOwner        = {}   -- zoneKey -> Player (for deferred maintain)
 local civByZone        = {}   -- zoneKey -> { [Model]=true }
 local civFolderByZone  = {}   -- zoneKey -> Folder
 local folderWatcher    = {}   -- zoneKey -> RBXScriptConnection
@@ -538,15 +627,17 @@ local function serverAliveCount()
 	return total
 end
 
-local function globalCapEnabled()
-	return (CFG.GlobalMaxAlive and CFG.GlobalMaxAlive > 0)
+local function globalCapEnabled(cfg)
+	cfg = cfg or CFG
+	return (cfg.GlobalMaxAlive and cfg.GlobalMaxAlive > 0)
 end
 
 local function getTargetForKey(zKey)
+	local cfg = cfgForZoneKey(zKey)
 	local t = targetPerZone[zKey]
 	if not t then
-		t = math.random(math.min(CFG.TargetMin, CFG.TargetMax), math.max(CFG.TargetMin, CFG.TargetMax))
-		targetPerZone[zKey] = math.clamp(t, 0, CFG.MaxAlivePerZone)
+		t = math.random(math.min(cfg.TargetMin, cfg.TargetMax), math.max(cfg.TargetMin, cfg.TargetMax))
+		targetPerZone[zKey] = math.clamp(t, 0, cfg.MaxAlivePerZone)
 	end
 	return targetPerZone[zKey]
 end
@@ -576,19 +667,20 @@ local function decAlive(zKey, n)
 	end
 end
 local function canSpawn(zKey)
-	if CFG.ServerGlobalMaxAlive and CFG.ServerGlobalMaxAlive > 0 then
-		if serverAliveCount() >= CFG.ServerGlobalMaxAlive then
+	local cfg = cfgForZoneKey(zKey)
+	if cfg.ServerGlobalMaxAlive and cfg.ServerGlobalMaxAlive > 0 then
+		if serverAliveCount() >= cfg.ServerGlobalMaxAlive then
 			return false
 		end
 	end
-	if globalCapEnabled() then
+	if globalCapEnabled(cfg) then
 		local owner = zoneOwner[zKey]
 		local uid = owner and owner.UserId
-		if uid and (globalAliveByPlayer[uid] or 0) >= CFG.GlobalMaxAlive then
+		if uid and (globalAliveByPlayer[uid] or 0) >= cfg.GlobalMaxAlive then
 			return false
 		end
 	end
-	return (alivePerZone[zKey] or 0) < CFG.MaxAlivePerZone
+	return (alivePerZone[zKey] or 0) < cfg.MaxAlivePerZone
 end
 
 local function registerCiv(zKey, model)
@@ -685,8 +777,22 @@ local function enqueueDelete(inst)
 	unparentQueue[#unparentQueue+1] = inst
 end
 
+local function currentQueueBudgets()
+	local hasMobile = false
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if perfTier(plr) == "mobile-low" then
+			hasMobile = true
+			break
+		end
+	end
+	if hasMobile then
+		return CFG_BY_TIER["mobile-low"].MaxUnparentPerStep, CFG_BY_TIER["mobile-low"].MaxDestroyPerStep
+	end
+	return CFG.MaxUnparentPerStep, CFG.MaxDestroyPerStep
+end
+
 RunServiceScheduler.onHeartbeat(function()
-	local budget = CFG.MaxUnparentPerStep
+	local budget = select(1, currentQueueBudgets())
 	while budget > 0 and #unparentQueue > 0 do
 		local inst = table.remove(unparentQueue) -- pop end
 		if inst then
@@ -700,7 +806,7 @@ RunServiceScheduler.onHeartbeat(function()
 end)
 
 RunServiceScheduler.onStepped(function()
-	local budget = CFG.MaxDestroyPerStep
+	local _, budget = currentQueueBudgets()
 	while budget > 0 and #destroyQueue > 0 do
 		local inst = table.remove(destroyQueue)
 		if inst then
@@ -791,15 +897,16 @@ maintainZoneSteadyState = function(player, zoneId)
 	if not zKey or not owner then return end
 	if not zoneActive[zKey] then return end
 	if not isZoneReady(owner, zoneId) then return end
+	local cfg = cfgForPlayer(owner)
 	local target  = getTargetForKey(zKey)
 	local alive   = alivePerZone[zKey] or 0
-	local deficit = math.max(0, math.min(target, CFG.MaxAlivePerZone) - alive)
+	local deficit = math.max(0, math.min(target, cfg.MaxAlivePerZone) - alive)
 	if deficit <= 0 then return end
 	local uid = owner and owner.UserId
 	local ownerAlive = (uid and globalAliveByPlayer[uid]) or 0
-	if globalCapEnabled() and ownerAlive >= CFG.GlobalMaxAlive then
+	if globalCapEnabled(cfg) and ownerAlive >= cfg.GlobalMaxAlive then
 		dprint(("[Maintain] global cap reached (%d/%d) for player %s; deferring spawn for zone %s"):format(
-			ownerAlive, CFG.GlobalMaxAlive, tostring(uid), tostring(zoneId)))
+			ownerAlive, cfg.GlobalMaxAlive, tostring(uid), tostring(zoneId)))
 		return
 	end
 	dprint(("[Maintain] zone=%s target=%d alive=%d deficit=%d"):format(zoneId, target, alive, deficit))
@@ -821,6 +928,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if not zoneActive[zKey] then return end
 	if not isZoneReady(player, zoneId) then return end
 	if not canSpawn(zKey) then return end
+	local cfg = cfgForPlayer(player)
 
 	local zones = getZonesSnapshot(player)
 	local zone  = zones and zones[zoneId]
@@ -842,8 +950,8 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	local destZoneRecord = nil
 
 	-- Pick destination via CivPathing (nearest with jitter)
-	local dest = CivPathing.pickDestinationZone(player, zone, CFG.DestinationStrategy)
-	if dest and dest.dist >= CFG.MinZonePathCells then
+	local dest = CivPathing.pickDestinationZone(player, zone, cfg.DestinationStrategy)
+	if dest and dest.dist >= cfg.MinZonePathCells then
 		destIdForAttr = dest.id
 		destZoneRecord = dest.data
 		wpath = CivPathing.hybridZoneToZonePath(plot, player, zone, destZoneRecord, {
@@ -858,7 +966,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if (not wpath) or (#wpath < 2) then
 		if destZoneRecord and destIdForAttr then
 			wpath = buildFallbackEdgePath(plot, player, zone, zoneId, destZoneRecord, destIdForAttr)
-			if CFG.Debug and wpath then
+			if cfg.Debug and wpath then
 				dprint(("[CivilianSpawner] using fallback edge walk for %s -> %s (#%d pts)")
 					:format(tostring(zoneId), tostring(destIdForAttr), #wpath))
 			end
@@ -871,7 +979,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 
 	-- ===== ORIGIN: shift spawn to the *furthest-most* edge outside the origin zone, pushing past adjacent disallowed zones =====
 	local spawnPos = wpath[1]
-	if CFG.SpawnOnEdgeOutside then
+	if cfg.SpawnOnEdgeOutside then
 		local edgePos = pickEdgeSpawnOutside(plot, player, zone, zoneId, wpath)
 		if edgePos then
 			spawnPos = edgePos
@@ -885,7 +993,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	-- ========================================================================================================================
 
 	-- ===== DESTINATION: clip last waypoint to the border outside the destination zone (never enter the zone) =====
-	if CFG.DespawnAtTargetEdge and destIdForAttr then
+	if cfg.DespawnAtTargetEdge and destIdForAttr then
 		local destZone = zones and zones[destIdForAttr]
 		if destZone then
 			local edgeEnd = pickEdgeDespawnOutside(plot, player, destZone, destIdForAttr, wpath)
@@ -907,7 +1015,7 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	model.Name   = ("Civ_%s_%d"):format(zoneId, os.clock()*1000)
 	model.Parent = zoneFolder
 	-- smear expiries to avoid burst-destroy every N minutes
-	local ttl = math.max(15, CFG.LifeSeconds + math.random(-CFG.TTLJitterSeconds, CFG.TTLJitterSeconds))
+	local ttl = math.max(15, cfg.LifeSeconds + math.random(-cfg.TTLJitterSeconds, cfg.TTLJitterSeconds))
 	Debris:AddItem(model, ttl)
 
 	-- tag & place
@@ -920,23 +1028,23 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if hrp then
 		model.PrimaryPart = hrp
 		local p = spawnPos -- (may be edge-shifted far outward)
-		hrp.CFrame = CFrame.new(p + Vector3.new(0, CFG.InitialYLift, 0))
+		hrp.CFrame = CFrame.new(p + Vector3.new(0, cfg.InitialYLift, 0))
 	end
 
 	incAlive(zKey, player, 1)
 	registerCiv(zKey, model)
 
-	if CFG.DebugFreezeAll then
+	if cfg.DebugFreezeAll then
 		local hum = model:FindFirstChildOfClass("Humanoid")
 		if hum then hum.WalkSpeed = 0 end
 		return -- no movement; Debris will clean up
 	end
 
-	local speed = math.max(0.5, CFG.CivilianWalkSpeed or 3.5)
+	local speed = math.max(0.5, cfg.CivilianWalkSpeed or 3.5)
 	local ownerAlive = globalAliveByPlayer[player.UserId] or 0
 	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s (playerAlive=%d/%s)"):format(
-		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(CFG.SpawnOnEdgeOutside), tostring(CFG.DespawnAtTargetEdge),
-		ownerAlive, tostring(CFG.GlobalMaxAlive or "inf")))
+		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(cfg.SpawnOnEdgeOutside), tostring(cfg.DespawnAtTargetEdge),
+		ownerAlive, tostring(cfg.GlobalMaxAlive or "inf")))
 	CivilianMovement.moveAlongPath(model, wpath, zoneId, {
 		WalkSpeed    = speed,
 		DestroyAtEnd = false,   -- we will enqueue despawn ourselves
@@ -1044,12 +1152,15 @@ ZoneRemovedEvent.Event:Connect(function(player, removedZoneId, _mode, _gridList)
 	destroyAllCivsForZone(zKey)
 
 	-- destroy any civ currently headed *to* this zone (paced)
+	local destroyed = 0
 	for zoneKeyCur, bucket in pairs(civByZone) do
 		for mdl in pairs(bucket) do
 			if mdl and mdl.Parent and (mdl:GetAttribute("DestinationZoneId") == removedZoneId) then
 				mdl:SetAttribute("CivAlive", false)
 				enqueueDelete(mdl)
 			end
+			destroyed += 1
+			yieldEveryN(destroyed, 200)
 		end
 	end
 
@@ -1081,7 +1192,7 @@ ForceCivTest.Event:Connect(function(player, zoneId)
 	local zKey = zoneKey(player, zoneId)
 	zoneOwner[zKey] = player
 	setActive(zKey, true)
-	targetPerZone[zKey] = math.clamp(getTargetForKey(zKey), 1, CFG.MaxAlivePerZone)
+	targetPerZone[zKey] = math.clamp(getTargetForKey(zKey), 1, cfgForZoneKey(zKey).MaxAlivePerZone)
 	maintainZoneSteadyState(player, zoneId)
 	-- if not ready yet, await readiness then top-up
 	if not isZoneReady(player, zoneId) then

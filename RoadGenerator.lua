@@ -45,6 +45,9 @@ local DEBUG_LOGS          = false
 local DEBUG_ROAD_ROTATION = false
 local DEBUG_SUPPORT_RAYCAST = true  -- set true to print what each support probe hits
 
+local _recalcIntersectionsInProgress = {} -- [uid] = true
+local _recalcIntersectionsPending    = {} -- [uid] = true
+
 local GRID_SIZE      = GridConfig.GRID_SIZE
 local BUILD_INTERVAL = 0.1
 local Y_OFFSET       = 0.625
@@ -2021,106 +2024,125 @@ function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList
 end
 
 function RoadGeneratorModule.recalculateIntersectionsForPlot(player, zoneWhitelist)  -- zoneWhitelist: array of zoneIds or nil
-	print(("[RoadFix] Re-calculating intersections for %s"):format(player.Name))
+	local uid = player and player.UserId
+	if not uid then return end
+	if _recalcIntersectionsInProgress[uid] then
+		_recalcIntersectionsPending[uid] = true
+		return
+	end
+	_recalcIntersectionsInProgress[uid] = true
 
-	local function _norm360(d) d = (tonumber(d) or 0) % 360; if d < 0 then d = d + 360 end; return d end
-	local function _dprint(...)
+	repeat
+		_recalcIntersectionsPending[uid] = nil
+
 		if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
-			print("[RoadFix][Recalc]", ...)
+			print(('[RoadFix] Re-calculating intersections for %s'):format(player.Name))
 		end
-	end
 
-	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
-	if not plot then
-		_dprint("No plot for player.")
-		return
-	end
-
-	local roadsFolder = plot:FindFirstChild("Roads")
-	if not roadsFolder then
-		_dprint("No Roads folder.")
-		return
-	end
-	
-	local allowed = nil
-	if typeof(zoneWhitelist) == "table" then
-		allowed = {}
-		for _, z in ipairs(zoneWhitelist) do allowed[z] = true end
-	end
-	
-	-- Build a synthetic placedRoadsData table from *visible road pieces only*
-	local placedRoadsData = {}
-	local nScanned, nAdded, nSkipped = 0, 0, 0
-
-	for _, obj in ipairs(roadsFolder:GetDescendants()) do
-		if obj:IsA("Model") or obj:IsA("BasePart") then
-			nScanned += 1
-
-			-- Skip decorations; they carry GridX/Z but shouldn't drive intersections
-			if obj:GetAttribute("IsRoadDecoration") == true then
-				nSkipped += 1
-				continue
+		local function _norm360(d) d = (tonumber(d) or 0) % 360; if d < 0 then d = d + 360 end; return d end
+		local function _dprint(...)
+			if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
+				print('[RoadFix][Recalc]', ...)
 			end
-			
-			if allowed then
-				local zid = obj:GetAttribute("ZoneId")
-				if not (zid and allowed[zid]) then
+		end
+
+		local plot = Workspace.PlayerPlots:FindFirstChild('Plot_' .. uid)
+		if not plot then
+			_dprint('No plot for player.')
+			break
+		end
+
+		local roadsFolder = plot:FindFirstChild('Roads')
+		if not roadsFolder then
+			_dprint('No Roads folder.')
+			break
+		end
+		
+		local allowed = nil
+		if typeof(zoneWhitelist) == 'table' then
+			allowed = {}
+			for _, z in ipairs(zoneWhitelist) do allowed[z] = true end
+		end
+		
+		-- Build a synthetic placedRoadsData table from *visible road pieces only*
+		local placedRoadsData = {}
+		local nScanned, nAdded, nSkipped = 0, 0, 0
+
+		for _, obj in ipairs(roadsFolder:GetDescendants()) do
+			if obj:IsA('Model') or obj:IsA('BasePart') then
+				nScanned += 1
+
+				-- Skip decorations; they carry GridX/Z but shouldn't drive intersections
+				if obj:GetAttribute('IsRoadDecoration') == true then
 					nSkipped += 1
 					continue
 				end
-			end
-
-
-			local gx, gz = obj:GetAttribute("GridX"), obj:GetAttribute("GridZ")
-			if gx and gz then
-				-- Prefer sticky yaw; fall back to live orientation
-				local yaw = obj:GetAttribute("YawBuilt")
-				if yaw == nil then
-					if obj:IsA("Model") and obj.PrimaryPart then
-						yaw = obj.PrimaryPart.Orientation.Y
-					elseif obj:IsA("BasePart") then
-						yaw = obj.Orientation.Y
-					else
-						yaw = 0
+				
+				if allowed then
+					local zid = obj:GetAttribute('ZoneId')
+					if not (zid and allowed[zid]) then
+						nSkipped += 1
+						continue
 					end
 				end
-				yaw = _norm360(yaw)
 
-				local roadAssetName = inferBridgeAwareRoadName(
-					player,
-					gx,
-					gz,
-					obj:GetAttribute("RoadAssetName") or obj.Name
-				)
 
-				table.insert(placedRoadsData, {
-					roadName = roadAssetName,  -- "Road","Bridge","Turn","3Way","4Way"
-					rotation = yaw,
-					gridX    = gx,
-					gridZ    = gz,
-				})
-				nAdded += 1
-			else
-				nSkipped += 1
+				local gx, gz = obj:GetAttribute('GridX'), obj:GetAttribute('GridZ')
+				if gx and gz then
+					-- Prefer sticky yaw; fall back to live orientation
+					local yaw = obj:GetAttribute('YawBuilt')
+					if yaw == nil then
+						if obj:IsA('Model') and obj.PrimaryPart then
+							yaw = obj.PrimaryPart.Orientation.Y
+						elseif obj:IsA('BasePart') then
+							yaw = obj.Orientation.Y
+						else
+							yaw = 0
+						end
+					end
+					yaw = _norm360(yaw)
+
+					local roadAssetName = inferBridgeAwareRoadName(
+						player,
+						gx,
+						gz,
+						obj:GetAttribute('RoadAssetName') or obj.Name
+					)
+
+					table.insert(placedRoadsData, {
+						roadName = roadAssetName,  -- "Road","Bridge","Turn","3Way","4Way"
+						rotation = yaw,
+						gridX    = gx,
+						gridZ    = gz,
+					})
+					nAdded += 1
+				else
+					nSkipped += 1
+				end
+			end
+
+			if (nScanned % 300) == 0 then
+				task.wait()
 			end
 		end
-	end
 
-	if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
-		_dprint(string.format("Scanned=%d  Added=%d  Skipped=%d", nScanned, nAdded, nSkipped))
-	end
+		if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
+			_dprint(string.format('Scanned=%d  Added=%d  Skipped=%d', nScanned, nAdded, nSkipped))
+		end
 
-	-- Nothing left → nothing to do
-	if #placedRoadsData == 0 then
-		_dprint("No road cells found; aborting.")
-		return
-	end
+		-- Nothing left -- nothing to do
+		if #placedRoadsData == 0 then
+			_dprint('No road cells found; aborting.')
+			break
+		end
 
-	-- Run the existing intersection logic against the reconstructed data.
-	-- We pass nil for zoneId; swapRoadModel will pull ZoneId from each part as needed.
-	RoadGeneratorModule.updateIntersections(nil, placedRoadsData, roadsFolder)
+		-- Run the existing intersection logic against the reconstructed data.
+		-- We pass nil for zoneId; swapRoadModel will pull ZoneId from each part as needed.
+		RoadGeneratorModule.updateIntersections(nil, placedRoadsData, roadsFolder)
+	until not _recalcIntersectionsPending[uid]
+
+	_recalcIntersectionsInProgress[uid] = nil
 end
-
 
 -- Capture a precise snapshot of what exists for this zone (visible piece per cell + decos)
 function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)

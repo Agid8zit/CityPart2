@@ -36,6 +36,13 @@ local function debugPrint(...)
 	end
 end
 
+local function yieldEveryN(index: number, interval: number?)
+	interval = interval or 100
+	if interval > 0 and index % interval == 0 then
+		task.wait()
+	end
+end
+
 
 function ZoneTrackerModule.getNextZoneId(player, prefix)
     prefix = prefix or "Zone"
@@ -58,8 +65,59 @@ ZoneTrackerModule.occupiedGrid = {}
 local _announced = {}
 
 local _tombstones = {}  -- [userId][zoneId] = os.clock()
+local _demandSuppress = {} -- [userId] = depth counter for demand suppression
+local _demandDirty = {}    -- [userId] = true if a publish was skipped while suppressed
+local _demandCooldownAt = {} -- [userId] = last publish time
+local _demandPendingTimer = {} -- [userId] = task token for delayed publish
 
 local function _uid(p) return p and p.UserId end
+
+local function _perfTier(player)
+	-- Use '.' for the existence check; ':' requires args
+	local t = player and player.GetAttribute and player:GetAttribute("PerfTier")
+	if t == "mobile" then return "mobile-low" end
+	if t == "desktop" then return "desktop-high" end
+	if t == "desktop-high" or t == "desktop-balanced" or t == "desktop-low" or t == "mobile-low" then
+		return t
+	end
+	return "desktop-high"
+end
+
+local DEMAND_COOLDOWN = {
+	["mobile-low"]      = 0.8,
+	["desktop-low"]     = 0.5,
+	["desktop-balanced"] = 0.35,
+	["desktop-high"]    = 0.0,
+}
+
+local function _scheduleDemand(player, delaySec)
+	local uid = _uid(player)
+	if not uid then return end
+	if _demandPendingTimer[uid] then return end
+	_demandPendingTimer[uid] = task.delay(delaySec, function()
+		_demandPendingTimer[uid] = nil
+		ZoneTrackerModule.publishDemand(player, { force = true })
+	end)
+end
+
+local function isDemandSuppressed(player)
+	local uid = _uid(player)
+	return uid and (_demandSuppress[uid] or 0) > 0
+end
+
+local function markDemandDirty(player)
+	local uid = _uid(player)
+	if uid then
+		_demandDirty[uid] = true
+	end
+end
+
+local function clearDemandDirty(player)
+	local uid = _uid(player)
+	if uid then
+		_demandDirty[uid] = nil
+	end
+end
 
 local OVERLAY_SILENT_DEFAULT = {
 	power = true, water = true, pipe = true,
@@ -82,6 +140,33 @@ end
 function ZoneTrackerModule.clearTombstone(player, zoneId)
 	local uid = _uid(player); if not uid or type(zoneId)~="string" then return end
 	if _tombstones[uid] then _tombstones[uid][zoneId] = nil end
+end
+
+-- Suppress demand publishes (per player) while rebuilding/wiping worlds.
+function ZoneTrackerModule.pushDemandSuppression(player)
+	local uid = _uid(player); if not uid then return end
+	_demandSuppress[uid] = (_demandSuppress[uid] or 0) + 1
+end
+
+function ZoneTrackerModule.popDemandSuppression(player, opts)
+	local uid = _uid(player); if not uid then return end
+	local publishIfDirty = opts and opts.publishIfDirty
+	local forcePublish   = opts and opts.forcePublish
+	local cur = _demandSuppress[uid] or 0
+	if cur <= 1 then
+		_demandSuppress[uid] = nil
+		if publishIfDirty and (_demandDirty[uid] or forcePublish) then
+			ZoneTrackerModule.publishDemand(player)
+		else
+			clearDemandDirty(player)
+		end
+	else
+		_demandSuppress[uid] = cur - 1
+	end
+end
+
+function ZoneTrackerModule.isDemandSuppressed(player)
+	return isDemandSuppressed(player)
 end
 
 -- Event signals for zone addition and removal
@@ -336,7 +421,7 @@ function ZoneTrackerModule.removeZoneById(player, zoneId)
 	-- Unmark grid occupancy safely
 	local userGrid = ZoneTrackerModule.occupiedGrid[userId]
 	if userGrid then
-		for _, coord in ipairs(gridList) do
+		for i, coord in ipairs(gridList) do
 			if coord and typeof(coord) == "table" and type(coord.x)=="number" and type(coord.z)=="number" then
 				local ok = removeOccupantFromStack(userGrid, coord.x, coord.z, "zone", zoneId)
 				if ok then
@@ -351,6 +436,7 @@ function ZoneTrackerModule.removeZoneById(player, zoneId)
 						:format(coord.x, coord.z, zoneId))
 				end
 			end
+			yieldEveryN(i, 250)
 		end
 	else
 		debugPrint("[ZT] removeZoneById: no occupiedGrid yet for player; skipping unmark loop")
@@ -382,10 +468,11 @@ function ZoneTrackerModule.removeAllZonesForPlayer(player)
 		list[#list+1] = id
 	end
 	local removed = 0
-	for _, id in ipairs(list) do
+	for i, id in ipairs(list) do
 		if ZoneTrackerModule.removeZoneById(player, id) then
 			removed += 1
 		end
+		yieldEveryN(i, 25)
 	end
 	return removed
 end
@@ -427,7 +514,7 @@ function ZoneTrackerModule.getGridWealth(player, zoneId, x, z)
 	local key = tostring(x)..","..tostring(z)
 	return zone.wealth[key]
 end
-
+ 
 -- Updates the stored WealthState for that tile
 function ZoneTrackerModule.setGridWealth(player, zoneId, x, z, newState)
 	local zone = ZoneTrackerModule.getZoneById(player, zoneId)
@@ -966,6 +1053,8 @@ function ZoneTrackerModule.clearPlayerData(player)
 	ZoneTrackerModule.allZones[userId]   = nil
 	ZoneTrackerModule.occupiedGrid[userId] = nil
 	_announced[userId]                   = nil
+	_demandSuppress[userId]              = nil
+	_demandDirty[userId]                 = nil
 	ZoneTrackerModule.publishDemand(player)
 end
 
@@ -1043,10 +1132,36 @@ function ZoneTrackerModule.getZoneDemand(player)
 end
 
 -- Publish current snapshot to listeners (UI / Advisor)
-function ZoneTrackerModule.publishDemand(player)
-	if not ZoneTrackerModule.demandUpdatedEvent then return end
+function ZoneTrackerModule.publishDemand(player, opts)
+	local force = opts and opts.force
+
+	if not force and isDemandSuppressed(player) then
+		markDemandDirty(player)
+		return
+	end
+
+	local tier = _perfTier(player)
+	local cooldown = (not force) and (DEMAND_COOLDOWN[tier] or 0) or 0
+	local uid = _uid(player)
+	if not force and cooldown > 0 and uid then
+		local now = os.clock()
+		local last = _demandCooldownAt[uid] or 0
+		if (now - last) < cooldown then
+			markDemandDirty(player)
+			_scheduleDemand(player, cooldown - (now - last) + 0.05)
+			return
+		end
+	end
+
+	if not ZoneTrackerModule.demandUpdatedEvent then
+		clearDemandDirty(player)
+		return
+	end
+
+	clearDemandDirty(player)
 	local snap = ZoneTrackerModule.getZoneDemandFull(player)
 	ZoneTrackerModule.demandUpdatedEvent:Fire(player, snap.demand, snap)
+	if uid then _demandCooldownAt[uid] = os.clock() end
 
 	-- Optional advisory nudge purely on high demand
 	local Events   = ReplicatedStorage:WaitForChild("Events")

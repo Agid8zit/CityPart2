@@ -3,6 +3,29 @@
 ----------------------------------------------------------------
 local START_TIME = os.clock()
 local Debug      = false
+-- Flip WarnEnabled/Debug here manually when you want output; no events or runtime hooks required.
+local WarnEnabled = true
+local _warn = warn
+local function warnIfEnabled(...)
+	if WarnEnabled then
+		_warn(...)
+	end
+end
+-- Shadow warn locally so every warn respects the toggle.
+local warn = warnIfEnabled
+
+local function setSaveManagerLogging(on: boolean?)
+	if on ~= nil then
+		Debug = not not on
+	end
+end
+
+local function setSaveManagerWarnings(on: boolean?)
+	if on ~= nil then
+		WarnEnabled = not not on
+	end
+end
+
 local function LOG(...)
 	if Debug then
 		print(("[SaveManager][+%.3fs] "):format(os.clock() - START_TIME), ...)
@@ -62,12 +85,16 @@ local PlayerDataService   = require(S3.Services.PlayerDataService)
 local Bld                 = S3:WaitForChild("Build")
 local Zones               = Bld:WaitForChild("Zones")
 local ZoneMgr             = Zones:WaitForChild("ZoneManager")
+local CC			  	  = Zones:WaitForChild("CoreConcepts")
+local Districts           = CC:WaitForChild("Districts")
+local BldGen			  =Districts:WaitForChild("Building Gen")	
 local ZoneManager         = require(ZoneMgr:WaitForChild("ZoneManager"))
 local ZoneTracker         = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local ZoneRequirementsCheck = require(ZoneMgr:WaitForChild("ZoneRequirementsCheck"))
 local EconomyService      = require(ZoneMgr:WaitForChild("EconomyService"))
 local CityInteractions    = require(ZoneMgr:WaitForChild("CityInteraction"))
 local LayerManager        = require(Bld:WaitForChild("LayerManager"))
+local BuildingGeneratorModule = require(BldGen:WaitForChild("BuildingGenerator"))
 local CoreConcepts        = Zones:WaitForChild("CoreConcepts")
 local PowerGenFolder      = CoreConcepts:WaitForChild("PowerGen")
 local PowerGeneratorModule = require(PowerGenFolder:WaitForChild("PowerGenerator"))
@@ -86,6 +113,12 @@ local RoadGeneratorModule = require(Roadgen:WaitForChild("RoadGenerator"))
 
 -- Which zone modes are “roads”
 local ROAD_MODES = { DirtRoad = true, Pavement = true, Highway = true }
+
+-- Building zones that use square-only footprints/rotations (core res/com/ind types)
+local SQUARE_ONLY_MODES : { [string]: boolean } = {
+	Residential = true, Commercial = true, Industrial = true,
+	ResDense    = true, CommDense   = true, IndusDense   = true,
+}
 LOG("Core services fetched")
 
 local _saveQueuedOnReloadEnd : { [Player]: boolean } = {}
@@ -211,6 +244,12 @@ local function copyBlueprintList(list: {any}?): {any}
 	end
 	return out
 end
+
+-- Forward-declared below (defined after pipeline helpers)
+local tryRehydrateZoneFromZoneParts
+local LastRehydrateAttemptAt : { [number]: { [string]: number } } = {}
+local REHYDRATE_RETRY_COOLDOWN_SEC = 6.0
+local REHYDRATE_SETTLE_TIMEOUT_SEC = 6.0
 
 ----------------------------------------------------------------
 --  Capture (for SAVE)
@@ -356,18 +395,41 @@ local function makeZoneRows(player: Player): ({any}, { [string]: boolean })
 		if not okCap then
 			warn("[SaveManager] collectBuildings failed for zone", id, capErr)
 			captured = {}
+		else
+			warn(("[SaveManager] capture count for %s: %d"):format(id, typeof(captured)=="table" and #captured or -1))
 		end
 
 		-- If empty, try last-good cached blueprint, else mark as missing for per-zone fallback
 		if (type(captured) ~= "table" or #captured == 0) and (not ROAD_MODES[z.mode]) and (not isNetworkId(id)) then
 			local cached = LastBlueprintByUid[uid] and LastBlueprintByUid[uid][id]
 			if cached and #cached > 0 then
-				LOG("[SaveManager] Using cached blueprint for", id, "(n="..tostring(#cached)..")")
+				warn("[SaveManager] Using cached blueprint for", id, "(n="..tostring(#cached)..")")
 				captured = cached
 			else
-				missingSet[id] = true
-				warn("[SaveManager] No buildings captured for zone", id, "; will attempt per-zone fallback to previous save.")
-				captured = {} -- keep empty for now; we may fill from prev save in savePlayer()
+				warn("[SaveManager] Attempting rehydrate for empty capture", id, "mode", z.mode)
+				local rehydrated = tryRehydrateZoneFromZoneParts
+					and tryRehydrateZoneFromZoneParts(player, id, z.mode)
+				if rehydrated then
+					for attempt = 1, 3 do
+						local okRecap, recapErr = pcall(function()
+							captured = collectBuildings(player, id)
+						end)
+						if not okRecap then
+							warn("[SaveManager] collectBuildings after rehydrate failed for zone", id, recapErr)
+							captured = {}
+						else
+							warn(("[SaveManager] post-rehydrate capture try %d for %s: %d"):format(attempt, id, typeof(captured)=="table" and #captured or -1))
+							if type(captured) == "table" and #captured > 0 then break end
+						end
+						task.wait(0.35)
+					end
+				end
+
+				if type(captured) ~= "table" or #captured == 0 then
+					missingSet[id] = true
+					warn("[SaveManager] No buildings captured for zone", id, "; will attempt per-zone fallback to previous save.")
+					captured = {} -- keep empty for now; we may fill from prev save in savePlayer()
+				end
 			end
 		end
 
@@ -600,6 +662,7 @@ end)
 -- Hook reload window (relay to client)
 WorldReloadBeginBE.Event:Connect(function(player: Player)
 	InReload[player] = true
+	ZoneTracker.pushDemandSuppression(player) -- silence per-zone demand publishes during reload
 	placeOcclusionCube(player)
 	WorldReloadRE:FireClient(player, "begin")
 	-- Optional early seed of progress band A:
@@ -608,6 +671,7 @@ end)
 WorldReloadEndBE.Event:Connect(function(player: Player)
 	destroyOcclusionCube(player)
 	InReload[player] = nil
+	ZoneTracker.popDemandSuppression(player, { publishIfDirty = true, forcePublish = true })
 	WorldReloadRE:FireClient(player, "end")
 end)
 
@@ -624,6 +688,209 @@ local function waitAllZonesSettled(player: Player, timeoutSec: number?): boolean
 		task.wait(0.05)
 	end
 	return false
+end
+
+-- Attempt to rebuild missing square-only zones from surviving zone parts/range visuals
+local function _shouldAttemptRehydrate(mode: string?): boolean
+	-- Only try for non-road/non-network building zones that are NOT square-only core zones.
+	return mode ~= nil
+		and (not ROAD_MODES[mode])
+		and (not isNetworkId(mode))
+		and (SQUARE_ONLY_MODES[mode] ~= true)
+end
+
+local function _canAttemptRehydrate(player: Player, zoneId: string): boolean
+	local uid = player and player.UserId
+	if not uid then return false end
+	local last = LastRehydrateAttemptAt[uid] and LastRehydrateAttemptAt[uid][zoneId]
+	return (not last) or ((os.clock() - last) >= REHYDRATE_RETRY_COOLDOWN_SEC)
+end
+
+local function _markRehydrateAttempt(player: Player, zoneId: string)
+	local uid = player and player.UserId
+	if not uid then return end
+	LastRehydrateAttemptAt[uid] = LastRehydrateAttemptAt[uid] or {}
+	LastRehydrateAttemptAt[uid][zoneId] = os.clock()
+end
+
+local function _remapZoneIdForPlayer(zoneId: string, player: Player): string?
+	if not (player and player.UserId and zoneId) then return nil end
+	local parts = {}
+	for token in tostring(zoneId):gmatch("[^_]+") do
+		parts[#parts+1] = token
+	end
+	if #parts < 3 then return nil end
+	parts[2] = tostring(player.UserId)
+	return table.concat(parts, "_")
+end
+
+local function _extractPrefixAndSuffix(zoneId: string): (string?, string?)
+	if not zoneId then return nil, nil end
+	local parts = {}
+	for token in tostring(zoneId):gmatch("[^_]+") do
+		parts[#parts+1] = token
+	end
+	if #parts < 2 then return nil, nil end
+	return parts[1], parts[#parts]
+end
+
+local function _findZoneTypeByPattern(folder: Instance?, prefix: string?, suffix: string?): (string?, string?)
+	if not (folder and prefix and suffix) then return nil, nil end
+	local zonePattern = "^" .. prefix .. "_%d+_" .. suffix .. "$"
+	local rvPattern   = "^" .. prefix .. "_%d+_" .. suffix .. "_RangeVisual$"
+
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("BasePart") then
+			local nm = child.Name
+			if nm:match(zonePattern) then
+				local zt = child:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then return zt, "ZonePart-suffix" end
+			elseif nm:match(rvPattern) then
+				local zt = child:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then return zt, "RangeVisual-suffix" end
+			end
+		end
+	end
+	return nil, nil
+end
+
+local function _findZoneTypeBySuffix(folder: Instance?, suffix: string?): (string?, string?)
+	if not (folder and suffix) then return nil, nil end
+	local zonePattern = "_" .. suffix .. "$"
+	local rvPattern   = "_" .. suffix .. "_RangeVisual$"
+
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("BasePart") then
+			local nm = child.Name
+			if nm:match(rvPattern) then
+				local zt = child:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then
+					warn("[SaveManager][Rehydrate] Suffix-only RV hit", nm, "->", zt)
+					return zt, "RangeVisual-suffixOnly"
+				end
+			elseif nm:match(zonePattern) then
+				local zt = child:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then
+					warn("[SaveManager][Rehydrate] Suffix-only zone hit", nm, "->", zt)
+					return zt, "ZonePart-suffixOnly"
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+local function _resolveZoneTypeFromPlot(player: Player, zoneId: string, modeHint: string?): (string?, string?)
+	local plots = Workspace:FindFirstChild("PlayerPlots")
+	local plot = plots and plots:FindFirstChild("Plot_" .. player.UserId)
+	if not plot then return nil, nil end
+
+	local zonesFolder = plot:FindFirstChild("PlayerZones")
+	if not zonesFolder then return nil, nil end
+
+	local remapped = _remapZoneIdForPlayer(zoneId, player)
+	local candidates = { zoneId, remapped }
+	local seen = {}
+	local prefix, suffix = _extractPrefixAndSuffix(zoneId)
+
+	for _, name in ipairs(candidates) do
+		if name and not seen[name] then
+			seen[name] = true
+			local zonePart = zonesFolder:FindFirstChild(name)
+			if zonePart and zonePart:IsA("BasePart") then
+				warn("[SaveManager][Rehydrate] Candidate zone part:", name, "for", zoneId, "uid", player.UserId)
+				local zt = zonePart:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then return zt, "ZonePart" end
+				if modeHint and _shouldAttemptRehydrate(modeHint) then
+					warn("[SaveManager][Rehydrate] Zone part missing ZoneType; using mode hint", modeHint)
+					return modeHint, "ZonePart-missingAttr"
+				end
+			end
+
+			local rv = zonesFolder:FindFirstChild(tostring(name) .. "_RangeVisual")
+			if rv and rv:IsA("BasePart") then
+				warn("[SaveManager][Rehydrate] Candidate range visual:", rv.Name, "for", zoneId)
+				local zt = rv:GetAttribute("ZoneType")
+				if typeof(zt) == "string" then return zt, "RangeVisual" end
+				if modeHint and _shouldAttemptRehydrate(modeHint) then
+					warn("[SaveManager][Rehydrate] Range visual missing ZoneType; using mode hint", modeHint)
+					return modeHint, "RangeVisual-missingAttr"
+				end
+			end
+		end
+	end
+
+	-- Fallback: match by prefix+suffix against current player's zone parts
+	if prefix and suffix then
+		local zt, source = _findZoneTypeByPattern(zonesFolder, prefix, suffix)
+		if zt then
+			warn("[SaveManager][Rehydrate] Pattern match resolved ZoneType", zt, "for", zoneId, "via", source)
+			return zt, source
+		end
+		-- Last resort: suffix-only match
+		local zt2, source2 = _findZoneTypeBySuffix(zonesFolder, suffix)
+		if zt2 then
+			warn("[SaveManager][Rehydrate] Suffix-only match resolved ZoneType", zt2, "for", zoneId, "via", source2)
+			return zt2, source2
+		end
+	end
+
+	-- If we still have nothing, force the mode hint as a last resort
+	if modeHint and _shouldAttemptRehydrate(modeHint) then
+		warn("[SaveManager][Rehydrate] Forcing mode hint", modeHint, "for", zoneId, "(no ZoneType found)")
+		return modeHint, "ModeHint"
+	end
+
+	return nil, nil
+end
+
+tryRehydrateZoneFromZoneParts = function(player: Player, zoneId: string, mode: string?)
+	if not _shouldAttemptRehydrate(mode) then
+		warn("[SaveManager] Rehydrate skip (mode not eligible):", zoneId, mode)
+		return false
+	end
+	if not _canAttemptRehydrate(player, zoneId) then
+		warn("[SaveManager] Rehydrate skip (cooldown):", zoneId, player and player.UserId)
+		return false
+	end
+	if typeof(BuildingGeneratorModule.populateZone) ~= "function" then
+		warn("[SaveManager] Rehydrate skip (populateZone missing):", zoneId)
+		return false
+	end
+
+	local resolvedType, source = _resolveZoneTypeFromPlot(player, zoneId, mode)
+	if not (resolvedType and _shouldAttemptRehydrate(resolvedType)) then
+		warn("[SaveManager] Rehydrate skipped; no zone part/RangeVisual type for", zoneId, "mapped for", player and player.UserId)
+		return false
+	end
+
+	warn("[SaveManager] Rehydrate resolved type", resolvedType, "for", zoneId, "via", source or "unknown")
+
+	local z = ZoneTracker.getZoneById(player, zoneId)
+	if not (z and z.gridList and #z.gridList > 0) then
+		warn("[SaveManager] Rehydrate skip; no gridList for", zoneId)
+		return false
+	end
+	warn("[SaveManager] Rehydrate gridList size for", zoneId, "=", #z.gridList)
+	do
+		local okEnc, encoded = pcall(HttpService.JSONEncode, HttpService, z.gridList or {})
+		warn("[SaveManager] gridList coords for", zoneId, okEnc and encoded or "<encode-failed>")
+	end
+
+	_markRehydrateAttempt(player, zoneId)
+	warn("[SaveManager] Rehydrating missing buildings for", zoneId, "via", source or "PlayerZones", "as", resolvedType)
+
+	local okPop, err = pcall(function()
+		BuildingGeneratorModule.populateZone(player, zoneId, resolvedType, z.gridList, nil, 0, true)
+	end)
+	if not okPop then
+		warn("[SaveManager] Rehydrate populate failed for zone", zoneId, err)
+		return false
+	end
+
+	waitAllZonesSettled(player, REHYDRATE_SETTLE_TIMEOUT_SEC)
+	warn("[SaveManager] Rehydrate completed for", zoneId)
+	return true
 end
 
 ----------------------------------------------------------------
@@ -787,7 +1054,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 				local prev = prevRowsById[r.id]
 				if missingSet[r.id] and prev and prev.buildings and prev.buildings ~= "" then
 					r.buildings = prev.buildings
-					LOG("[SaveManager] Per-zone fallback applied for", r.id)
+					warn("[SaveManager] Per-zone fallback applied for", r.id)
 				elseif missingSet[r.id] then
 					LOG("[SaveManager] No previous buildings for", r.id, "— leaving empty array.")
 				end
@@ -937,6 +1204,7 @@ local function wipeLiveWorld(player: Player)
 	local plots = Workspace:FindFirstChild("PlayerPlots")
 	local plot  = plots and plots:FindFirstChild("Plot_"..player.UserId)
 	if plot then
+		local cleaned = 0
 		for _, inst in ipairs(plot:GetDescendants()) do
 			if inst.GetAttribute then
 				if inst:GetAttribute("ZoneId") ~= nil then
@@ -947,6 +1215,10 @@ local function wipeLiveWorld(player: Player)
 			end
 			if typeof(inst.Name) == "string" and string.sub(inst.Name, 1, 8) == "Traffic_" then
 				pcall(function() inst:Destroy() end)
+			end
+			cleaned += 1
+			if cleaned % 200 == 0 then
+				task.wait()
 			end
 		end
 	end
@@ -1168,7 +1440,28 @@ local function ensurePredefinedCache(state, zoneId: string, row)
 	if row.buildings and row.buildings ~= "" then
 		local okJSON, decoded = pcall(HttpService.JSONDecode, HttpService, row.buildings)
 		if okJSON and typeof(decoded) == "table" then
-			predefined = decoded
+			local clean, dropped = {}, 0
+			for _, entry in ipairs(decoded) do
+				local name = entry and entry.buildingName
+				local gx   = entry and tonumber(entry.gridX)
+				local gz   = entry and tonumber(entry.gridZ)
+				if type(name) == "string" and gx and gz then
+					clean[#clean+1] = {
+						buildingName = name,
+						gridX        = gx,
+						gridZ        = gz,
+						rotation     = tonumber(entry.rotation) or 0,
+						isUtility    = entry.isUtility == true,
+						wealth       = entry.wealth,
+					}
+				else
+					dropped += 1
+				end
+			end
+			if dropped > 0 then
+				warn(("[SaveManager] Dropped %d invalid saved buildings for %s (missing name/coords)"):format(dropped, tostring(zoneId)))
+			end
+			predefined = clean
 		else
 			local preview = string.sub(row.buildings, 1, 120)
 			if #row.buildings > 120 then
@@ -1554,14 +1847,38 @@ local function captureZoneRowForSave(player: Player, id: string, prevRowsById: {
 		if not okCap then
 			warn("[ProgSave] collectBuildings failed for", id, capErr)
 			captured = {}
+		else
+			warn(("[ProgSave] capture count for %s: %d"):format(id, typeof(captured)=="table" and #captured or -1))
 		end
 		if type(captured) ~= "table" or #captured == 0 then
 			local uid = player.UserId
 			local cached = LastBlueprintByUid[uid] and LastBlueprintByUid[uid][id]
 			if cached and #cached > 0 then
 				captured = cached
+				warn("[ProgSave] Using cached blueprint for", id, "(n="..tostring(#cached)..")")
 			else
-				missingSet[id] = true
+				warn("[ProgSave] Attempting rehydrate for empty capture", id, "mode", z.mode)
+				local rehydrated = tryRehydrateZoneFromZoneParts
+					and tryRehydrateZoneFromZoneParts(player, id, z.mode)
+				if rehydrated then
+					for attempt = 1, 3 do
+						local okRecap, recapErr = pcall(function()
+							captured = collectBuildings(player, id)
+						end)
+						if not okRecap then
+							warn("[ProgSave] collectBuildings after rehydrate failed for", id, recapErr)
+							captured = {}
+						else
+							warn(("[ProgSave] post-rehydrate capture try %d for %s: %d"):format(attempt, id, typeof(captured)=="table" and #captured or -1))
+							if type(captured) == "table" and #captured > 0 then break end
+						end
+						task.wait(0.35)
+					end
+				end
+
+				if type(captured) ~= "table" or #captured == 0 then
+					missingSet[id] = true
+				end
 			end
 		end
 		local okB, out = pcall(function() return HttpService:JSONEncode(captured) end)
@@ -1573,7 +1890,7 @@ local function captureZoneRowForSave(player: Player, id: string, prevRowsById: {
 		local prev = prevRowsById[id]
 		if prev and prev.buildings and prev.buildings ~= "" then
 			buildingsJSON = prev.buildings
-			LOG("[ProgSave] Per-zone fallback applied for", id)
+			warn("[ProgSave] Per-zone fallback applied for", id)
 		end
 	end
 
@@ -1958,6 +2275,7 @@ Players.PlayerRemoving:Connect(function(plr)
 
 	InflightPopByUid[plr.UserId] = 0
 	InReload[plr] = nil
+	LastRehydrateAttemptAt[plr.UserId] = nil
 	destroyOcclusionCube(plr)
 
 	local firedPlayerSaved = false

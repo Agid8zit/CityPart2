@@ -75,6 +75,10 @@ local cardinalGridParts = {}
 local metroEntranceCells = {}
 local metroTunnelCells = {}
 
+-- Debug toggle: when true, after grid generation we’ll check that every placed
+-- building/utility has a corresponding GridSquare and log any gaps we find.
+local DEBUG_GRID_COVERAGE = true
+
 local ZERO_EPSILON = 1e-6
 local function normalizeGridIndex(value)
 	if math.abs(value) < ZERO_EPSILON then
@@ -731,6 +735,46 @@ BE_DisableBuildMode.Event:Connect(function()
 	currentMode = nil
 end)
 
+-- Debug helper: make sure every placed building/utility is inside the grid we render.
+local function _logMissingGridCoverage()
+	if not DEBUG_GRID_COVERAGE then return end
+	if not playerPlot then return end
+	local buildings = playerPlot:FindFirstChild("Buildings")
+	local populated = buildings and buildings:FindFirstChild("Populated")
+	if not populated then return end
+
+	local missing = 0
+	local reported = 0
+
+	local function checkInst(inst)
+		if not (inst and (inst:IsA("Model") or inst:IsA("BasePart"))) then return end
+		local gx = inst:GetAttribute("GridX")
+		local gz = inst:GetAttribute("GridZ")
+		if gx == nil or gz == nil then return end
+		local k = _key(gx, gz)
+		if not gridLookup[k] then
+			missing += 1
+			if reported < 25 then
+				reported += 1
+				local zid = inst:GetAttribute("ZoneId")
+				local pos = (inst:IsA("Model") and inst:GetPivot().Position) or inst.Position
+				warn(("[GridViz][Gap] No GridSquare for %s zone=%s @ (%d,%d) pos=(%.1f,%.1f,%.1f)")
+					:format(inst.Name, tostring(zid), gx, gz, pos.X, pos.Y, pos.Z))
+			end
+		end
+	end
+
+	for _, folder in ipairs(populated:GetChildren()) do
+		for _, inst in ipairs(folder:GetChildren()) do
+			checkInst(inst)
+		end
+	end
+
+	if missing > 0 then
+		warn(string.format("[GridViz][Gap] Missing grid coverage for %d placed instances (reported %d).", missing, reported))
+	end
+end
+
 notifyLockedEvent.OnClientEvent:Connect(function(zoneType, requiredLevel)
 	removeGhost()
 	clearAll()
@@ -783,6 +827,9 @@ local function createGrid(mode)
 	-- Logical axis for this plot
 	local ax, az = GridConfig.getAxisDirectionsForPlot(playerPlot)
 
+	local minGX, maxGX = math.huge, -math.huge
+	local minGZ, maxGZ = math.huge, -math.huge
+
 	for i = 0, displayGridSizeX - 1 do
 		for j = 0, displayGridSizeZ - 1 do
 			local worldX = absMinX + (i + 0.5) * step
@@ -817,8 +864,16 @@ local function createGrid(mode)
 			table.insert(gridParts, gridPart)
 
 			gridLookup[gridX .. "," .. gridZ] = gridPart
+
+			if gridX < minGX then minGX = gridX end
+			if gridX > maxGX then maxGX = gridX end
+			if gridZ < minGZ then minGZ = gridZ end
+			if gridZ > maxGZ then maxGZ = gridZ end
 		end
 	end
+
+	warn(("[GridViz] Generated %d GridSquares. GX range: %d..%d  GZ range: %d..%d")
+		:format(#gridParts, minGX, maxGX, minGZ, maxGZ))
 
 	if mode == "MetroTunnel" then
 		findMetroEntrances()
@@ -849,6 +904,9 @@ local function createGrid(mode)
 			end
 		end
 	end
+
+	-- After generating, sanity check coverage against placed instances.
+	_logMissingGridCoverage()
 end
 
 -- SHOW CARDINAL GRIDS

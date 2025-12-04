@@ -53,10 +53,136 @@ local TEMP_ALARM_FOLDER_NAME = "TempAlarms"
 -- Prevent bulk temp alarms from infra events / full-zone scans before population
 local SHOW_TEMP_FROM_INFRA_EVENTS = false
 
+-- Attribute used on alarm parts so clients can hide non-owned alarms locally
+local ALARM_OWNER_ATTRIBUTE = "OwnerUserId"
+local ALARM_CLUSTER_FLAG_ATTRIBUTE  = "ClusteredAlarm"
+local ALARM_CLUSTER_COUNT_ATTRIBUTE = "ClusteredCount"
+local ALARM_CLUSTER_MIN_SIZE        = 4 -- when >= this many neighbors, collapse into one alarm
+local ALARM_CLUSTER_TARGET_SIZE     = 5 -- desired tiles represented per cluster marker
+
 -- ==== PERFORMANCE / LOAD-AWARE TUNABLES (ADDED) ===========================
 local TEMP_ALARM_BUDGET_MS         = 4      -- soft time budget per update call
 local TEMP_ALARM_YIELD_EVERY_OPS   = 200    -- yield cadence for large batches
 local LOAD_AWARE_SKIP_TEMP_ALARMS  = true   -- skip temp alarms during world reload
+local LOOP_YIELD_EVERY             = 250    -- yield cadence for heavy grid scans
+local LOOP_TIME_BUDGET             = 0.35   -- soft time budget between yields when loops are heavy
+local LARGE_ZONE_DEFER_THRESHOLD   = 1500   -- cells: above this, defer full checks to a slow lane
+local SOFT_REQUIREMENT_BUDGET      = 1.0    -- seconds: soft budget before deferring to slow lane
+local SLOW_CHECK_YIELD_EVERY       = 60     -- cadence for the slow lane worker
+local SLOW_CHECK_GAP               = 0.05   -- pause between slow-lane jobs
+local ASSUME_REQUIREMENTS_DURING_RELOAD = true -- treat requirements as satisfied during save/load replay
+
+-- Tier-aware tunables (desktop defaults, mobile more aggressive)
+local PERF_TIER_DEFAULT = {
+	clusterMin       = ALARM_CLUSTER_MIN_SIZE,
+	clusterTarget    = ALARM_CLUSTER_TARGET_SIZE,
+	showTempAlarms   = SHOW_POPULATING_ALARMS,
+	tempBudgetMs     = TEMP_ALARM_BUDGET_MS,
+	tempYieldOps     = TEMP_ALARM_YIELD_EVERY_OPS,
+	deferThreshold   = LARGE_ZONE_DEFER_THRESHOLD,
+	softBudget       = SOFT_REQUIREMENT_BUDGET,
+	loopBudget       = LOOP_TIME_BUDGET,
+	loopYieldEvery   = LOOP_YIELD_EVERY,
+}
+
+local PERF_TIER_OVERRIDES = {
+	["desktop-balanced"] = {
+		clusterMin     = 3,
+		clusterTarget  = 4,
+		deferThreshold = 1200,
+		softBudget     = 0.8,
+		loopBudget     = 0.32,
+		loopYieldEvery = 200,
+	},
+	["desktop-low"] = {
+		clusterMin     = 3,
+		clusterTarget  = 4,
+		deferThreshold = 900,
+		softBudget     = 0.6,
+		loopBudget     = 0.25,
+		loopYieldEvery = 150,
+	},
+	["mobile-low"] = {
+		clusterMin     = 2,
+		clusterTarget  = 3,
+		showTempAlarms = false,
+		tempBudgetMs   = 2,
+		tempYieldOps   = 120,
+		deferThreshold = 750,
+		softBudget     = 0.4,
+		loopBudget     = 0.18,
+		loopYieldEvery = 120,
+	},
+}
+
+local function getPerfTier(player)
+	local t = player and player:GetAttribute("PerfTier")
+	if t == "mobile" then return "mobile-low" end
+	if t == "desktop" then return "desktop-high" end
+	if t == "desktop-high" or t == "desktop-balanced" or t == "desktop-low" or t == "mobile-low" then
+		return t
+	end
+	return "desktop-high"
+end
+
+local function getPerfConfig(player)
+	local tier = getPerfTier(player)
+	local override = PERF_TIER_OVERRIDES[tier] or {}
+	return tier, {
+		clusterMin     = override.clusterMin     or PERF_TIER_DEFAULT.clusterMin,
+		clusterTarget  = override.clusterTarget  or PERF_TIER_DEFAULT.clusterTarget,
+		showTempAlarms = override.showTempAlarms ~= nil and override.showTempAlarms or PERF_TIER_DEFAULT.showTempAlarms,
+		tempBudgetMs   = override.tempBudgetMs   or PERF_TIER_DEFAULT.tempBudgetMs,
+		tempYieldOps   = override.tempYieldOps   or PERF_TIER_DEFAULT.tempYieldOps,
+		deferThreshold = override.deferThreshold or PERF_TIER_DEFAULT.deferThreshold,
+		softBudget     = override.softBudget     or PERF_TIER_DEFAULT.softBudget,
+		loopBudget     = override.loopBudget     or PERF_TIER_DEFAULT.loopBudget,
+		loopYieldEvery = override.loopYieldEvery or PERF_TIER_DEFAULT.loopYieldEvery,
+	}
+end
+
+local function isMobileTier(tier)
+	return tier == "mobile-low"
+end
+
+-- Forward declarations
+local invalidateZoneCache
+
+local function _makeYieldState(opts)
+	if not opts then return nil end
+	return {
+		yieldEvery = opts.yieldEvery or LOOP_YIELD_EVERY,
+	deadline = opts.deadline,
+	budgetSeconds = opts.budgetSeconds or LOOP_TIME_BUDGET,
+	lastYield = os.clock(),
+	}
+end
+
+local function _yieldLoop(i, state)
+	if state then
+		state.lastYield = state.lastYield or os.clock()
+		local now = os.clock()
+		local every = state.yieldEvery or LOOP_YIELD_EVERY
+		if state.budgetSeconds and (now - state.lastYield) >= state.budgetSeconds then
+			task.wait()
+			state.lastYield = os.clock()
+			now = state.lastYield
+		end
+		if i % every == 0 then
+			task.wait()
+			state.lastYield = os.clock()
+			now = state.lastYield
+		end
+		if state.deadline and now > state.deadline then
+			return true
+		end
+	else
+		if i % LOOP_YIELD_EVERY == 0 then
+			task.wait()
+		end
+	end
+	return false
+end
 
 -- >>> ADDED: definitive requirement name mapping for defensive checks
 local REQ_NAME_FOR_ALARM = {
@@ -64,13 +190,6 @@ local REQ_NAME_FOR_ALARM = {
 	AlarmWater = "Water",
 	AlarmPower = "Power",
 }
-
--- Attribute used on alarm parts so clients can hide non-owned alarms locally
-local ALARM_OWNER_ATTRIBUTE = "OwnerUserId"
-local ALARM_CLUSTER_FLAG_ATTRIBUTE  = "ClusteredAlarm"
-local ALARM_CLUSTER_COUNT_ATTRIBUTE = "ClusteredCount"
-local ALARM_CLUSTER_MIN_SIZE        = 4 -- when >= this many neighbors, collapse into one alarm
-local ALARM_CLUSTER_TARGET_SIZE     = 5 -- desired tiles represented per cluster marker
 
 -- >>> ADDED: last-writer-wins sequencing to eliminate stale re-adds
 local AlarmSeq     = {} -- [uid][zoneId][alarmType] = seq
@@ -122,9 +241,65 @@ local function _queueDeferredRecheck(player, zoneId)
 	DeferredRechecksByUid[uid][zoneId] = true
 end
 
+-- Slow-lane requirement checks to avoid script timeouts on large cities
+local SlowRequirementQueue = {} -- [uid][zoneId] = {mode=..., gridList=..., reason=...}
+local SlowRequirementBusy  = {} -- [uid] = true when worker is running
+
+local function _enqueueSlowRequirementCheck(player, zoneId, mode, gridList, reason)
+	local uid = player and player.UserId
+	if not uid or not zoneId or not mode then return end
+
+	SlowRequirementQueue[uid] = SlowRequirementQueue[uid] or {}
+	SlowRequirementQueue[uid][zoneId] = { mode = mode, gridList = gridList, reason = reason }
+	if SlowRequirementBusy[uid] then return end
+
+	SlowRequirementBusy[uid] = true
+	task.spawn(function()
+		while SlowRequirementQueue[uid] do
+			local nextZoneId, job = next(SlowRequirementQueue[uid])
+			if not nextZoneId then break end
+			SlowRequirementQueue[uid][nextZoneId] = nil
+
+			ZoneRequirementsChecker.checkZoneRequirements(
+				player,
+				nextZoneId,
+				job.mode,
+				job.gridList or {},
+				{
+					runSync = true,
+					allowDeferred = false, -- stay in slow lane until completion
+					evalOpts = {
+						yieldEvery = SLOW_CHECK_YIELD_EVERY,
+						budgetSeconds = LOOP_TIME_BUDGET,
+					},
+				}
+			)
+
+			task.wait(SLOW_CHECK_GAP)
+		end
+
+		SlowRequirementQueue[uid] = nil
+		SlowRequirementBusy[uid] = nil
+	end)
+end
+
 do
 	local WorldReloadBeginBE = BindableEvents:FindFirstChild("WorldReloadBegin")
 	local WorldReloadEndBE   = BindableEvents:FindFirstChild("WorldReloadEnd")
+
+	local function _queuePostReloadSweep(player)
+		if not ASSUME_REQUIREMENTS_DURING_RELOAD then return end
+		if not (player and player.UserId) then return end
+		local all = ZoneTrackerModule.getAllZones(player)
+		if not all then return end
+		for zid, z in pairs(all) do
+			if z and z.mode and ZoneRequirementsChecker.isBuildingZone(z.mode) and z.gridList then
+				-- clear any optimistic cache and schedule a slow-lane recheck
+				invalidateZoneCache(player, zid)
+				_enqueueSlowRequirementCheck(player, zid, z.mode, z.gridList, "postReload")
+			end
+		end
+	end
 
 	if WorldReloadBeginBE and WorldReloadBeginBE:IsA("BindableEvent") then
 		WorldReloadBeginBE.Event:Connect(function(player)
@@ -153,6 +328,7 @@ do
 						end)
 					end
 				end
+				_queuePostReloadSweep(player)
 				-- >>> ADDED: sequences not strictly needed to clear here since zone-wise clears happen elsewhere
 			end
 		end)
@@ -621,7 +797,7 @@ local function setCachedTileRequirements(player, zoneId, gx, gz, hasRoad, hasWat
 	}
 end
 
-local function invalidateZoneCache(player, zoneId)
+function invalidateZoneCache(player, zoneId)
 	local userId = player.UserId
 	if zoneRequirementCache[userId] and zoneRequirementCache[userId][zoneId] then
 		zoneRequirementCache[userId][zoneId] = nil
@@ -752,15 +928,19 @@ local function chunkCluster(cluster, chunkSize)
 	return groups
 end
 
-local function buildAlarmDisplayTargets(neededSet)
+local function buildAlarmDisplayTargets(neededSet, alarmCfg)
 	local targets = {}
 	if not neededSet or next(neededSet) == nil then
 		return targets
 	end
 
-	local threshold = ALARM_CLUSTER_MIN_SIZE or 0
+	local threshold = (alarmCfg and alarmCfg.clusterMin) or ALARM_CLUSTER_MIN_SIZE or 0
 	local clusters = clusterNeededTiles(neededSet)
-	local targetSize = math.max(threshold, ALARM_CLUSTER_TARGET_SIZE or 0, 1)
+	local targetSize = math.max(
+		threshold,
+		(alarmCfg and alarmCfg.clusterTarget) or ALARM_CLUSTER_TARGET_SIZE or 0,
+		1
+	)
 
 	local function registerSingle(c)
 		targets[coordKey(c)] = {
@@ -1211,6 +1391,8 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 		_setSeq(AlarmSeq, player, zoneId, alarmType, seq)
 	end
 
+	local _, tierCfg = getPerfConfig(player)
+
 	-- If zone is NOT populated, store in pending and bail out
 	if not isZonePopulated(player, zoneId) then
 		debugPrint("Zone NOT populated, storing alarm coords for later:", alarmType, zoneId)
@@ -1279,7 +1461,7 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], neededTiles)
 	end
 
-	local displayTargets = buildAlarmDisplayTargets(neededTiles)
+	local displayTargets = buildAlarmDisplayTargets(neededTiles, tierCfg)
 
 	-- Remove any existing parts of this type that are no longer needed
 	for _, child in ipairs(zoneModel:GetChildren()) do
@@ -1352,6 +1534,9 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 	if not SHOW_POPULATING_ALARMS then return end
 	if not player or not zoneId or not alarmType then return end
 
+	local tier, tierCfg = getPerfConfig(player)
+	if tierCfg.showTempAlarms == false then return end
+
 	-- >>> ADDED: last-writer-wins for temp alarms
 	local current = _getSeq(TempAlarmSeq, player, zoneId, alarmType)
 	if seq and seq < current then
@@ -1420,10 +1605,15 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 	-- Budgeted processing
 	local start = os.clock()
 	local ops   = 0
+	local tempYieldEvery = tierCfg.tempYieldOps or TEMP_ALARM_YIELD_EVERY_OPS
+	local tempBudgetSec  = (tierCfg.tempBudgetMs or TEMP_ALARM_BUDGET_MS) / 1000
 	local function maybeYield()
 		ops += 1
-		if (ops % TEMP_ALARM_YIELD_EVERY_OPS) == 0 then task.wait() ; start = os.clock() end
-		if (os.clock() - start) >= (TEMP_ALARM_BUDGET_MS / 1000) then
+		if tempYieldEvery > 0 and (ops % tempYieldEvery) == 0 then
+			task.wait()
+			start = os.clock()
+		end
+		if (os.clock() - start) >= tempBudgetSec then
 			task.wait()
 			start = os.clock()
 		end
@@ -1723,12 +1913,18 @@ function ZoneRequirementsChecker.getEffectiveTotals(player)
 	return copyAggregate(totals)
 end
 
-local function allocateTilesForZone(player, zoneId, networkType, gridList, produced, required, radius)
+local function allocateTilesForZone(player, zoneId, networkType, gridList, produced, required, radius, evalOpts)
 	local z = ZoneTrackerModule.getZoneById(player, zoneId)
 	if not z or not ZoneRequirementsChecker.isBuildingZone(z.mode) then return {} end
 
 	local cand, zoneReachableDemand = {}, 0
-	for _, c in ipairs(gridList) do
+	local loopState = _makeYieldState(evalOpts)
+	local timedOut = false
+	for i, c in ipairs(gridList) do
+		if _yieldLoop(i, loopState) then
+			timedOut = true
+			break
+		end
 		local reachable = (networkType == "Water")
 			and ZoneRequirementsChecker.zoneHasWater(player, zoneId, {c}, radius)
 			or ZoneRequirementsChecker.zoneHasPower(player, zoneId, {c}, radius)
@@ -1739,6 +1935,7 @@ local function allocateTilesForZone(player, zoneId, networkType, gridList, produ
 			table.insert(cand, {coord=c, demand=d, dist2=d2})
 		end
 	end
+	if timedOut then return {}, true end
 	if #cand == 0 or zoneReachableDemand == 0 then return {} end
 
 	local share = (produced >= required) and zoneReachableDemand or (produced * (zoneReachableDemand/required))
@@ -1757,7 +1954,7 @@ local function allocateTilesForZone(player, zoneId, networkType, gridList, produ
 		served[("%d_%d"):format(t.coord.x,t.coord.z)] = true
 		remaining -= t.demand
 	end
-	return served
+	return served, false
 end
 
 ----------------------------------------------------------------------
@@ -1844,20 +2041,32 @@ UtilityAlertsRF.OnServerInvoke = function(player)
 	}
 end
 
-function ZoneRequirementsChecker.evaluateRoadsForZone(player, zoneId, mode, gridList)
+function ZoneRequirementsChecker.evaluateRoadsForZone(player, zoneId, mode, gridList, evalOpts)
+	if _isReloading(player) and ASSUME_REQUIREMENTS_DURING_RELOAD then
+		return true, {}, false
+	end
 	if not ZoneRequirementsChecker.isBuildingZone(mode) then
 		return true, {}
 	end
 	local unsatisfied = {}
-	for _, c in ipairs(gridList) do
+	local loopState = _makeYieldState(evalOpts)
+	local timedOut = false
+	for i, c in ipairs(gridList) do
+		if _yieldLoop(i, loopState) then
+			timedOut = true
+			break
+		end
 		local ok = ZoneRequirementsChecker.checkNearbyRoad(player, zoneId, mode, {c})
 		markTile(player, zoneId, c.x, c.z, "Road", ok)
 		if not ok then table.insert(unsatisfied, c) end
 	end
-	return (#unsatisfied == 0), unsatisfied
+	return (#unsatisfied == 0) and not timedOut, unsatisfied, timedOut
 end
 
-function ZoneRequirementsChecker.evaluateWaterForZone(player, zoneId, gridList)
+function ZoneRequirementsChecker.evaluateWaterForZone(player, zoneId, gridList, evalOpts)
+	if _isReloading(player) and ASSUME_REQUIREMENTS_DURING_RELOAD then
+		return true, {}, false
+	end
 	local zData = ZoneTrackerModule.getZoneById(player, zoneId)
 	local mode  = zData and zData.mode
 	if not ZoneRequirementsChecker.isBuildingZone(mode) then
@@ -1866,22 +2075,31 @@ function ZoneRequirementsChecker.evaluateWaterForZone(player, zoneId, gridList)
 
 	local produced, required = getComponentBudget(player, zoneId, "Water", { gridAware = true })
 	local servedSet = nil
+	local timedOut = false
 	if produced < required then
-		servedSet = allocateTilesForZone(player, zoneId, "Water", gridList, produced, required, SEARCH_RADIUS)
+		servedSet, timedOut = allocateTilesForZone(player, zoneId, "Water", gridList, produced, required, SEARCH_RADIUS, evalOpts)
 	end
 
 	local unsatisfied = {}
-	for _, c in ipairs(gridList) do
+	local loopState = _makeYieldState(evalOpts)
+	for i, c in ipairs(gridList) do
+		if _yieldLoop(i, loopState) then
+			timedOut = true
+			break
+		end
 		local reachable = ZoneRequirementsChecker.zoneHasWater(player, zoneId, {c}, SEARCH_RADIUS)
 		local ok = (produced >= required) and reachable or (reachable and servedSet and servedSet[("%d_%d"):format(c.x,c.z)] == true)
 		ZoneTrackerModule.markTileRequirement(player, zoneId, c.x, c.z, "Water", ok)
 		if not ok then table.insert(unsatisfied, c) end
 	end
 
-	return (#unsatisfied == 0), unsatisfied
+	return (#unsatisfied == 0) and not timedOut, unsatisfied, timedOut
 end
 
-function ZoneRequirementsChecker.evaluatePowerForZone(player, zoneId, gridList)
+function ZoneRequirementsChecker.evaluatePowerForZone(player, zoneId, gridList, evalOpts)
+	if _isReloading(player) and ASSUME_REQUIREMENTS_DURING_RELOAD then
+		return true, {}, false
+	end
 	local zData = ZoneTrackerModule.getZoneById(player, zoneId)
 	local mode  = zData and zData.mode
 	if not ZoneRequirementsChecker.isBuildingZone(mode) then
@@ -1890,19 +2108,25 @@ function ZoneRequirementsChecker.evaluatePowerForZone(player, zoneId, gridList)
 
 	local produced, required = getComponentBudget(player, zoneId, "Power", { gridAware = true })
 	local servedSet = nil
+	local timedOut = false
 	if produced < required then
-		servedSet = allocateTilesForZone(player, zoneId, "Power", gridList, produced, required, SEARCH_RADIUS)
+		servedSet, timedOut = allocateTilesForZone(player, zoneId, "Power", gridList, produced, required, SEARCH_RADIUS, evalOpts)
 	end
 
 	local unsatisfied = {}
-	for _, c in ipairs(gridList) do
+	local loopState = _makeYieldState(evalOpts)
+	for i, c in ipairs(gridList) do
+		if _yieldLoop(i, loopState) then
+			timedOut = true
+			break
+		end
 		local reachable = ZoneRequirementsChecker.zoneHasPower(player, zoneId, {c}, SEARCH_RADIUS)
 		local ok = (produced >= required) and reachable or (reachable and servedSet and servedSet[("%d_%d"):format(c.x,c.z)] == true)
 		ZoneTrackerModule.markTileRequirement(player, zoneId, c.x, c.z, "Power", ok)
 		if not ok then table.insert(unsatisfied, c) end
 	end
 
-	return (#unsatisfied == 0), unsatisfied
+	return (#unsatisfied == 0) and not timedOut, unsatisfied, timedOut
 end
 
 function ZoneRequirementsChecker.attemptActivatePendingZone(player, zoneId)
@@ -2000,6 +2224,13 @@ function ZoneRequirementsChecker.onZoneRemoved(player, zoneId, mode, gridList)
 	end
 end
 
+local function _assumeRequirementsSatisfied(player, zoneId, mode, gridList)
+	ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  true)
+	ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", true)
+	ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", true)
+	setCachedRequirements(player, zoneId, true, true, true)
+end
+
 ----------------------------------------------------------------------
 -- 9) Zone requirement checks (populated / cached paths)
 ----------------------------------------------------------------------
@@ -2010,8 +2241,13 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 	if not player or not player:IsA("Player") then return end
 	if type(zoneId) ~= "string" or type(mode) ~= "string" or type(gridList) ~= "table" then return end
 
+	local tier, tierCfg = getPerfConfig(player)
+
 	-- During a SaveManager reload, defer expensive checks and mark to recompute after reload ends.
 	if _isReloading(player) then
+		if ASSUME_REQUIREMENTS_DURING_RELOAD then
+			_assumeRequirementsSatisfied(player, zoneId, mode, gridList)
+		end
 		_queueDeferredRecheck(player, zoneId)
 		if opts.onFinished then pcall(opts.onFinished) end
 		return
@@ -2022,27 +2258,75 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 		return
 	end
 
+	local allowDeferred = opts.allowDeferred ~= false
+	local cellCount = (type(gridList) == "table") and #gridList or 0
+	local cached = getCachedRequirements(player, zoneId)
 	local startTime = os.clock()
-	local function work()
-		local cached = getCachedRequirements(player, zoneId)
-		if cached then
-			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  cached.hasRoad)
-			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", cached.hasWater)
-			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", cached.hasPower)
-			if cached.hasRoad then ZoneRequirementsChecker.attemptActivatePendingZone(player, zoneId) end
-			if DEBUG then
-				print(string.format("checkZoneRequirements (cached) in %.4fs for '%s'",
-					os.clock() - startTime, zoneId))
-			end
-			scheduleHappinessPublish(player, 0.02)
-			if opts.onFinished then pcall(opts.onFinished) end
-			return
-		end
 
+	local function finishFromCache()
+		if not cached then return false end
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  cached.hasRoad)
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", cached.hasWater)
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", cached.hasPower)
+		if cached.hasRoad then ZoneRequirementsChecker.attemptActivatePendingZone(player, zoneId) end
+		if DEBUG then
+			print(string.format("checkZoneRequirements (cached) in %.4fs for '%s'",
+				os.clock() - startTime, zoneId))
+		end
+		scheduleHappinessPublish(player, 0.02)
+		if opts.onFinished then pcall(opts.onFinished) end
+		return true
+	end
+
+	if finishFromCache() then
+		return
+	end
+
+	if allowDeferred
+		and (opts.deferHeavy ~= false)
+		and cellCount >= (tierCfg.deferThreshold or LARGE_ZONE_DEFER_THRESHOLD)
+	then
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  true)
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", true)
+		ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", true)
+		setCachedRequirements(player, zoneId, true, true, true)
+		_enqueueSlowRequirementCheck(player, zoneId, mode, gridList, "heavy")
+		scheduleHappinessPublish(player, 0.05)
+		if opts.onFinished then pcall(opts.onFinished) end
+		return
+	end
+
+	local evalOpts = opts.evalOpts
+	if not evalOpts then
+		evalOpts = {
+			deadline = os.clock() + (tierCfg.softBudget or SOFT_REQUIREMENT_BUDGET),
+			budgetSeconds = tierCfg.loopBudget or LOOP_TIME_BUDGET,
+			yieldEvery = tierCfg.loopYieldEvery or LOOP_YIELD_EVERY,
+		}
+	end
+
+	local function work()
+		if cached and finishFromCache() then return end
+
+		local timedOut = false
 		local success, err = pcall(function()
-			local allRoad,  missR = ZoneRequirementsChecker.evaluateRoadsForZone(player, zoneId, mode, gridList)
-			local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, zoneId, gridList)
-			local allPower, missP = ZoneRequirementsChecker.evaluatePowerForZone(player, zoneId, gridList)
+			local allRoad,  missR, timedOutR = ZoneRequirementsChecker.evaluateRoadsForZone(player, zoneId, mode, gridList, evalOpts)
+			local allWater, missW, timedOutW = ZoneRequirementsChecker.evaluateWaterForZone(player, zoneId, gridList, evalOpts)
+			local allPower, missP, timedOutP = ZoneRequirementsChecker.evaluatePowerForZone(player, zoneId, gridList, evalOpts)
+
+			timedOut = timedOutR or timedOutW or timedOutP
+			if timedOut then
+				if allowDeferred then
+					ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  true)
+					ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", true)
+					ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", true)
+					setCachedRequirements(player, zoneId, true, true, true)
+					_enqueueSlowRequirementCheck(player, zoneId, mode, gridList, "budget")
+				else
+					warn(string.format("checkZoneRequirements: budget exceeded for '%s' (mode=%s)", zoneId, tostring(mode)))
+				end
+				return
+			end
 
 			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Road",  allRoad)
 			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Water", allWater)
@@ -2074,7 +2358,7 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 			warn(string.format("Error in checkZoneRequirements('%s'): %s", zoneId, err))
 		end
 
-		if DEBUG then
+		if DEBUG and not timedOut then
 			print(string.format("checkZoneRequirements executed in %.4fs for '%s'", os.clock() - startTime, zoneId))
 		end
 

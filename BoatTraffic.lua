@@ -260,6 +260,21 @@ local function flattenToWaterline(pos: Vector3)
 	return Vector3.new(pos.X, BOAT_WATERLINE_Y or pos.Y, pos.Z)
 end
 
+-- Compute a perpendicular detour anchor between two points (XZ plane).
+-- Useful when no explicit detour marker exists: pushes path around land corners.
+local function perpendicularAnchorBetween(a: Vector3, b: Vector3, side: number?)
+	local delta = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+	local mag = delta.Magnitude
+	if mag < 1e-3 then return nil end
+
+	local dir = delta / mag
+	local perp = Vector3.new(-dir.Z, 0, dir.X) * (side or 1)
+	local offset = math.clamp(mag * 0.35, 40, 180)
+	local mid = (a + b) * 0.5
+
+	return flattenToWaterline(mid + perp * offset)
+end
+
 local function buildPathEvaluator(points: { Vector3 }, applyWave: boolean)
 	points = points or {}
 	if #points < 2 then
@@ -530,14 +545,26 @@ local function launchBoat(player: Player, ctx)
 	local useWave = false
 
 	local detourSpec = DETOUR_SPECS[rock.id]
+	local detourAdded = false
 	if detourSpec and detourSpec.anchors then
 		for _, anchorId in ipairs(detourSpec.anchors) do
 			local detour = findRockById(anchorId)
 			if detour and detour.part then
 				table.insert(points, flattenToWaterline(detour.part.Position))
+				detourAdded = true
 			end
 		end
 		useWave = (detourSpec.wavy == nil) and true or detourSpec.wavy
+	end
+
+	-- If this is a marked detour but no explicit anchor was found, synthesize a perpendicular bend.
+	if detourSpec and not detourAdded then
+		local perp = perpendicularAnchorBetween(startPos, targetPos, detourSpec.side)
+		if perp then
+			table.insert(points, perp)
+			detourAdded = true
+			useWave = true
+		end
 	end
 
 	table.insert(points, targetPos)

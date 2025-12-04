@@ -25,7 +25,7 @@ return {
 
 	LIMITS = {
 		-- Soft limits; PlayerDataService will refuse to commit when PER_SAVE_BYTES is exceeded.
-		PER_SAVE_BYTES = 1024 * 1024, -- allow up to ~1MB payloads
+		PER_SAVE_BYTES = 1536 * 1024, -- allow up to ~1.5MB payloads (still well under platform cap)
 		ROADS_B64_MAX = 200 * 1024,
 		ZONES_B64_MAX = 200 * 1024,
 	},
