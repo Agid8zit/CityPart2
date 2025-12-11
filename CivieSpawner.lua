@@ -36,6 +36,7 @@ local ZoneTrackerModule = require(game.ServerScriptService.Build.Zones.ZoneManag
 local CivilianMovement  = require(script.Parent.CivieMovement)
 
 -- Events
+local RemoteEvents         = ReplicatedStorage:WaitForChild("Events"):WaitForChild("RemoteEvents")
 local BindableEvents       = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
 local ZoneAddedEvent       = BindableEvents:WaitForChild("ZoneAdded")
 local ZoneRemovedEvent     = BindableEvents:WaitForChild("ZoneRemoved")
@@ -56,10 +57,22 @@ ForceCivTest.Name  = "ForceCivTest"
 
 local CiviliansFolder   = ReplicatedStorage:WaitForChild("FuncTestGroundRS"):WaitForChild("Civilians")
 
+local CivClientDriveRE = RemoteEvents:FindFirstChild("CivClientDrive") or Instance.new("RemoteEvent")
+CivClientDriveRE.Name = "CivClientDrive"
+CivClientDriveRE.Parent = RemoteEvents
+local CivClientArrivedRE = RemoteEvents:FindFirstChild("CivClientArrived") or Instance.new("RemoteEvent")
+CivClientArrivedRE.Name = "CivClientArrived"
+CivClientArrivedRE.Parent = RemoteEvents
+local CivClientAckRE = RemoteEvents:FindFirstChild("CivClientDriveAck") or Instance.new("RemoteEvent")
+CivClientAckRE.Name = "CivClientDriveAck"
+CivClientAckRE.Parent = RemoteEvents
+
 local zoneCellsCache   = {}
 local zoneCellsVersion = {}
 local zoneSnapshotCache = {}
 local zoneOwner        = {}   -- zoneKey -> Player (for deferred maintain)
+
+local CLIENT_DRIVE_DEBUG = true
 
 local civTemplates = {}
 local function refreshCivTemplates()
@@ -86,8 +99,8 @@ end
 local CFG = {
 	-- populations
 	MaxAlivePerZone      = 1,
-	GlobalMaxAlive       = 40,    -- per-player ceiling
-	ServerGlobalMaxAlive = 120,   -- hard ceiling across all players (failsafe)
+	GlobalMaxAlive       = 10,    -- per-player ceiling
+	ServerGlobalMaxAlive = 60,    -- hard ceiling across all players (failsafe)
 	TargetMin            = 1,
 	TargetMax            = 1,
 	ZoneTypesEligible    = { Residential=true, ResDense=true, Commercial=true, CommDense=true, Industrial=true, IndusDense=true },
@@ -100,10 +113,10 @@ local CFG = {
 	CivilianWalkSpeed    = 3.5,    -- studs/sec (Humanoid WalkSpeed)
 
 	-- pathing
-	MinZonePathCells     = 6,      -- require at least this many grid steps for inter-zone route
+	MinZonePathCells     = 2,      -- lowered so short hops still spawn
 	GridStrideCells      = 3,      -- only used in Manhattan fallback
 	DestinationStrategy  = "nearest",
-	FallbackMaxNodes     = 20000,  -- cap for emergency edge→edge fallback search
+	FallbackMaxNodes     = 12000,  -- cap for emergency edge-to-edge fallback search
 
 	-- despawn queue budget (tune to your server perf)
 	MaxUnparentPerStep   = 16,     -- how many instances to Parent=nil per Heartbeat
@@ -121,6 +134,9 @@ local CFG = {
 	-- despawn placement (destination)
 	DespawnAtTargetEdge      = true,  -- NEW: clip final waypoint to the border outside the destination zone
 	DespawnEdgePreferAlign   = true,  -- NEW: bias dest-edge pick toward final approach vector
+
+	-- client-driven simulation (reduces server->client traffic)
+	ClientDriven            = true,
 }
 
 local function mergeCfg(base, override)
@@ -133,32 +149,32 @@ end
 local CFG_BY_TIER = {
 	["desktop-high"] = CFG,
 	["desktop-balanced"] = mergeCfg(CFG, {
-		GlobalMaxAlive       = 32,
-		ServerGlobalMaxAlive = 110,
+		GlobalMaxAlive       = 8,
+		ServerGlobalMaxAlive = 48,
 		LifeSeconds          = 200,
 		TTLJitterSeconds     = 45,
 		GridStrideCells      = 4,
-		FallbackMaxNodes     = 14000,
+		FallbackMaxNodes     = 10000,
 		MaxUnparentPerStep   = 14,
 		MaxDestroyPerStep    = 7,
 	}),
 	["desktop-low"] = mergeCfg(CFG, {
-		GlobalMaxAlive       = 26,
-		ServerGlobalMaxAlive = 95,
+		GlobalMaxAlive       = 6,
+		ServerGlobalMaxAlive = 36,
 		LifeSeconds          = 160,
 		TTLJitterSeconds     = 40,
 		GridStrideCells      = 4,
-		FallbackMaxNodes     = 10000,
+		FallbackMaxNodes     = 8000,
 		MaxUnparentPerStep   = 12,
 		MaxDestroyPerStep    = 6,
 	}),
 	["mobile-low"] = mergeCfg(CFG, {
-		GlobalMaxAlive       = 18,
-		ServerGlobalMaxAlive = 80,
+		GlobalMaxAlive       = 5,
+		ServerGlobalMaxAlive = 30,
 		LifeSeconds          = 130,
 		TTLJitterSeconds     = 35,
 		GridStrideCells      = 5,
-		FallbackMaxNodes     = 8000,
+		FallbackMaxNodes     = 6000,
 		MaxUnparentPerStep   = 10,
 		MaxDestroyPerStep    = 5,
 	}),
@@ -652,6 +668,10 @@ local function incAlive(zKey, owner, n)
 	if uid then
 		globalAliveByPlayer[uid] = (globalAliveByPlayer[uid] or 0) + delta
 	end
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivAlive] ++ zKey=%s alive=%d global(uid)=%s",
+			tostring(zKey), alivePerZone[zKey] or 0, uid and tostring(globalAliveByPlayer[uid]) or "nil"))
+	end
 end
 local function decAlive(zKey, n)
 	local delta = n or 1
@@ -665,11 +685,18 @@ local function decAlive(zKey, n)
 		local nextCount = math.max(0, (globalAliveByPlayer[uid] or 0) - applied)
 		globalAliveByPlayer[uid] = nextCount
 	end
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivAlive] -- zKey=%s alive=%d global(uid)=%s",
+			tostring(zKey), alivePerZone[zKey] or 0, uid and tostring(globalAliveByPlayer[uid]) or "nil"))
+	end
 end
 local function canSpawn(zKey)
 	local cfg = cfgForZoneKey(zKey)
 	if cfg.ServerGlobalMaxAlive and cfg.ServerGlobalMaxAlive > 0 then
 		if serverAliveCount() >= cfg.ServerGlobalMaxAlive then
+			if CLIENT_DRIVE_DEBUG then
+				print(string.format("[CivSpawn] gate: server cap reached (%d/%d)", serverAliveCount(), cfg.ServerGlobalMaxAlive))
+			end
 			return false
 		end
 	end
@@ -677,8 +704,17 @@ local function canSpawn(zKey)
 		local owner = zoneOwner[zKey]
 		local uid = owner and owner.UserId
 		if uid and (globalAliveByPlayer[uid] or 0) >= cfg.GlobalMaxAlive then
+			if CLIENT_DRIVE_DEBUG then
+				print(string.format("[CivSpawn] gate: player cap reached (%d/%d) uid=%s",
+					globalAliveByPlayer[uid] or 0, cfg.GlobalMaxAlive, tostring(uid)))
+			end
 			return false
 		end
+	end
+	local allowed = (alivePerZone[zKey] or 0) < cfg.MaxAlivePerZone
+	if not allowed and CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivSpawn] gate: zone cap reached alive=%d max=%d zKey=%s",
+			alivePerZone[zKey] or 0, cfg.MaxAlivePerZone, tostring(zKey)))
 	end
 	return (alivePerZone[zKey] or 0) < cfg.MaxAlivePerZone
 end
@@ -756,14 +792,17 @@ local function ensureZoneFolderWatcher(zKey, zoneId, folder)
 		dprint(("ChildRemoved: zone %s alive=%d"):format(zoneId, alivePerZone[zKey] or 0))
 
 		local owner = zoneOwner[zKey]
-		if owner and zoneActive[zKey] then
-			task.defer(function()
-				if zoneActive[zKey] and canSpawn(zKey) then
-					maintainZoneSteadyState(owner, zoneId)
+	if owner and zoneActive[zKey] then
+		task.defer(function()
+			if zoneActive[zKey] and canSpawn(zKey) then
+				if CLIENT_DRIVE_DEBUG then
+					print(string.format("[CivWatcher] ChildRemoved -> top-up zone=%s", tostring(zoneId)))
 				end
-			end)
-		end
-	end)
+				maintainZoneSteadyState(owner, zoneId)
+			end
+		end)
+	end
+end)
 end
 
 -- =========================================================
@@ -902,6 +941,10 @@ maintainZoneSteadyState = function(player, zoneId)
 	local alive   = alivePerZone[zKey] or 0
 	local deficit = math.max(0, math.min(target, cfg.MaxAlivePerZone) - alive)
 	if deficit <= 0 then return end
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[Maintain] zone=%s target=%d alive=%d deficit=%d canSpawn=%s",
+			tostring(zoneId), target, alive, deficit, tostring(canSpawn(zKey))))
+	end
 	local uid = owner and owner.UserId
 	local ownerAlive = (uid and globalAliveByPlayer[uid]) or 0
 	if globalCapEnabled(cfg) and ownerAlive >= cfg.GlobalMaxAlive then
@@ -922,6 +965,57 @@ local function pickCivilian()
 	if #civTemplates == 0 then return nil end
 	return civTemplates[math.random(1, #civTemplates)]
 end
+
+-- Try to hand simulation to the owning client (reduces server->client replication).
+local function tryClientDrive(player, model, path, speed)
+	if not (player and model and model.PrimaryPart and path and #path >= 2 and speed and speed > 0) then
+		return false
+	end
+
+	local okOwn = pcall(function()
+		model.PrimaryPart:SetNetworkOwner(player)
+	end)
+	if not okOwn then
+		return false
+	end
+
+	model:SetAttribute("ClientDrivePending", true)
+	model:SetAttribute("ClientDriveActive", false)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivClientDrive] send -> %s model=%s pts=%d speed=%.2f",
+			player.Name, tostring(model), #path, speed))
+	end
+	-- Defer one heartbeat to give replication a tick before the client tries to drive.
+	task.defer(function()
+		if model and model.Parent then
+			CivClientDriveRE:FireClient(player, model, path, speed)
+		end
+	end)
+	return true
+end
+
+-- Client confirms it is about to drive; mark active so we don't fall back.
+CivClientAckRE.OnServerEvent:Connect(function(player, model)
+	if not (player and model and model:IsA("Model")) then return end
+	local ownerId = model:GetAttribute("OwnerUserId")
+	if ownerId and ownerId ~= player.UserId then return end
+	model:SetAttribute("ClientDrivePending", false)
+	model:SetAttribute("ClientDriveActive", true)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivClientDrive] ack <- %s model=%s", player.Name, tostring(model)))
+	end
+end)
+
+-- Owner tells us the civ finished its walk; remove it early (folder watcher will account).
+CivClientArrivedRE.OnServerEvent:Connect(function(player, model)
+	if not (player and model and model:IsA("Model")) then return end
+	local ownerId = model:GetAttribute("OwnerUserId")
+	if ownerId and ownerId ~= player.UserId then return end
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivClientDrive] arrived <- %s model=%s", player.Name, tostring(model)))
+	end
+	enqueueDelete(model)
+end)
 
 spawnOneCivilianFlexible = function(player, zoneId)
 	local zKey = zoneKey(player, zoneId)
@@ -976,6 +1070,9 @@ spawnOneCivilianFlexible = function(player, zoneId)
 			return
 		end
 	end
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivSpawn] path picked zone=%s len=%d dest=%s", tostring(zoneId), #wpath, tostring(destIdForAttr)))
+	end
 
 	-- ===== ORIGIN: shift spawn to the *furthest-most* edge outside the origin zone, pushing past adjacent disallowed zones =====
 	local spawnPos = wpath[1]
@@ -1028,7 +1125,17 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	if hrp then
 		model.PrimaryPart = hrp
 		local p = spawnPos -- (may be edge-shifted far outward)
-		hrp.CFrame = CFrame.new(p + Vector3.new(0, cfg.InitialYLift, 0))
+		-- lift to prevent underground spawn; use HRP size as a guide
+		local yLift = cfg.InitialYLift + ((hrp.Size and hrp.Size.Y or 4) * 0.5)
+		local baseY = p.Y + yLift
+		hrp.CFrame = CFrame.new(p.X, baseY, p.Z)
+		-- raise entire path to the same height
+		local raisedPath = table.create(#wpath)
+		for i = 1, #wpath do
+			local wp = wpath[i]
+			raisedPath[i] = Vector3.new(wp.X, baseY, wp.Z)
+		end
+		wpath = raisedPath
 	end
 
 	incAlive(zKey, player, 1)
@@ -1045,14 +1152,41 @@ spawnOneCivilianFlexible = function(player, zoneId)
 	dprint(("[Spawn] zone=%s ws=%.1f ttl=%d pathLen=%d dest=%s originEdge=%s destEdge=%s (playerAlive=%d/%s)"):format(
 		zoneId, speed, ttl, #wpath, tostring(destIdForAttr), tostring(cfg.SpawnOnEdgeOutside), tostring(cfg.DespawnAtTargetEdge),
 		ownerAlive, tostring(cfg.GlobalMaxAlive or "inf")))
-	CivilianMovement.moveAlongPath(model, wpath, zoneId, {
-		WalkSpeed    = speed,
-		DestroyAtEnd = false,   -- we will enqueue despawn ourselves
-		OnComplete   = function()
-			-- Do NOT flip CivAlive here. Folder watcher will mark & account on removal.
-			enqueueDelete(model)
-		end,
-	})
+	local clientDrove = cfg.ClientDriven and tryClientDrive(player, model, wpath, speed)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[CivSpawn] triedClient=%s zone=%s pathPts=%d owner=%s", tostring(clientDrove), tostring(zoneId), #wpath, player.Name))
+	end
+	if not clientDrove then
+		CivilianMovement.moveAlongPath(model, wpath, zoneId, {
+			WalkSpeed    = speed,
+			DestroyAtEnd = false,   -- we will enqueue despawn ourselves
+			OnComplete   = function()
+				-- Do NOT flip CivAlive here. Folder watcher will mark & account on removal.
+				enqueueDelete(model)
+			end,
+		})
+	else
+		-- If the client never acks, fall back after a short grace period.
+		task.delay(1.0, function()
+			if not model or not model.Parent then return end
+			local active = model:GetAttribute("ClientDriveActive")
+			if active == true then return end
+			if CLIENT_DRIVE_DEBUG then
+				print(string.format("[CivClientDrive] fallback to server; no ack. model=%s owner=%s", tostring(model), player.Name))
+			end
+			model:SetAttribute("ClientDrivePending", false)
+			model:SetAttribute("ClientDriveActive", false)
+			-- Reset network owner so server drives.
+			pcall(function() model.PrimaryPart:SetNetworkOwner(nil) end)
+			CivilianMovement.moveAlongPath(model, wpath, zoneId, {
+				WalkSpeed    = speed,
+				DestroyAtEnd = false,
+				OnComplete   = function()
+					enqueueDelete(model)
+				end,
+			})
+		end)
+	end
 end
 
 local function seedTargetAndFill(player, zoneId)

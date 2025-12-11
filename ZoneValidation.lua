@@ -20,6 +20,7 @@ ZoneValidationModule.__index = ZoneValidationModule
 -- Configuration
 local DEBUG = false   -- Set to true for detailed debugging
 local EPS   = 1e-6    -- tiny nudge to avoid boundary ties
+local GRID_SIZE = GridConfig.GRID_SIZE or 4
 
 -- ------------------------------------------------------------------
 -- Debug helpers
@@ -143,6 +144,11 @@ local function getGlobalBoundsForPlot(plot)
 		table.insert(terrains, testTerrain)
 	end
 
+	-- If nothing defines terrain, bail early (callers should handle nil gracefully).
+	if #terrains == 0 then
+		return nil, terrains
+	end
+
 	local gb = GridConfig.calculateGlobalBounds(terrains)
 	local axisDirX, axisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
 	gb.axisDirX = axisDirX
@@ -156,8 +162,98 @@ local function convertGridToWorld(player, gx, gz)
 	if not plot then return Vector3.zero end
 
 	local gb, terrains = getGlobalBoundsForPlot(plot)
+	if not gb then return nil end
 	local wx, _, wz = GridUtils.globalGridToWorldPosition(gx, gz, gb, terrains)
 	return Vector3.new(wx, 1.025, wz)
+end
+
+-- ------------------------------------------------------------------
+-- Terrain support probe (lightweight version of the road checker)
+-- Returns "Land", "Water", "Cliff", or "Void".
+-- ------------------------------------------------------------------
+local function classifySupportAtGrid(player, gx, gz)
+	-- Safely resolve world position; if terrain/bounds missing, treat as land to avoid validation hard-fail.
+	local ok, pos = pcall(convertGridToWorld, player, gx, gz)
+	if not ok or not pos then
+		return "Land"
+	end
+
+	local origin = pos + Vector3.new(0, 50, 0)
+	local direction = Vector3.new(0, -500, 0)
+
+	local function classify(inst: Instance, mat: Enum.Material?)
+		if inst:IsA("BasePart") then
+			if mat == Enum.Material.Water or inst.Material == Enum.Material.Water then
+				return "Water"
+			end
+			if inst.Name:lower():find("cliff") or (inst.Parent and inst.Parent.Name:lower():find("cliff")) then
+				return "Cliff"
+			end
+			return "Land"
+		end
+		if mat == Enum.Material.Water then
+			return "Water"
+		end
+		return "Land"
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {}
+	params.IgnoreWater = false
+
+	local hit = Workspace:Raycast(origin, direction, params)
+	if not hit then
+		return "Void"
+	end
+
+	local primary = classify(hit.Instance, hit.Material)
+	local finalSupport = primary
+
+	-- If the first hit is water, probe again ignoring water to catch shallow cases.
+	if primary == "Water" then
+		local params2 = RaycastParams.new()
+		params2.FilterType = Enum.RaycastFilterType.Exclude
+		params2.FilterDescendantsInstances = {}
+		params2.IgnoreWater = true
+
+		local hit2 = Workspace:Raycast(origin, direction, params2)
+		if hit2 then
+			local secondary = classify(hit2.Instance, hit2.Material)
+			if secondary ~= "Water" then
+				finalSupport = secondary
+			end
+		end
+	end
+
+	-- If still water/void, treat unlock terrain segments as solid ground.
+	if finalSupport == "Water" or finalSupport == "Void" then
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = {}
+		local overlaps = Workspace:GetPartBoundsInBox(
+			CFrame.new(pos),
+			Vector3.new(GRID_SIZE, 200, GRID_SIZE),
+			op
+		)
+		for _, p in ipairs(overlaps) do
+			if p:IsA("BasePart") and p.Name:match("^Segment%d+$") then
+				finalSupport = "Land"
+				break
+			end
+		end
+	end
+
+	return finalSupport
+end
+
+local function gridListHasWater(player, gridList)
+	for _, coord in ipairs(gridList or {}) do
+		if classifySupportAtGrid(player, coord.x, coord.z) == "Water" then
+			return true, coord
+		end
+	end
+	return false, nil
 end
 
 -- ------------------------------------------------------------------
@@ -205,6 +301,9 @@ local function getUnlockGridSet(player)
 	if not unlockFolder then return {} end
 
 	local globalBounds = select(1, getGlobalBoundsForPlot(plot))
+	if not globalBounds then
+		return {}
+	end
 	local gridSize     = GridConfig.GRID_SIZE or 4
 	local rawAxisDirX, rawAxisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
 	local axisDirX     = (rawAxisDirX == -1) and -1 or 1
@@ -529,6 +628,14 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 		return false, "You cannot build over an unlockable item."
 	end
 
+	-- Block non-road placement on water
+	local isRoadMode = RoadTypes[mode] == true
+	local hasWater, waterCoord = gridListHasWater(player, gridList)
+	if hasWater and not isRoadMode then
+		pushLangNotification(player, "Cant build on water")
+		return false, string.format("Cannot place %s on water at (%d,%d).", mode, waterCoord.x, waterCoord.z)
+	end
+
 	-- Utilities can be built anywhere
 	if mode == "WaterPipe" or mode == "PowerLines" or mode == "MetroTunnel" then
 		debugPrint(mode, "can be built through other zones. Validation passed.")
@@ -809,6 +916,12 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 		return false, "Invalid grid position."
 	end
 
+	local isRoadMode = RoadTypes[mode] == true
+	if classifySupportAtGrid(player, gridPosition.x, gridPosition.z) == "Water" and not isRoadMode then
+		pushLangNotification(player, "Cant build on water")
+		return false, "Cannot place that on water."
+	end
+
 	if IgnoreValidation[mode] then
 		if overlapsAnyRoad(player, { gridPosition }) then
 			pushLangNotification(player, "Cant build on roads")
@@ -931,6 +1044,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 		if not hasRequiredInfrastructure(gridList) then
 			pushLangNotification(player, "Cant overlap zones")
 			return false, "Required infrastructure is not nearby."
+		end
+	end
+	if not RoadTypes[mode] then
+		local hasWater = gridListHasWater(player, gridList)
+		if hasWater then
+			pushLangNotification(player, "Cant build on water")
+			return false, "Cannot place non-road zones on water."
 		end
 	end
 

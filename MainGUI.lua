@@ -293,6 +293,13 @@ local UI_Top_Money_Gain_TextLabel = UI.top.money.Background.Gain
 local UI_CityNameLabel = UI.cityLevel.background.CityName
 
 local UI_DriveBtn = UI.left.drive.ImageButton
+local DRIVE_BUTTON_DISABLED = true
+if DRIVE_BUTTON_DISABLED then
+	pcall(function()
+		UI.left.drive.Visible = false
+		UI_DriveBtn.Visible = false
+	end)
+end
 local UI_PopulationBtn = UI.top.population.Background  -- (already present in your code)
 
 local OnboardingToggleEvent = BindableEvents:FindFirstChild("OnboardingToggle")
@@ -990,6 +997,8 @@ function MainGui.Init()
 	-- == City Name UI reference (added) ========================================
 	local UI_CityNameLabel = UI.cityLevel.background.CityName
 
+	local hasAuthoritativeCityName = false
+
 	-- Helper: set city name safely
 	local function _setCityName(name)
 		local text = ""
@@ -1001,6 +1010,14 @@ function MainGui.Init()
 		end
 		UI_CityNameLabel.Text = text
 	end
+	local function _applyCityNameFromData(name)
+		hasAuthoritativeCityName = true
+		_setCityName(name)
+	end
+	local function _markCityNameUnknown()
+		hasAuthoritativeCityName = false
+	end
+	_markCityNameUnknown()
 	_setCityName("...")
 
 	-- Listen to PlayerData snapshots/deltas and update city name
@@ -1017,7 +1034,7 @@ function MainGui.Init()
 		if not cur then return end
 		local sf = pd.savefiles and pd.savefiles[cur]
 		if not sf then return end
-		_setCityName(sf.cityName)
+		_applyCityNameFromData(sf.cityName)
 	end
 
 	-- Prime the label immediately if PlayerDataController already has a snapshot
@@ -1051,7 +1068,7 @@ function MainGui.Init()
 		-- If the city name for the current slot changes directly
 		-- Path pattern: "savefiles/<slotId>/cityName"
 		if string.match(path, "^savefiles/[^/]+/cityName$") then
-			_setCityName(newValue)
+			_applyCityNameFromData(newValue)
 			return
 		end
 
@@ -1059,9 +1076,10 @@ function MainGui.Init()
 		if path == "currentSaveFile" then
 			if type(_lastPD) == "table" and _lastPD.savefiles and _lastPD.savefiles[newValue] then
 				local sf = _lastPD.savefiles[newValue]
-				_setCityName(sf and sf.cityName)
+				_applyCityNameFromData(sf and sf.cityName)
 			else
 				-- fallback placeholder; next full snapshot will correct it
+				_markCityNameUnknown()
 				_setCityName("...")
 			end
 			return
@@ -1073,6 +1091,9 @@ function MainGui.Init()
 	local PlotAssigned = ReplicatedStorage.Events.RemoteEvents:FindFirstChild("PlotAssigned")
 	if PlotAssigned then
 		PlotAssigned.OnClientEvent:Connect(function(playerPlotName, _unlocks)
+			if hasAuthoritativeCityName then
+				return
+			end
 			if typeof(playerPlotName) == "string" and playerPlotName ~= "" then
 				_setCityName(playerPlotName)
 			end
@@ -1271,7 +1292,7 @@ function MainGui.Init()
 			end
 		end
 	end)
-	
+
 	UI_Top_HappinessButton.MouseButton1Down:Connect(function()
 		SoundController.PlaySoundOnce("UI", "SmallClick")
 		local Demands = PlayerGui.Demands
@@ -1287,7 +1308,7 @@ function MainGui.Init()
 			end
 		end
 	end)
-	
+
 	UI_DestroyButton.MouseButton1Down:Connect(function()
 		if onboardingLocked then return end
 		SoundController.PlaySoundOnce("UI", "SmallClick")
@@ -1404,55 +1425,59 @@ function MainGui.Init()
 	)
 	------------------------------------------------------------------
 
-	--Drive
-	local DRIVE_COOLDOWN = 1.0
-	local _driveReadyAt = 0
+	if not DRIVE_BUTTON_DISABLED then
+		--Drive
+		local DRIVE_COOLDOWN = 1.0
+		local _driveReadyAt = 0
 
-	local function canDrive()
-		return time() >= _driveReadyAt
-	end
-	local function markDriveUsed()
-		_driveReadyAt = time() + DRIVE_COOLDOWN
-	end
+		local function canDrive()
+			return time() >= _driveReadyAt
+		end
+		local function markDriveUsed()
+			_driveReadyAt = time() + DRIVE_COOLDOWN
+		end
 
-	local function drivePulse()
-		-- quick visual nudge on the button
-		local img = UI_DriveBtn:FindFirstChild("ImageLabel")
-		if not img then return end
-		local t1 = TweenService:Create(img, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			Size = img.Size + UDim2.fromScale(0.08, 0.08),
-			Rotation = 7,
-		})
-		local t2 = TweenService:Create(img, TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-			Size = img.Size,
-			Rotation = 0,
-		})
-		t1:Play()
-		t1.Completed:Connect(function() t2:Play() end)
-	end
+		local function drivePulse()
+			-- quick visual nudge on the button
+			local img = UI_DriveBtn:FindFirstChild("ImageLabel")
+			if not img then return end
+			local t1 = TweenService:Create(img, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Size = img.Size + UDim2.fromScale(0.08, 0.08),
+				Rotation = 7,
+			})
+			local t2 = TweenService:Create(img, TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+				Size = img.Size,
+				Rotation = 0,
+			})
+			t1:Play()
+			t1.Completed:Connect(function() t2:Play() end)
+		end
 
-	local function triggerDrive()
-		if not canDrive() then return end
-		markDriveUsed()
-		SoundController.PlaySoundOnce("UI", "SmallClick")
-		drivePulse()
-		-- Fire remote; server will compute origin->farthest path and spawn
-		SpawnToDrive:FireServer()
-	end
-	triggerDriveRequest = triggerDrive
-	
-	local PlayUISoundRE = ReplicatedStorage.Events.RemoteEvents:FindFirstChild("PlayUISound")
-	if PlayUISoundRE then
-		PlayUISoundRE.OnClientEvent:Connect(function(cat, name)
-			pcall(function() SoundController.PlaySoundOnce(cat or "Misc", name or "PurchaseFail") end)
-		end)
-	end
-	
-	-- Mouse/touch
-	UI_DriveBtn.MouseButton1Down:Connect(triggerDrive)
-	-- Gamepad/Touch unified activation
-	if UI_DriveBtn.Activated then
-		UI_DriveBtn.Activated:Connect(triggerDrive)
+		local function triggerDrive()
+			if not canDrive() then return end
+			markDriveUsed()
+			SoundController.PlaySoundOnce("UI", "SmallClick")
+			drivePulse()
+			-- Fire remote; server will compute origin->farthest path and spawn
+			SpawnToDrive:FireServer()
+		end
+		triggerDriveRequest = triggerDrive
+
+		local PlayUISoundRE = ReplicatedStorage.Events.RemoteEvents:FindFirstChild("PlayUISound")
+		if PlayUISoundRE then
+			PlayUISoundRE.OnClientEvent:Connect(function(cat, name)
+				pcall(function() SoundController.PlaySoundOnce(cat or "Misc", name or "PurchaseFail") end)
+			end)
+		end
+
+		-- Mouse/touch
+		UI_DriveBtn.MouseButton1Down:Connect(triggerDrive)
+		-- Gamepad/Touch unified activation
+		if UI_DriveBtn.Activated then
+			UI_DriveBtn.Activated:Connect(triggerDrive)
+		end
+	else
+		triggerDriveRequest = nil
 	end
 
 	local DRIVER_X_OFFSET      = -2   -- Front-Back
@@ -1543,7 +1568,7 @@ function MainGui.Init()
 			require(PlayerGui.BoomboxSelection.Logic).OnHide()
 		end
 	end)
-	
+
 	UtilityGUI.VisualMouseInteraction(
 		UI_Top_HappinessButton, UI_Top_HappinessButton.UIStroke,
 		TweenInfo.new(0.15),
@@ -1568,17 +1593,62 @@ function MainGui.Init()
 
 	-- Display Income/Balance
 	local UIUpdate_RemoteEvent = ReplicatedStorage.Events.RemoteEvents.UpdateStatsUI
+	local BALANCE_PREDICT_INTERVAL_SEC = 6 -- slightly slower visual climb than the 5s payout
+	local balanceVisualState = {
+		lastServerBalance = 0,
+		lastServerIncome = 0,
+		lastServerAt = time(),
+	}
+
+	local function formatBalance(val: number)
+		return "$" .. tostring(Abr.abbreviateNumber(math.floor(val + 0.5)))
+	end
+
+	local function renderBalance(val: number)
+		UI_Top_Money_Amount_TextLabel.Text = formatBalance(val)
+	end
+
+	local function updateBalanceStateFromServer(balance: number?, income: number?)
+		local numericBalance = tonumber(balance)
+		if not numericBalance then
+			return
+		end
+
+		balanceVisualState.lastServerBalance = numericBalance
+		if income ~= nil then
+			local inc = tonumber(income)
+			if inc then
+				balanceVisualState.lastServerIncome = inc
+			end
+		end
+		balanceVisualState.lastServerAt = time()
+		renderBalance(numericBalance)
+	end
+
+	RunService.RenderStepped:Connect(function()
+		local income = balanceVisualState.lastServerIncome or 0
+		if income == 0 then
+			return
+		end
+
+		local elapsed = math.max(0, time() - (balanceVisualState.lastServerAt or time()))
+		local t = math.clamp(elapsed / BALANCE_PREDICT_INTERVAL_SEC, 0, 1)
+		local predicted = balanceVisualState.lastServerBalance + income * t
+		renderBalance(predicted)
+	end)
+
 	UIUpdate_RemoteEvent.OnClientEvent:Connect(function(data)
 		if data then
-			UI_Top_Money_Amount_TextLabel.Text = "$" .. tostring(Abr.abbreviateNumber(data.balance))
-			UI_Top_Money_Gain_TextLabel.Text = "+ $" .. tostring(Abr.abbreviateNumber(data.income))
+			updateBalanceStateFromServer(data.balance, data.income)
+			UI_Top_Money_Gain_TextLabel.Text = "+ $" .. tostring(Abr.abbreviateNumber(data.income or 0))
 		end
 	end)
 	RE_PlayerDataChanged_Money.OnClientEvent:Connect(function(balance)
 		if typeof(balance) ~= "number" then
 			return
 		end
-		UI_Top_Money_Amount_TextLabel.Text = "$" .. tostring(Abr.abbreviateNumber(balance))
+		-- keep using the last known income so the visual climb continues smoothly
+		updateBalanceStateFromServer(balance, balanceVisualState.lastServerIncome)
 	end)
 	UI_Top_Money_Amount_TextLabel.Text = "..."
 	UI_Top_Money_Gain_TextLabel.Text = "..."

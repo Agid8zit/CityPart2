@@ -291,7 +291,9 @@ end
 
 -- Coverage computation preserved
 local function computeCoverage(player)
-	local totalsReq  = DistrictStatsModule.getTotalsForPlayer(player)
+	-- Use served demand only so disconnected zones don't tank coverage.
+	local totalsReq  = ZoneRequirementsChecker.getEffectiveServedTotals(player)
+		or DistrictStatsModule.getTotalsForPlayer(player)
 	local produced   = ZoneRequirementsChecker.getEffectiveProduction(player)
 		or DistrictStatsModule.getUtilityProduction(player)
 
@@ -374,7 +376,7 @@ local function doPayoutChunked()
 			warn(("[Income] payout skipped for %s: %s"):format(
 				(player and player.Name) or ("player#" .. tostring(i)),
 				tostring(err)
-			))
+				))
 		end
 
 		-- Yield cooperatively under long-task budget

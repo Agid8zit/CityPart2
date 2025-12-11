@@ -30,6 +30,12 @@ local BusSupportUnlocked   = BindableEvents:WaitForChild("BusSupportUnlocked")
 local BusSupportRevoked    = BindableEvents:WaitForChild("BusSupportRevoked")
 local SpawnCarToFarthestEvt = RemoteEvents:FindFirstChild("SpawnCarToFarthest")
 local CameraAttachEvt       = RemoteEvents:FindFirstChild("CameraAttachToCar")
+local TrafficClientDriveEvt = RemoteEvents:FindFirstChild("TrafficClientDrive") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientDriveEvt.Name = "TrafficClientDrive"
+local TrafficClientAckEvt   = RemoteEvents:FindFirstChild("TrafficClientDriveAck") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientAckEvt.Name   = "TrafficClientDriveAck"
+local TrafficClientArrivedEvt = RemoteEvents:FindFirstChild("TrafficClientArrived") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientArrivedEvt.Name = "TrafficClientArrived"
 
 -- Save reload gates (optional, but your stack has them)
 local RequestReloadFromCurrentEvt = BindableEvents:FindFirstChild("RequestReloadFromCurrent")
@@ -222,6 +228,48 @@ local function currentDispatchMode(ctx)
 	end
 	return DISPATCH_MODE
 end
+
+local CLIENT_DRIVE_ENABLED = true  -- flip false to revert to server tweens
+local CLIENT_DRIVE_DEBUG   = false
+local CLIENT_DRIVE_MAX_POINTS = 120 -- gate client-drive on very long paths to limit payload size
+local CLIENT_DRIVE_ALLOWED_TIERS = {
+	["desktop-high"]     = true,
+	["desktop-balanced"] = true,
+}
+local function clientDriveAllowed(player: Player?)
+	if not CLIENT_DRIVE_ENABLED then return false end
+	local tier = perfTier(player)
+	return CLIENT_DRIVE_ALLOWED_TIERS[tier] == true
+end
+
+local function _markClientArrived(car: Model?)
+	if not car then return end
+	local ownerId = tonumber(car:GetAttribute("TrafficOwner"))
+	if not ownerId then return end
+	local ctx = ctxByUserId[ownerId]
+	if ctx and ctx.cars and ctx.cars[car] then
+		ctx.cars[car] = nil
+		ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
+	end
+end
+
+TrafficClientAckEvt.OnServerEvent:Connect(function(player, car)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[TrafficClient] ack <- %s car=%s", player and player.Name or "?", car))
+	end
+	if not car or not car:IsA("Model") then return end
+	car:SetAttribute("ClientDriveActive", true)
+	car:SetAttribute("ClientDrivePending", false)
+end)
+
+TrafficClientArrivedEvt.OnServerEvent:Connect(function(player, car)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[TrafficClient] arrived <- %s car=%s", player and player.Name or "?", car))
+	end
+	if not car or not car:IsA("Model") then return end
+	_markClientArrived(car)
+	fadeOutAndDestroy(car, FADE_OUT_TIME)
+end)
 
 local templates = {
 	default = {},
@@ -1067,13 +1115,49 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel,
 	}
 
 	local pathId = newPathId(player.UserId)
-	CarMovement.moveCarAlongPath(car, worldPath, opts, function(arrived)
+	local function onArrive(arrived)
 		if ctx.cars[car] then
 			ctx.cars[car] = nil
 			ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
 		end
 		fadeOutAndDestroy(arrived, FADE_OUT_TIME)
-	end, pathId)
+	end
+
+	local clientDrove = false
+	if player and clientDriveAllowed(player) and #worldPath <= CLIENT_DRIVE_MAX_POINTS then
+		car:SetAttribute("ClientDrivePending", true)
+		car:SetAttribute("ClientDriveActive", false)
+		local okOwn = pcall(function()
+			if car.PrimaryPart then car.PrimaryPart:SetNetworkOwner(player) end
+		end)
+		if okOwn then
+			if CLIENT_DRIVE_DEBUG then
+				print(string.format("[TrafficClient] send -> %s car=%s pts=%d variant=%s", player.Name, tostring(car), #worldPath, tostring(variantLabel)))
+			end
+			task.defer(function()
+				if car and car.Parent then
+					TrafficClientDriveEvt:FireClient(player, car, worldPath, opts, pathId)
+				end
+			end)
+			clientDrove = true
+			-- Fallback if client never acks
+			task.delay(1.0, function()
+				if not car or not car.Parent then return end
+				if car:GetAttribute("ClientDriveActive") == true then return end
+				if CLIENT_DRIVE_DEBUG then
+					print(string.format("[TrafficClient] fallback server drive; no ack car=%s owner=%s", tostring(car), player.Name))
+				end
+				car:SetAttribute("ClientDrivePending", false)
+				car:SetAttribute("ClientDriveActive", false)
+				pcall(function() if car.PrimaryPart then car.PrimaryPart:SetNetworkOwner(nil) end end)
+				CarMovement.moveCarAlongPath(car, worldPath, opts, onArrive, pathId)
+			end)
+		end
+	end
+
+	if not clientDrove then
+		CarMovement.moveCarAlongPath(car, worldPath, opts, onArrive, pathId)
+	end
 	return car
 end
 

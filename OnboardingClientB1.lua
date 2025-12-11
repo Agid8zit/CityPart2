@@ -1,4 +1,4 @@
--- StarterPlayerScripts/OnboardingController.client.lua
+-- StarterPlayerScripts/OnboardingController.client.lua (Barrage1-only fork)
 -- Single-source-of-truth for onboarding UI pulses, arrows, and BuildMenu gating.
 -- Minimal, defensive, and race-safe. (Localization-first: NO literal UI strings here.)
 -- [DEBUG] Deep instrumentation for arrow/pulse/gate decisions, BuildMenu open/close,
@@ -631,11 +631,8 @@ local function findClickableButton(target)
 end
 
 local function allowAutoCommit()
-	-- B2/B3 should always wait for explicit clicks (no auto-commit),
-	-- as should any manual override or barrage1.
-	if activeSeq == "barrage1" then return false end
-	if activeSeq == "barrage2" or activeSeq == "barrage3" then return false end
-	return not manualTabOverride
+	-- Barrage1/Barrage2 always wait for explicit clicks; never auto-commit.
+	return false
 end
 
 local function connectClickWatcher(kind, key, onClick)
@@ -1113,6 +1110,7 @@ local function scheduleHoldForItem(id, forceHold)
 end
 
 manualTabOverrideChanged = function(enabled)
+	-- When manually guiding tabs/hubs, reset any stale commits.
 	if enabled then
 		triggerManualOverrideReset()
 	end
@@ -1125,7 +1123,7 @@ local function shouldForceManualForItem(seq, id)
 	return false
 end
 
--- REVERTED: no forceReset argument/behavior
+-- Refresh manual override per current guard step
 local function refreshManualTabGuidance()
 	local step = guardSeq and guardSeq[guardIdx]
 	local id = step and canonItem(step.mode or step.item)
@@ -1348,13 +1346,6 @@ local function GuardStart(seq, resumeAt)
 		if activeSeq == "barrage1" then
 			local hintKey = OB1_STEP_HINT_KEYS[guardIdx]
 			if hintKey then showOB1(hintKey, DUR.HINT) end
-		elseif activeSeq == "barrage2" then
-			local id = canonItem(cur.mode or cur.item)
-			if id == "WindTurbine" or id == "PowerLines" then
-				showB2(LANG.OB2_CONNECT_POWER, DUR.HINT)
-			elseif id == "WaterPipe" then
-				showB2(LANG.OB2_CONNECT_WATER, DUR.HINT)
-			end
 		elseif activeSeq == "barrage3" then
 			showB3(LANG.OB3_Industrial_Hint, DUR.HINT)
 		end
@@ -1432,15 +1423,6 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	dbg_route("orchestrate (skipRoute=%s) activeSeq=%s owner=%s lastKey=%s",
 		tostring(skipRoute), tostring(activeSeq), tostring(arrowOwner), tostring(lastArrowKey))
 
-	-- Detect target changes so we can reset any stale tab/hub commits for specific steps.
-	if lastRouteId ~= currentGateId then
-		if activeSeq == "barrage2" and currentGateId == "WaterPipe" then
-			-- Ensure we re-walk Supply -> Water -> WaterPipe after power lines.
-			triggerManualOverrideReset()
-		end
-		lastRouteId = currentGateId
-	end
-
 	-- If asked, cancel any in-progress route (showcase)
 	if skipRoute == true and barrage1RouteActive then
 		cancelBarrage1Route()
@@ -1462,7 +1444,7 @@ arrowAndGateToCurrentStep = function(skipRoute)
 
 	local skipBarrageRoute = (skipRoute == true)
 
-	-- Prefer guard/flow hints when present; fall back to explicit server gates (B2/B3).
+	-- Prefer guard/flow hints when present; fall back to explicit server gates.
 	local id, flowState = resolveCurrentTarget()
 	dbg_route("choose id (gate=%s) -> id=%s", tostring(currentGateId), tostring(id))
 
@@ -1477,12 +1459,6 @@ arrowAndGateToCurrentStep = function(skipRoute)
 	setManualTabOverride(manualForId, manualForId and id or nil)
 	if manualForId then
 		scheduleHoldForItem(id, true)
-	end
-
-	if activeSeq ~= "barrage1" then
-		barrage1LastIndex = 0
-		majorHoldUntil = 0
-		hubHoldUntil   = 0
 	end
 
 	local now = os.clock()
@@ -1529,13 +1505,8 @@ arrowAndGateToCurrentStep = function(skipRoute)
 		if contextAligned then
 			cancelBarrage1Route()
 			clearBuildMenuPulsesExcept(nil)
-			if activeSeq == "barrage1" then
-				dbg_route("tool already selected (%s), repulse tile", tostring(id))
-				repulseSameToolIfNeeded(id)
-			else
-				dbg_route("tool already selected (%s), hide global arrow", tostring(id))
-				HideArrow("tool-already-selected")
-			end
+			dbg_route("tool already selected (%s), repulse tile", tostring(id))
+			repulseSameToolIfNeeded(id)
 			return
 		end
 	end
@@ -1631,16 +1602,7 @@ arrowAndGateToCurrentStep = function(skipRoute)
 		dbg_route("target hub key=%s hold=%.2f", tostring(targetKey), holdHub)
 		requestPulseAndArrow(targetKey, UDim2.new(0,0,-0.12,0))
 
-		-- Manual steps (barrage2 WaterPipe / barrage3 PowerLines) benefit from pulsing the major tab too.
-		-- Keep both Supply and the hub lit instead of clearing down to a single pulse.
-		if manualTabOverride and wantMajor then
-			local majorKey = resolveMajorKey(wantMajor)
-			if majorKey and majorKey ~= targetKey then
-				requestPulseAndArrow(majorKey, UDim2.new(0,0,-0.12,0))
-			end
-		else
-			clearBuildMenuPulsesExcept(targetKey)
-		end
+		clearBuildMenuPulsesExcept(targetKey)
 
 		local clickArmed = connectClickWatcher("hub", targetKey, function()
 			setCommitted(nil, wantHub)
@@ -1885,8 +1847,6 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				if activeSeq == "barrage1" then
 					local doneKey = OB1_STEP_DONE_KEYS[justDone]
 					if doneKey then showOB1(doneKey, DUR.DONE) end
-				elseif activeSeq == "barrage3" then
-					showB3(LANG.OB3_Industrial_Done, DUR.DONE)
 				end
 
 				-- Stop any pulse for the reported (or expected) item
@@ -1932,16 +1892,13 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			return
 		end
 
-		-- ===== Legacy / local guard driver path (B2/B3 or pre-Flow) =====
+		-- ===== Legacy / local guard driver path (pre-Flow) =====
 		local justDone = math.max(guardIdx, 1)
 		dbg_fb("legacy done justDone=%d", justDone)
 
 		if activeSeq == "barrage1" then
 			local doneKey = OB1_STEP_DONE_KEYS[justDone]
 			if doneKey then showOB1(doneKey, DUR.DONE) end
-		elseif activeSeq == "barrage3" then
-			showB3(LANG.OB3_Industrial_Done, DUR.DONE)
-			pcall(function() StepCompleted:FireServer("B3_ZonePlaced") end)
 		elseif activeSeq == "barrage2" then
 			-- Contextual next coaching for B2
 			if justDone == 1 then
@@ -1949,6 +1906,13 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			elseif justDone == 2 then
 				showB2(LANG.OB2_CONNECT_WATER, DUR.HINT)
 			end
+			-- After PowerLines are placed (B2 step 2), close the Build Menu.
+			if justDone == 2 or fbItem == "PowerLines" or expected == "PowerLines" then
+				forceCloseBuildMenu("B2_PowerLinesDone")
+			end
+		elseif activeSeq == "barrage3" then
+			showB3(LANG.OB3_Industrial_Done, DUR.DONE)
+			pcall(function() StepCompleted:FireServer("B3_ZonePlaced") end)
 		end
 
 		pcall(function()
@@ -1959,19 +1923,19 @@ BE_GuardFB.Event:Connect(function(tag, info)
 			})
 		end)
 
+		local id = fbItem or expected
+		if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
+
 		if isSecondBarrage3PipeStep(justDone) then
 			forceCloseBuildMenu("B3Pipe2")
 		end
 
-		local id = fbItem or expected
-		if id then Stop(id); if guardPulseItem == id then guardPulseItem = nil end end
-
 		local wasLast = justDone >= #guardSeq
 		if wasLast then
-			if activeSeq ~= "barrage2" then
-				pcall(function() StepCompleted:FireServer("OnboardingFinished") end)
-			else
+			if activeSeq == "barrage2" then
 				pcall(function() StepCompleted:FireServer("B2_LocalSequenceFinished") end)
+			else
+				pcall(function() StepCompleted:FireServer("OnboardingFinished") end)
 			end
 		end
 		GuardAdvance()
@@ -1993,6 +1957,8 @@ BE_GuardFB.Event:Connect(function(tag, info)
 					nextB2Hint = LANG.OB2_CONNECT_WATER
 				end
 				nextId = nid
+			elseif activeSeq == "barrage3" then
+				nextId = canonItem(nextGuard.mode or nextGuard.item)
 			else
 				nextId = canonItem(nextGuard.mode or nextGuard.item)
 			end
@@ -2012,6 +1978,8 @@ BE_GuardFB.Event:Connect(function(tag, info)
 				showOB1(nextHintKey, DUR.HINT)
 			elseif activeSeq == "barrage2" and nextB2Hint then
 				showB2(nextB2Hint, DUR.HINT)
+			elseif activeSeq == "barrage3" then
+				showB3(LANG.OB3_Industrial_Hint, DUR.HINT)
 			end
 			if nextId then
 				showRoutingHintsForItemId(nextId)
@@ -2346,6 +2314,7 @@ StateChanged.OnClientEvent:Connect(function(stepName, payload)
 		applyToggle(false)
 		return
 	end
+
 end)
 
 -- Self-nudge seed --

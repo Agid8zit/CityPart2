@@ -4,7 +4,7 @@
 local START_TIME = os.clock()
 local Debug      = false
 -- Flip WarnEnabled/Debug here manually when you want output; no events or runtime hooks required.
-local WarnEnabled = true
+local WarnEnabled = false
 local _warn = warn
 local function warnIfEnabled(...)
 	if WarnEnabled then
@@ -1038,11 +1038,11 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 		prevRoadsValid   = isValidB64(prevRoadsB64)
 		prevUnlocksValid = isValidB64(prevUnlocksB64)
 	end)
-	
+
 	-- [NEW] Decode previous rows once for **per-zone fallback**
 	local prevRowsById = decodePrevZoneRows(prevZonesB64)
 	local prevRoadById = decodePrevRoadRows(prevRoadsB64)
-	
+
 	-- Zones & buildings
 	do
 		local zoneRows, missingSet = makeZoneRows(player)

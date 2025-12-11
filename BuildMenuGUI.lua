@@ -43,7 +43,7 @@ local BUTTON_SCROLL_SPEED = 300
 
 -- Defines
 local UI = script.Parent
-local LocalPlayer = Players.LocalPlayerSl
+local LocalPlayer = Players.LocalPlayer
 local MajorCurrentTabName = nil
 local CurrentTabName = nil
 local TabSections = {} -- [TabName] = FrameContainer
@@ -712,30 +712,61 @@ local function recomputeTopTabBadges()
 end
 
 -- When user opens a section, mark everything in that section as "seen"
+local markItemSeen -- forward declaration
+
 local function markSectionSeen(sectionName: string)
 	local uiSection = TabSections[sectionName]
 	if not uiSection then return end
 
-	-- Clear per-button dots + pending flags for items in this section
-	for itemID, btn in pairs(FrameButtons) do
+	-- Clearing a section now happens per-item via markItemSeen; kept for compatibility if ever invoked.
+	for itemID in pairs(PendingByItem) do
 		if ItemToSection[itemID] == sectionName then
-			PendingByItem[itemID] = nil
-			local dot = btn:FindFirstChild("notification")
-			if dot then dot.Visible = false end
+			-- markItemSeen will update dots and badges for us
+			markItemSeen(itemID)
+		end
+	end
+end
+
+-- Clear a single item's pending dot only after the user actually looks at it (hover/click).
+markItemSeen = function(itemID: string)
+	if not (itemID and PendingByItem[itemID]) then return end
+	PendingByItem[itemID] = nil
+
+	local btn = FrameButtons[itemID]
+	if btn then
+		local dot = btn:FindFirstChild("notification")
+		if dot then dot.Visible = false end
+	end
+
+	local section = ItemToSection[itemID]
+	if section then
+		local anyPending = false
+		for id, pending in pairs(PendingByItem) do
+			if pending and ItemToSection[id] == section then
+				anyPending = true
+				break
+			end
+		end
+		SectionHasPending[section] = anyPending
+
+		local hubBtn = CategoryButtonForSection[section]
+		if hubBtn then
+			local dot = hubBtn:FindFirstChild("notification")
+			if dot then dot.Visible = anyPending end
 		end
 	end
 
-	SectionHasPending[sectionName] = false
 	recomputeTopTabBadges()
 end
 
-local function entriesFor(features: {string})
+local function entriesFor(features: {string}, labelsById: {[string]: string}?)
 	local arr = {}
 	for _, id in ipairs(features) do
 		-- Prefer icon for these
 		local icon = FeatureIcons[id]
 		if icon then
-			arr[#arr+1] = { image = icon, label = id }
+			local label = (labelsById and labelsById[id]) or id
+			arr[#arr+1] = { image = icon, label = label }
 		else
 			-- Fall back to model if mapped
 			local m = FeatureModels[id]
@@ -751,6 +782,31 @@ local function shallowCopy(t)
 	local c = {}
 	for k, v in pairs(t) do c[k] = v end
 	return c
+end
+
+-- Build a readable label for unlock popups that pairs the hub/section with the item.
+local function hubAwareLabel(itemID: string)
+	local friendly = tostring(itemID)
+	do
+		local btn = FrameButtons[itemID]
+		local nameLabel = btn and btn.info and btn.info.itemName
+		if nameLabel then
+			local langKey = nameLabel:GetAttribute("LangKey")
+			local text = nameLabel.Text
+			local resolved = _resolveLang(langKey, text or itemID)
+			if type(resolved) == "string" and resolved ~= "" then
+				friendly = resolved
+			elseif type(text) == "string" and text ~= "" then
+				friendly = text
+			end
+		end
+	end
+
+	local hub = ItemToSection[itemID]
+	if hub and hub ~= "" then
+		return hub .. " - " .. friendly
+	end
+	return friendly
 end
 
 local function openUnlockModal(gainedList)
@@ -779,10 +835,18 @@ local function openUnlockModal(gainedList)
 	end
 	if Mod.Init then pcall(Mod.Init) end
 
-	local title = (#gainedList == 1) and (gainedList[1] .. " Unlocked!") or "New items unlocked!"
-	local desc  = table.concat(gainedList, ", ")
+	local labelsById = {}
+	local displayList = {}
+	for _, id in ipairs(gainedList) do
+		local label = hubAwareLabel(id)
+		labelsById[id] = label
+		displayList[#displayList + 1] = label
+	end
 
-	local iconsOrModels = entriesFor(gainedList)
+	local title = (#displayList == 1) and (displayList[1] .. " Unlocked!") or "New items unlocked!"
+	local desc  = table.concat(displayList, ", ")
+
+	local iconsOrModels = entriesFor(gainedList, labelsById)
 	pcall(Mod.OnShow, title, desc, iconsOrModels)
 end
 
@@ -1648,6 +1712,7 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 			SoundController.PlaySoundOnce("UI", "SmallClick")
 			if Data.priceInRobux then
 				Choice.MouseButton1Down:Connect(function()
+					if Data.itemID then markItemSeen(Data.itemID) end
 					local SaveFileData = PlayerDataController.GetSaveFileData()
 					if SaveFileData and SaveFileData.exclusiveLocations[Data.priceInRobux] > 0 then
 						if Data.itemID then SetBuildingsTransparent(true) end
@@ -1659,6 +1724,7 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 				end)
 			else
 				Choice.MouseButton1Down:Connect(function()
+					if Data.itemID then markItemSeen(Data.itemID) end
 					-- [ADDED] Pre-click affordability gate for fixed-cost, non-robux, individual buildings.
 					-- We DO NOT block zones/lines here because their final cost is variable.
 					if Data.itemID and not isZoneOrLinear(Data.itemID) then
@@ -1729,6 +1795,11 @@ local function CreateTabSection(SectionName: string, Choices) -- {itemname, pric
 			if type(Data.itemID) == "string" and Data.itemID ~= "" then
 				_regTarget("BM_" .. Data.itemID, Choice)
 			end
+
+			-- Clear the pending dot only when the player actually hovers or clicks the item.
+			Choice.MouseEnter:Connect(function()
+				markItemSeen(Data.itemID)
+			end)
 
 			if PendingByItem[Data.itemID] then
 				dot.Visible = true
@@ -1872,15 +1943,6 @@ function BuildMenu.SetTab(TabName: string)
 		if _activeCategory then
 			RangeVisualsClient.applyCategory(_activeCategory)
 			RangeVisualsClient.debugDump()
-		end
-	end
-
-	if not _suppressSeen and hasConcrete and typeof(markSectionSeen) == "function" then
-		markSectionSeen(TabName)
-		local hubBtn = CategoryButtonForSection[TabName]
-		if hubBtn then
-			local dot = hubBtn:FindFirstChild("notification")
-			if dot then dot.Visible = false end
 		end
 	end
 

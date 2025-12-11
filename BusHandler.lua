@@ -313,6 +313,26 @@ local function spawnBusAtSlot(depot: Model, slot: Instance, busModel: Instance, 
 	vis:SetAttribute("DepotSlotTag", tag)
 	vis.Parent = holder
 
+	-- Parked depot buses should stay put and not block anything; pin and make them non-colliding.
+	local function anchorVisual(root: Instance)
+		if not root then return end
+		local function pin(part: BasePart)
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanQuery = false
+			part.CanTouch = false
+		end
+		if root:IsA("BasePart") or root:IsA("MeshPart") then
+			pin(root)
+		end
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("BasePart") or d:IsA("MeshPart") then
+				pin(d)
+			end
+		end
+	end
+	anchorVisual(vis)
+
 	-- derive pivot from slot (BasePart / Attachment / Model.PrimaryPart / first BasePart / depot pivot)
 	local pivotCF
 	if slot:IsA("BasePart") or slot:IsA("MeshPart") then
@@ -340,6 +360,7 @@ local function spawnBusAtSlot(depot: Model, slot: Instance, busModel: Instance, 
 		wrap.Name = vis.Name .. "_Wrap"
 		vis.Parent = wrap
 		wrap.Parent = holder
+		anchorVisual(wrap)
 		local pp = wrap:FindFirstChildWhichIsA("BasePart", true)
 		if pp then wrap.PrimaryPart = pp; wrap:PivotTo(pivotCF) end
 		wrap:SetAttribute("DepotSlotTag", tag)

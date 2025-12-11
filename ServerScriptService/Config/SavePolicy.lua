@@ -4,7 +4,7 @@ return {
 
 	PLAYER_DS_BY_ENV = {
 		Studio = "PlayerData_PublicTest2",
-		Release = "PlayerData_Release1",
+		Release = "PlayerData_Release2",
 	},
 
 	PLAYER_DS_ALL = {

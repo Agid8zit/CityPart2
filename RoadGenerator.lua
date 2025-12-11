@@ -1161,7 +1161,7 @@ local function placeStraightRoadDecorations(player, zoneFolder, placedRoadsData,
 					* CFrame.Angles(0, rotationY, 0)
 				toggle = not toggle
 
-				local decorationName = (math.random() < 0.5) and "Billboard" or "BillboardStanding"
+				local decorationName = "BillboardStanding"
 				local deco = BuildingMasterList.getBuildingByName(decorationName)
 				if deco and deco.stages and deco.stages.Stage3 then
 					local clone = deco.stages.Stage3:Clone()
@@ -1170,48 +1170,28 @@ local function placeStraightRoadDecorations(player, zoneFolder, placedRoadsData,
 					clone:SetAttribute("IsRoadDecoration", true)
 					clone:SetAttribute("GridX", cell.gridX)
 					clone:SetAttribute("GridZ", cell.gridZ)
-					
 
-				if clone:IsA("Model") and clone.PrimaryPart then
-					clone:SetPrimaryPartCFrame(decorationCF)
-				elseif clone:IsA("BasePart") then
-					clone.CFrame = decorationCF
-				end
-
-				for _, p in ipairs(clone:GetDescendants()) do
-					if p:IsA("BasePart") then
-						p.CanQuery = false
+					if clone:IsA("Model") and clone.PrimaryPart then
+						clone:SetPrimaryPartCFrame(decorationCF)
+					elseif clone:IsA("BasePart") then
+						clone.CFrame = decorationCF
 					end
-				end
-					
-					if decorationName == "Billboard" then
-						-- Alternate the lateral offset: one side +1.2, the other -1.2 (in LOCAL Z)
-						-- Decide side from which road-side offset we chose above
-						local sideSign
-						if     offset == eastWestOffsetA or offset == northSouthOffsetA then
-							sideSign =  1
-						else
-							sideSign = -1
-						end
 
-						if clone:IsA("Model") and clone.PrimaryPart then
-							-- Move in local space: down 1.5, then ±1.2 forward (model’s Z)
-							clone:SetPrimaryPartCFrame(clone:GetPrimaryPartCFrame() * CFrame.new(0, -1.5, 1.2 * sideSign))
-						elseif clone:IsA("BasePart") then
-							-- Same idea for a lone part
-							clone.CFrame = clone.CFrame * CFrame.new(0, -1.5, 1.2 * sideSign)
+					for _, p in ipairs(clone:GetDescendants()) do
+						if p:IsA("BasePart") then
+							p.CanQuery = false
 						end
 					end
 
-				clone.Parent = zoneFolder
-				attachRandomAd(clone)
-				debugPrint(
-					"[placeStraightRoadDecorations] Placed",
-					decorationName,
-					"at",
-					cell.gridX,
-					cell.gridZ
-				)
+					clone.Parent = zoneFolder
+					attachRandomAd(clone)
+					debugPrint(
+						"[placeStraightRoadDecorations] Placed",
+						decorationName,
+						"at",
+						cell.gridX,
+						cell.gridZ
+					)
 				else
 					warn("Missing model or Stage3 for decoration:", decorationName)
 				end
@@ -2231,8 +2211,9 @@ function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)
 						localPos={x=lp.X,y=lp.Y,z=lp.Z}, localYaw=lyaw,
 					})
 				elseif (obj.Name == "BillboardStanding" or obj.Name == "Billboard") then
+					local modelName = (obj.Name == "Billboard") and "BillboardStanding" or obj.Name
 					table.insert(snapshot.strDecos, {
-						gridX = gx, gridZ = gz, modelName = obj.Name,  -- << keep the real model name
+						gridX = gx, gridZ = gz, modelName = modelName,
 						localPos = { x = lp.X, y = lp.Y, z = lp.Z }, localYaw = lyaw,
 						adName = obj:GetAttribute("AdName"),
 					})
@@ -2419,12 +2400,15 @@ function RoadGeneratorModule.recreateStraightDecoration(player, zoneId, hostRota
 	local roadsFolder = plot:FindFirstChild("Roads"); if not roadsFolder then return end
 	local zoneFolder  = roadsFolder:FindFirstChild(zoneId); if not zoneFolder then return end
 
-	local asset = BuildingMasterList.getBuildingByName(d.modelName)
+	local requestedName = d and d.modelName or "BillboardStanding"
+	local modelName = (requestedName == "Billboard") and "BillboardStanding" or requestedName
+
+	local asset = BuildingMasterList.getBuildingByName(modelName)
 	if asset and not (asset.stages and asset.stages.Stage3) then
-		asset.stages = BuildingMasterList.loadBuildingStages("Road","Default",d.modelName)
+		asset.stages = BuildingMasterList.loadBuildingStages("Road","Default", modelName)
 	end
 	if not (asset and asset.stages and asset.stages.Stage3) then
-		warn("[recreateStraightDecoration] Missing asset:", d.modelName); return
+		warn("[recreateStraightDecoration] Missing asset:", modelName); return
 	end
 
 	local hostCF  = _baseCellCF(player, d.gridX, d.gridZ, hostRotation or 0)
@@ -2433,7 +2417,7 @@ function RoadGeneratorModule.recreateStraightDecoration(player, zoneId, hostRota
 	local finalCF = _applyLocal(hostCF, localCF)
 
 	local clone = asset.stages.Stage3:Clone()
-	clone.Name = d.modelName
+	clone.Name = modelName
 	clone:SetAttribute("ZoneId", zoneId)
 	clone:SetAttribute("IsRoadDecoration", true)
 	clone:SetAttribute("GridX", d.gridX)

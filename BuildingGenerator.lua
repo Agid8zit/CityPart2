@@ -12,6 +12,12 @@ local SoundEmitter = require(ReplicatedStorage.Scripts.SoundEmitter)
 local EventsFolder = ReplicatedStorage:WaitForChild("Events")
 local RemoteEvents = EventsFolder:WaitForChild("RemoteEvents")
 local PlayUISoundRE = RemoteEvents:FindFirstChild("PlayUISound")
+local ClientBuildFXRE = RemoteEvents:FindFirstChild("BuildingConstructFX")
+if not ClientBuildFXRE then
+	ClientBuildFXRE = Instance.new("RemoteEvent")
+	ClientBuildFXRE.Name = "BuildingConstructFX"
+	ClientBuildFXRE.Parent = RemoteEvents
+end
 local ServerScriptService = game:GetService("ServerScriptService")
 local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents")
 local zoneRemovedEvent = BE:WaitForChild("ZoneRemoved")
@@ -88,6 +94,8 @@ local function getBuildingInterval()
 	-- Use waitScaled where we actually sleep; this gives us a single source of truth.
 	return BUILDING_INTERVAL
 end
+-- When true, Stage1/Stage2 construction FX + SFX are sent to clients (no server replication)
+local USE_CLIENT_BUILD_FX = true
 local GRID_SIZE = GridConfig.GRID_SIZE -- Ensure this matches your grid size in GridVisualizer
 local Y_OFFSET = 0.4 -- Adjust as needed
 local STAGE1_Y_OFFSET = -0.38
@@ -324,6 +332,70 @@ local function stopConstructionSound(handle: { sound: Sound?, anchor: BasePart? 
 	end
 end
 
+-- Gather animations under a model/animator (shared by server + client FX paths)
+local function collectAnimations(root: Instance?): {Animation}
+	if not root then return {} end
+	local out = {}
+	for _, desc in ipairs(root:GetDescendants()) do
+		if desc:IsA("Animation") then
+			table.insert(out, desc)
+		end
+	end
+	return out
+end
+
+-- Best-effort single animation length for Stage1; used to keep server timing aligned with client FX
+local function firstAnimationLength(stageModel: Instance?): number
+	if not stageModel then
+		return 0
+	end
+	local ok, length = pcall(function()
+		local preview = stageModel:Clone()
+		local animator, animations = nil, {}
+		local animController = preview:FindFirstChild("AnimationController", true)
+		if animController then
+			animator   = animController:FindFirstChildOfClass("Animator", true)
+			animations = collectAnimations(animator or animController)
+		end
+		if (not animator) or #animations == 0 then
+			local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
+			if humanoid then
+				animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
+				animations = collectAnimations(animator)
+			end
+		end
+		local len = 0
+		if animator and #animations > 0 then
+			local okLoad, track = pcall(animator.LoadAnimation, animator, animations[1])
+			if okLoad and track then
+				len = track.Length or 0
+				pcall(function() track:Stop() end)
+				pcall(function() track:Destroy() end)
+			end
+		end
+		preview:Destroy()
+		return len
+	end)
+	return (ok and length) or 0
+end
+
+local function computeStage1Positions(
+	gridCoord, rotatedWidth, rotatedDepth, gBounds, gTerrains, stage1Y
+): {Vector3}
+	local positions = {}
+	for dx = 0, rotatedWidth - 1 do
+		for dz = 0, rotatedDepth - 1 do
+			local cx, _, cz = GridUtils.globalGridToWorldPosition(
+				gridCoord.x + dx,
+				gridCoord.z + dz,
+				gBounds, gTerrains
+			)
+			positions[#positions + 1] = Vector3.new(cx, stage1Y, cz)
+		end
+	end
+	return positions
+end
+
 -- Infrastructure-only zones do not need the 3D construction SFX.
 local SILENT_BUILD_MODES = {
 	DirtRoad    = true,
@@ -361,7 +433,7 @@ local function shouldPlayBuildUISound(mode: string?): boolean
 end
 
 local BuildSpeed = {
-	enabled    = true,  -- true in Studio, false on live by default
+	enabled    = false, -- set true for fast-build in Studio; keep false on live
 	multiplier = 10.0,                    -- 1.0 = normal; 4.0 = 4x faster; 0.5 = slower
 }
 
@@ -1809,132 +1881,170 @@ function BuildingGeneratorModule.generateBuilding(
 		end
 
 		-- Stage flow
-	local finalStageClone
+		local finalStageClone
 		if not skipStages then
-			local stage1Clones = {}
-			local allTracks    = {}
 			local suppressStage1 = SUPPRESS_STAGE1_BY_ZONE[zoneId] == true
-
-			local function collectAnimations(root)
-				local out = {}
-				for _, desc in ipairs(root:GetDescendants()) do
-					if desc:IsA("Animation") then
-						table.insert(out, desc)
-					end
-				end
-				return out
-			end
-
+			local stage1Duration = getBuildingInterval()
 			if not suppressStage1 then
-				-- Full per-cell Stage1 previews during normal gameplay
-				for dx = 0, rotatedWidth - 1 do
-					for dz = 0, rotatedDepth - 1 do
-						local cx, _, cz = GridUtils.globalGridToWorldPosition(
-							gridCoord.x + dx,
-							gridCoord.z + dz,
-							gBounds, gTerrains
-						)
-						local pos = Vector3.new(
-							cx,
-							terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
-							cz
-						)
+				stage1Duration = math.max(stage1Duration, firstAnimationLength(buildingData.stages.Stage1))
+			end
+			local stage2Duration = getBuildingInterval()
+			local useClientFX = USE_CLIENT_BUILD_FX and ClientBuildFXRE and not suppressStage1
 
-						local preview = buildingData.stages.Stage1:Clone()
-						if preview:IsA("Model") and preview.PrimaryPart then
-							preview:SetPrimaryPartCFrame(
-								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-									CFrame.Angles(0, math.rad(rotationY), 0)
+			if useClientFX then
+				local stage1Y = terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET + STAGE1_Y_OFFSET
+				local fxPayload = {
+					userId               = player and player.UserId or nil,
+					zoneId               = zoneId,
+					mode                 = mode,
+					rotationY            = rotationY,
+					buildingName         = buildingData.name,
+					wealthState          = wealthState or "Poor",
+					stage1               = buildingData.stages.Stage1,
+					stage2               = buildingData.stages.Stage2,
+					finalCFrame          = CFrame.new(finalPosition) * CFrame.Angles(0, math.rad(rotationY), 0),
+					stage1Positions      = computeStage1Positions(
+						gridCoord, rotatedWidth, rotatedDepth, gBounds, gTerrains, stage1Y
+					),
+					stage1Duration       = stage1Duration,
+					stage2Duration       = stage2Duration,
+					buildSpeedEnabled    = BuildSpeed.enabled,
+					buildSpeedMultiplier = BuildSpeed.multiplier,
+					playSound            = shouldPlayConstructionAudio(mode),
+				}
+				pcall(function()
+					if player and player:IsA("Player") then
+						ClientBuildFXRE:FireClient(player, fxPayload)
+					else
+						ClientBuildFXRE:FireAllClients(fxPayload)
+					end
+				end)
+				waitScaled(stage1Duration)
+			else
+				local stage1Clones = {}
+				local allTracks    = {}
+
+				if not suppressStage1 then
+					-- Full per-cell Stage1 previews during normal gameplay
+					for dx = 0, rotatedWidth - 1 do
+						for dz = 0, rotatedDepth - 1 do
+							local cx, _, cz = GridUtils.globalGridToWorldPosition(
+								gridCoord.x + dx,
+								gridCoord.z + dz,
+								gBounds, gTerrains
 							)
-						else
-							preview.CFrame =
-								CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
-								CFrame.Angles(0, math.rad(rotationY), 0)
-						end
-						preview.Parent = parentFolder
-						preview:SetAttribute("ZoneId", zoneId)
-						preview:SetAttribute("BuildingName", buildingData.name)
-						preview:SetAttribute("WealthState", wealthState or "Poor")
-						preview:SetAttribute("GridX", gridCoord.x)
-						preview:SetAttribute("GridZ", gridCoord.z)
-						preview:SetAttribute("RotationY", rotationY)
-						if isUtility then preview:SetAttribute("IsUtility", true) end
+							local pos = Vector3.new(
+								cx,
+								terrainPos.Y + (terrainSize.Y / 2) + 0.1 + Y_OFFSET,
+								cz
+							)
 
-						table.insert(stage1Clones, preview)
+							local preview = buildingData.stages.Stage1:Clone()
+							if preview:IsA("Model") and preview.PrimaryPart then
+								preview:SetPrimaryPartCFrame(
+									CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+										CFrame.Angles(0, math.rad(rotationY), 0)
+								)
+							else
+								preview.CFrame =
+									CFrame.new(pos + Vector3.new(0, STAGE1_Y_OFFSET, 0)) *
+									CFrame.Angles(0, math.rad(rotationY), 0)
+							end
+							preview.Parent = parentFolder
+							preview:SetAttribute("ZoneId", zoneId)
+							preview:SetAttribute("BuildingName", buildingData.name)
+							preview:SetAttribute("WealthState", wealthState or "Poor")
+							preview:SetAttribute("GridX", gridCoord.x)
+							preview:SetAttribute("GridZ", gridCoord.z)
+							preview:SetAttribute("RotationY", rotationY)
+							if isUtility then preview:SetAttribute("IsUtility", true) end
 
-						-- Try to gather an animation to play
-						local animator, animations = nil, {}
-						local animController = preview:FindFirstChild("AnimationController", true)
-						if animController then
-							animator   = animController:FindFirstChildOfClass("Animator", true)
-							animations = collectAnimations(animator or animController)
-						end
-						if (not animator) or #animations == 0 then
-							local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
-							if humanoid then
-								animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
-								animations = collectAnimations(animator)
+							table.insert(stage1Clones, preview)
+
+							-- Try to gather an animation to play
+							local animator, animations = nil, {}
+							local animController = preview:FindFirstChild("AnimationController", true)
+							if animController then
+								animator   = animController:FindFirstChildOfClass("Animator", true)
+								animations = collectAnimations(animator or animController)
+							end
+							if (not animator) or #animations == 0 then
+								local humanoid = preview:FindFirstChildOfClass("Humanoid", true)
+								if humanoid then
+									animator   = humanoid:FindFirstChildOfClass("Animator", true) or humanoid
+									animations = collectAnimations(animator)
+								end
+							end
+							if animator and #animations > 0 then
+								local track = animator:LoadAnimation(animations[1])
+								table.insert(allTracks, track)
 							end
 						end
-						if animator and #animations > 0 then
-							local track = animator:LoadAnimation(animations[1])
-							table.insert(allTracks, track)
+					end
+				end
+
+				local waitDuration = 0
+				local constructionSoundHandle
+				if #allTracks > 0 then
+					if shouldPlayConstructionAudio(mode) then
+						constructionSoundHandle = startConstructionSound(stage1Clones, parentFolder)
+					end
+					local playbackSpeed = BuildSpeed.enabled and BuildSpeed.multiplier or 1
+					for _, track in ipairs(allTracks) do
+						-- Some rigs report Length=0 until the first frame; poll briefly
+						while track.Length == 0 do waitScaled(0.02) end
+						waitDuration = math.max(waitDuration, track.Length)
+						-- Force the animation to actually play at the fast-build speed so later
+						-- keyframes (like the construction SFX trigger) still fire.
+						track:Play(0, 1, playbackSpeed)
+						if playbackSpeed ~= 1 then
+							track:AdjustSpeed(playbackSpeed)
 						end
 					end
+					-- Even though we sped the track, Roblox keeps Length as the authoring length.
+					-- So we scale the *wait* duration ourselves:
+					waitScaled(waitDuration)
+				else
+					waitScaled(stage1Duration)
 				end
-			end
 
-			local waitDuration = 0
-			local constructionSoundHandle
-			if #allTracks > 0 then
-				if shouldPlayConstructionAudio(mode) then
-					constructionSoundHandle = startConstructionSound(stage1Clones, parentFolder)
+				if constructionSoundHandle then
+					stopConstructionSound(constructionSoundHandle)
+					constructionSoundHandle = nil
 				end
-				local playbackSpeed = BuildSpeed.enabled and BuildSpeed.multiplier or 1
-				for _, track in ipairs(allTracks) do
-					-- Some rigs report Length=0 until the first frame; poll briefly
-					while track.Length == 0 do waitScaled(0.02) end
-					waitDuration = math.max(waitDuration, track.Length)
-					-- Force the animation to actually play at the fast-build speed so later
-					-- keyframes (like the construction SFX trigger) still fire.
-					track:Play(0, 1, playbackSpeed)
-					if playbackSpeed ~= 1 then
-						track:AdjustSpeed(playbackSpeed)
+
+				if shouldAbort(player, zoneId) then
+					for _, preview in ipairs(stage1Clones) do
+						if preview and preview.Parent then preview:Destroy() end
 					end
+					ZoneTrackerModule.setZonePopulating(player, zoneId, false)
+					return _abortEarly("aborted during Stage1")
 				end
-				-- Even though we sped the track, Roblox keeps Length as the authoring length.
-				-- So we scale the *wait* duration ourselves:
-				waitScaled(waitDuration)
-			else
-				waitScaled(getBuildingInterval())
-			end
 
-			if constructionSoundHandle then
-				stopConstructionSound(constructionSoundHandle)
-				constructionSoundHandle = nil
-			end
-
-			if shouldAbort(player, zoneId) then
 				for _, preview in ipairs(stage1Clones) do
-					if preview and preview.Parent then preview:Destroy() end
+					preview:Destroy()
 				end
-				ZoneTrackerModule.setZonePopulating(player, zoneId, false)
-				return _abortEarly("aborted during Stage1")
+
+				-- Stage 2 (server replicated visuals)
+				local stage2 = placeStage(buildingData.stages.Stage2)
+				stage2.Anchored   = true
+				stage2.CanCollide = false
+
+				-- Stage 3
+				waitScaled(stage2Duration)
+				finalStageClone = placeStage(buildingData.stages.Stage3)
+				stage2:Destroy()
 			end
 
-			for _, preview in ipairs(stage1Clones) do
-				preview:Destroy()
+			if useClientFX then
+				if shouldAbort(player, zoneId) then
+					ZoneTrackerModule.setZonePopulating(player, zoneId, false)
+					return _abortEarly("aborted during Stage1")
+				end
+				-- Client will show Stage2; server just waits before placing Stage3
+				waitScaled(stage2Duration)
+				finalStageClone = placeStage(buildingData.stages.Stage3)
 			end
-
-			-- Stage 2
-			local stage2 = placeStage(buildingData.stages.Stage2)
-			stage2.Anchored   = true
-			stage2.CanCollide = false
-
-			-- Stage 3
-			waitScaled(getBuildingInterval())
-			finalStageClone = placeStage(buildingData.stages.Stage3)
-			stage2:Destroy()
 		else
 			finalStageClone = placeStage(buildingData.stages.Stage3)
 		end
@@ -2586,7 +2696,7 @@ local function placeBuildings(
 		if ZoneTrackerModule.isGridOccupied(
 			player, x, z,
 			{ excludeOccupantId = zoneId, excludeZoneTypes = OverlapExclusions }
-		) then
+			) then
 			return "occupied"
 		end
 		return "unknown"
@@ -2871,7 +2981,7 @@ local function placeBuildingsSecondPass(
 		if ZoneTrackerModule.isGridOccupied(
 			player, x, z,
 			{ excludeOccupantId = zoneId, excludeZoneTypes = OverlapExclusions }
-		) then
+			) then
 			return "occupied"
 		end
 		return "unknown"
@@ -3478,24 +3588,6 @@ function BuildingGeneratorModule.populateZone(
 			maxX = math.max(maxX, coord.x)
 			minZ = math.min(minZ, coord.z)
 			maxZ = math.max(maxZ, coord.z)
-		end
-
-		-- Temporary: emit unsuppressed diagnostics for Airport rehydrate cases
-		if mode == "Airport" then
-			local w0, d0  = _stage3FootprintCells("Airport", 0)
-			local w90, d90 = _stage3FootprintCells("Airport", 90)
-			local zoneW    = (maxX - minX + 1)
-			local zoneH    = (maxZ - minZ + 1)
-			local fits0    = (w0 <= zoneW and d0 <= zoneH)
-			local fits90   = (w90 <= zoneW and d90 <= zoneH)
-			_warn(("[AirportDebug] zone=%s grid=%dx%d bounds=(%d..%d,%d..%d) stg3 0°=%dx%d fits=%s 90°=%dx%d fits=%s")
-				:format(
-					tostring(zoneId),
-					tostring(metrics.gridCount or #gridList),
-					zoneW, maxX, minZ, maxZ,
-					w0, d0, tostring(fits0),
-					w90, d90, tostring(fits90)
-				))
 		end
 
 		local placedBuildingsData   = {}

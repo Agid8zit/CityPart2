@@ -59,6 +59,8 @@ local ALARM_CLUSTER_FLAG_ATTRIBUTE  = "ClusteredAlarm"
 local ALARM_CLUSTER_COUNT_ATTRIBUTE = "ClusteredCount"
 local ALARM_CLUSTER_MIN_SIZE        = 4 -- when >= this many neighbors, collapse into one alarm
 local ALARM_CLUSTER_TARGET_SIZE     = 5 -- desired tiles represented per cluster marker
+local ALARM_CLUSTER_SIZE_MULT       = 1.35 -- visual scale boost for clustered alarms
+local ALARM_MESH_BASE_SCALE_ATTR    = "BaseMeshScale"
 
 -- ==== PERFORMANCE / LOAD-AWARE TUNABLES (ADDED) ===========================
 local TEMP_ALARM_BUDGET_MS         = 4      -- soft time budget per update call
@@ -338,6 +340,7 @@ end
 local AGGREGATE_CACHE_TTL = 0.25
 local aggregateTotalsCache = {}
 local aggregateProductionCache = {}
+local aggregateServedTotalsCache = {}
 
 local function copyAggregate(src)
 	local dest = { water = 0, power = 0 }
@@ -374,6 +377,7 @@ local function invalidateAggregateCaches(player)
 	if not (player and player.UserId) then return end
 	aggregateTotalsCache[player.UserId] = nil
 	aggregateProductionCache[player.UserId] = nil
+	aggregateServedTotalsCache[player.UserId] = nil
 end
 
 Players.PlayerRemoving:Connect(function(player)
@@ -655,6 +659,7 @@ local AlarmPool = {}
 -- SHARED BOBBING SYSTEM
 --------------------------------------------------------------------
 local USE_SHARED_BOBBING = true      -- flip to false to return to Tween mode
+local BOB_ON_CLIENT = true           -- when true, server only tags base pos; clients bob locally
 local BOB_SPEED     = 2              -- radians / sec
 local BOB_AMPLITUDE = 0.5            -- studs
 
@@ -663,8 +668,21 @@ local RunServiceScheduler = require(ReplicatedStorage.Scripts.RunServiceSchedule
 local ActiveAlarms   = {}            -- [part] = { base = Vector3, phase = number }
 local heartbeatConn  -- lazily made
 
+local function tagBobBase(part, basePos)
+	if not (part and basePos) then return end
+	if not BOB_ON_CLIENT then return end
+	local ok, err = pcall(function()
+		part:SetAttribute("BobBase", basePos)
+	end)
+	if not ok then
+		warn("[ZoneReq] Failed to tag BobBase:", err)
+	end
+end
+
 local function attachSharedBobbing(part, basePos)
 	if not USE_SHARED_BOBBING then return end
+	tagBobBase(part, basePos)
+	if BOB_ON_CLIENT then return end
 
 	ActiveAlarms[part] = { base = basePos, phase = math.random() * math.pi * 2 }
 
@@ -688,6 +706,11 @@ end
 
 local function detachSharedBobbing(part)
 	ActiveAlarms[part] = nil
+	if BOB_ON_CLIENT and part then
+		pcall(function()
+			part:SetAttribute("BobBase", nil)
+		end)
+	end
 end
 
 local function borrowAlarm(templateFolder, alarmType)
@@ -701,12 +724,32 @@ local function borrowAlarm(templateFolder, alarmType)
 
 	part = t:Clone()
 	part.Anchored, part.CanCollide = true, false
+	if typeof(part:GetAttribute("BaseSize")) ~= "Vector3" then
+		part:SetAttribute("BaseSize", part.Size)
+	end
+	local mesh = part:FindFirstChildWhichIsA("SpecialMesh") or part:FindFirstChildWhichIsA("Mesh")
+	if mesh and typeof(mesh:GetAttribute(ALARM_MESH_BASE_SCALE_ATTR)) ~= "Vector3" then
+		mesh:SetAttribute(ALARM_MESH_BASE_SCALE_ATTR, mesh.Scale)
+	end
 	return part
 end
 
 local function returnAlarm(part)
 	if not part then return end
 	detachSharedBobbing(part)
+	if part:IsA("BasePart") then
+		local base = part:GetAttribute("BaseSize")
+		if typeof(base) == "Vector3" then
+			part.Size = base
+		end
+		local mesh = part:FindFirstChildWhichIsA("SpecialMesh") or part:FindFirstChildWhichIsA("Mesh")
+		if mesh then
+			local baseScale = mesh:GetAttribute(ALARM_MESH_BASE_SCALE_ATTR)
+			if typeof(baseScale) == "Vector3" then
+				mesh.Scale = baseScale
+			end
+		end
+	end
 	local t = part.Name:match("^(Alarm%u%l+)")   -- AlarmRoad / AlarmWater / …
 	if not t then part:Destroy() return end
 	part:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
@@ -948,6 +991,7 @@ local function buildAlarmDisplayTargets(neededSet, alarmCfg)
 			z = c.z,
 			isCluster = false,
 			count = 1,
+			members = { { x = c.x, z = c.z } },
 		}
 	end
 
@@ -965,6 +1009,7 @@ local function buildAlarmDisplayTargets(neededSet, alarmCfg)
 				z = ctr.z,
 				isCluster = true,
 				count = #group,
+				members = group,
 			}
 		else
 			for _, c in ipairs(group) do
@@ -1257,6 +1302,11 @@ local function computeZoneCenter(gridList)
 end
 
 local function startBobbing(part, basePos)
+	if BOB_ON_CLIENT then
+		tagBobBase(part, basePos)
+		return
+	end
+
 	if USE_SHARED_BOBBING then
 		attachSharedBobbing(part, basePos)
 	else
@@ -1358,19 +1408,66 @@ end
 -- Helpers for alarm placement ordering / cleanup
 ----------------------------------------------------------------------
 local function removeLowerTypeAlarms(zoneModel, lowerTypes, neededSet)
-	if not lowerTypes or #lowerTypes == 0 then return end
+	if not (zoneModel and lowerTypes) or #lowerTypes == 0 then return end
+
+	local covered = {}
+	for key, entry in pairs(neededSet or {}) do
+		local members = typeof(entry) == "table" and entry.members or nil
+		if members and typeof(members) == "table" then
+			for _, m in ipairs(members) do
+				if m and typeof(m.x) == "number" and typeof(m.z) == "number" then
+					covered[coordKey(m)] = true
+				end
+			end
+		elseif typeof(entry) == "table" and typeof(entry.x) == "number" and typeof(entry.z) == "number" then
+			covered[coordKey(entry)] = true
+		elseif type(key) == "string" then
+			covered[key] = true
+		end
+	end
+	if next(covered) == nil then return end
+
 	for _, child in ipairs(zoneModel:GetChildren()) do
 		if child:IsA("BasePart") then
 			for _, lt in ipairs(lowerTypes) do
 				local gx, gz = child.Name:match("^"..lt.."_([%-0-9]+)_([%-0-9]+)$")
 				if gx and gz then
 					local key = gx.."_"..gz
-					if neededSet[key] then
+					if covered[key] then
 						returnAlarm(child)
 						break
 					end
 				end
 			end
+		end
+	end
+end
+
+local function applyClusterSizing(alarm: BasePart?, isCluster: boolean?)
+	if not (alarm and alarm:IsA("BasePart")) then return end
+	local base = alarm:GetAttribute("BaseSize")
+	if typeof(base) ~= "Vector3" then
+		base = alarm.Size
+		alarm:SetAttribute("BaseSize", base)
+	end
+	if typeof(base) == "Vector3" then
+		if isCluster then
+			alarm.Size = base * ALARM_CLUSTER_SIZE_MULT
+		else
+			alarm.Size = base
+		end
+	end
+
+	-- Adjust mesh scale (if any) so visuals also grow/shrink with clustering
+	local mesh = alarm:FindFirstChildWhichIsA("SpecialMesh") or alarm:FindFirstChildWhichIsA("Mesh")
+	if mesh then
+		local baseScale = mesh:GetAttribute(ALARM_MESH_BASE_SCALE_ATTR)
+		if typeof(baseScale) ~= "Vector3" then
+			baseScale = mesh.Scale
+			mesh:SetAttribute(ALARM_MESH_BASE_SCALE_ATTR, baseScale)
+		end
+		if typeof(baseScale) == "Vector3" then
+			mesh.Scale = isCluster and (baseScale * ALARM_CLUSTER_SIZE_MULT) or baseScale
 		end
 	end
 end
@@ -1422,7 +1519,18 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 
 	purgeSatisfiedHigherAlarms(player, zoneId, zoneModel, higher)
 
-	local function hasHigherAlarm(x, z)
+	local function higherMissingOrAlarmed(x, z)
+		-- If a higher-tier requirement is still missing at this tile, suppress this alarm type.
+		for _, t in ipairs(higher) do
+			local reqName = REQ_NAME_FOR_ALARM[t]
+			if reqName then
+				local v = ZoneTrackerModule.getTileRequirement(player, zoneId, x, z, reqName)
+				if v == false then
+					return true
+				end
+			end
+		end
+
 		for _, t in ipairs(higher) do
 			local nameCheck = string.format("%s_%d_%d", t, x, z)
 			local part = zoneModel:FindFirstChild(nameCheck)
@@ -1451,17 +1559,18 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 			local v = ZoneTrackerModule.getTileRequirement(player, zoneId, c.x, c.z, reqName)
 			missing = (v == false)
 		end
-		if missing and not hasHigherAlarm(c.x, c.z) then
+		if missing and not higherMissingOrAlarmed(c.x, c.z) then
 			local key = coordKey(c)
 			neededTiles[key] = { x = c.x, z = c.z }
 		end
 	end
 
-	if #ALARM_LOWER[alarmType] > 0 and next(neededTiles) ~= nil then
-		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], neededTiles)
-	end
-
 	local displayTargets = buildAlarmDisplayTargets(neededTiles, tierCfg)
+
+	if #ALARM_LOWER[alarmType] > 0 and next(displayTargets) ~= nil then
+		-- Remove lower-priority alarms across the entire cluster coverage (not just the centroid tile)
+		removeLowerTypeAlarms(zoneModel, ALARM_LOWER[alarmType], displayTargets)
+	end
 
 	-- Remove any existing parts of this type that are no longer needed
 	for _, child in ipairs(zoneModel:GetChildren()) do
@@ -1504,6 +1613,7 @@ function ZoneRequirementsChecker.updateTileAlarms(player, zoneId, alarmType, uns
 				alarm:SetAttribute(ALARM_CLUSTER_FLAG_ATTRIBUTE, nil)
 				alarm:SetAttribute(ALARM_CLUSTER_COUNT_ATTRIBUTE, nil)
 			end
+			applyClusterSizing(alarm, info.isCluster)
 		end
 	end
 end
@@ -1585,6 +1695,9 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 		end
 	end
 
+	-- Cluster temp alarms for readability (same settings as normal alarms)
+	local displayTargets = buildAlarmDisplayTargets(needed, tierCfg)
+
 	-- Build an index of existing temp alarms to avoid rescanning children for each tile
 	local idx = indexTempAlarmFolder(tempFolder)
 
@@ -1619,21 +1732,41 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 		end
 	end
 
-	-- 1) Lower-type cleanup **once** for all needed keys
-	if next(needed) ~= nil and #lower > 0 then
-		for key, _ in pairs(needed) do
-			for i = 1, #lower do
-				idxRemove(lower[i], key)
+	-- 1) Lower-type cleanup across the clustered coverage
+	if next(displayTargets) ~= nil and #lower > 0 then
+		for key, entry in pairs(displayTargets) do
+			local members = typeof(entry) == "table" and entry.members
+			if members then
+				for _, m in ipairs(members) do
+					local mk = ("%d_%d"):format(m.x, m.z)
+					for i = 1, #lower do
+						idxRemove(lower[i], mk)
+					end
+				end
 			end
 			maybeYield()
 		end
 	end
 
-	-- 2) For each tile in scope: ensure correct presence/absence of current alarmType
-	for key, coord in pairs(scope) do
-		local x, z = coord.x, coord.z
+	-- 2) Remove stale alarms of this type that are no longer needed
+	do
+		local bucket = idx[alarmType]
+		if bucket then
+			for key, part in pairs(bucket) do
+				if not displayTargets[key] then
+					idxRemove(alarmType, key)
+				end
+				maybeYield()
+			end
+		end
+	end
 
-		-- Respect priority: if any higher-type temp alarm exists for this tile, skip placing lower
+	-- 3) Place/update clustered targets
+	for key, info in pairs(displayTargets) do
+		local x, z = info.x, info.z
+		local name = string.format("%s_%d_%d", alarmType, x, z)
+
+		-- Respect priority: skip if higher-type temp alarm occupies this centroid
 		local hasHigher = false
 		for i = 1, #higher do
 			if idxHas(higher[i], key) then
@@ -1641,46 +1774,35 @@ function ZoneRequirementsChecker.updateTempTileAlarms(player, zoneId, alarmType,
 				break
 			end
 		end
-
 		if hasHigher then
-			-- If we currently have this alarmType at this tile, remove it (higher takes precedence)
 			idxRemove(alarmType, key)
+			maybeYield()
 		else
-			if needed[key] then
-				-- Should exist: place or update
-				if not idxHas(alarmType, key) then
-					local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0, 6, 0)
-					local alarm   = borrowAlarm(templateFolder, alarmType)
-					if alarm then
-						alarm.Name = string.format("%s_%d_%d", alarmType, x, z)
-						if player and player.UserId then
-							alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, player.UserId)
-						else
-							alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
-						end
-						alarm.Parent   = tempFolder
-						alarm.Position = basePos
-						startBobbing(alarm, basePos)
-						-- update index
-						idx[alarmType] = idx[alarmType] or {}
-						idx[alarmType][key] = alarm
+			local alarm = idxHas(alarmType, key)
+			if not alarm then
+				local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0, 6, 0)
+				alarm = borrowAlarm(templateFolder, alarmType)
+				if alarm then
+					alarm.Name = name
+					if player and player.UserId then
+						alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, player.UserId)
+					else
+						alarm:SetAttribute(ALARM_OWNER_ATTRIBUTE, nil)
 					end
-				else
-					-- Update position in case terrain moved
-					local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0, 6, 0)
-					local p = idxHas(alarmType, key)
-					if p then
-						p.Position = basePos
-						if ActiveAlarms[p] then ActiveAlarms[p].base = basePos end
-					end
+					alarm.Parent   = tempFolder
+					alarm.Position = basePos
+					startBobbing(alarm, basePos)
+					idx[alarmType] = idx[alarmType] or {}
+					idx[alarmType][key] = alarm
 				end
 			else
-				-- Should *not* exist: remove if present
-				idxRemove(alarmType, key)
+				local basePos = gridToWorld(playerPlot, x, z) + Vector3.new(0, 6, 0)
+				alarm.Position = basePos
+				if ActiveAlarms[alarm] then ActiveAlarms[alarm].base = basePos end
 			end
+			maybeYield()
 		end
 
-		maybeYield()
 	end
 end
 
@@ -1910,6 +2032,54 @@ function ZoneRequirementsChecker.getEffectiveTotals(player)
 	end
 
 	setAggregateCache(aggregateTotalsCache, player, totals)
+	return copyAggregate(totals)
+end
+
+-- Served-only demand: counts tiles that have Road + Water + Power connected.
+local function tileHasAllRequirements(player, zoneId, gx, gz)
+	return ZoneTrackerModule.getTileRequirement(player, zoneId, gx, gz, "Road")  == true
+		and ZoneTrackerModule.getTileRequirement(player, zoneId, gx, gz, "Water") == true
+		and ZoneTrackerModule.getTileRequirement(player, zoneId, gx, gz, "Power") == true
+end
+
+function ZoneRequirementsChecker.getEffectiveServedTotals(player)
+	local cached = getAggregateCache(aggregateServedTotalsCache, player)
+	if cached then return cached end
+
+	local totals = { water = 0, power = 0 }
+	if not (player and player:IsA("Player")) then return totals end
+
+	local Zones = ZoneTrackerModule.getAllZones(player)
+	if not Zones then return totals end
+
+	for _, z in pairs(Zones) do
+		if ZoneRequirementsChecker.isBuildingZone(z.mode) and z.gridList then
+			local cfgTbl = Balance.StatConfig[z.mode]
+			if cfgTbl then
+				for _, c in ipairs(z.gridList) do
+					if tileHasAllRequirements(player, z.zoneId, c.x, c.z) then
+						local w = ZoneTrackerModule.getGridWealth(player, z.zoneId, c.x, c.z) or "Poor"
+						local T = cfgTbl[w]
+						if T then
+							local baseW = T.water or 0
+							local baseP = T.power or 0
+
+							local mulW, mulP = 1.0, 1.0
+							if CityInteractions and CityInteractions.getTileDemandMultiplier then
+								mulW = CityInteractions.getTileDemandMultiplier(player, z.zoneId, c.x, c.z, z.mode, "Water") or 1.0
+								mulP = CityInteractions.getTileDemandMultiplier(player, z.zoneId, c.x, c.z, z.mode, "Power") or 1.0
+							end
+
+							totals.water += math.floor(baseW * mulW + 0.5)
+							totals.power += math.floor(baseP * mulP + 0.5)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	setAggregateCache(aggregateServedTotalsCache, player, totals)
 	return copyAggregate(totals)
 end
 

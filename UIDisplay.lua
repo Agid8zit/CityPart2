@@ -141,7 +141,8 @@ local function computeTickIncome(player)
 	end
 
 	-- capacity coverage (use EFFECTIVE totals so mixed-use demand shows)
-	local totalsReq = ZoneRequirementsChecker.getEffectiveTotals(player)
+	local totalsReq = ZoneRequirementsChecker.getEffectiveServedTotals(player)
+		or ZoneRequirementsChecker.getEffectiveTotals(player)
 		or DistrictStatsModule.getTotalsForPlayer(player)
 		or { water = 0, power = 0 }
 
@@ -183,6 +184,12 @@ local function buildPayload(player)
 	end
 	total.water = effTotals.water or 0
 	total.power = effTotals.power or 0
+
+	-- === [ADD] Display multiplier for "x2 Population" gamepass (UI-only, does not mutate stored stats) ===
+	if PlayerDataInterfaceService.HasGamepass(player, "x2 Population") then
+		total.population = total.population * 2
+	end
+	-- === [END ADD] ===
 
 	local lang    = PlayerData.Language
 	local prodTpl = _loc("Produced WATER", lang, "Produced: %s")

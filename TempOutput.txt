@@ -1,1 +1,10 @@
+end
 
+---------------------------
+-- Barrage-1 route helper --
+---------------------------
+local arrowAndGateToCurrentStep, retargetCurrentStep -- fwd decl
+
+local ENABLE_BARRAGE1_SHOWCASE = false
+
+local BARRAGE1_ROUTE_STEPS = {

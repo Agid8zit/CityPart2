@@ -31,7 +31,7 @@ local function log(...)
 	if VERBOSE_LOG then print(...) end
 end
 
-local DEFAULT_PLAYER_DS = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release1"
+local DEFAULT_PLAYER_DS = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release2"
 local PLAYERDATA_DATASTORE = SavePolicy.PLAYER_DS_BY_ENV[SavePolicy.ENV] or DEFAULT_PLAYER_DS
 local SLOT_ID = "player"
 local PER_USER_PRUNE_INTERVAL = 90
@@ -64,10 +64,72 @@ local _lastEnvelopeMeta = {} -- [Player] = { hash, updatedAt, approxBytes }
 local _highChurnTouches = {} -- [Player] = os.time()
 local _sessionStart = {} -- [Player] = os.clock()
 local _pruneQueue = {} -- [userId] = true
+local function _isCityStoragePath(path: string?)
+	return type(path) == "string" and string.find(path, "cityStorage", 1, true) ~= nil
+end
+
+-- Trim large cityStorage blobs before sending to clients to avoid RECV spikes.
+local function _copyForClient(pd: any)
+	if type(pd) ~= "table" then
+		return pd
+	end
+
+	local copy = {}
+	for k, v in pairs(pd) do
+		if k == "savefiles" and type(v) == "table" then
+			local slots = {}
+			for slotId, slot in pairs(v) do
+				if type(slot) == "table" then
+					local slotCopy = {}
+					for sk, sv in pairs(slot) do
+						if sk ~= "cityStorage" then
+							slotCopy[sk] = sv
+						end
+					end
+					slots[slotId] = slotCopy
+				else
+					slots[slotId] = slot
+				end
+			end
+			copy.savefiles = slots
+		else
+			copy[k] = v
+		end
+	end
+
+	return copy
+end
 
 -- Networking
 local RE_UpdatePlayerData = ReplicatedStorage.Events.RemoteEvents.UpdatePlayerData
 local RF_RequestReload = ReplicatedStorage.Events.RemoteEvents.RequestReload
+
+-- Throttle UpdatePlayerData bursts (per-player coalescing)
+local UPDATE_DEBOUNCE_SEC = 0.1
+local _pendingPdUpdates = {}      -- [Player] = { [path] = value }
+local _pendingPdFlush = {}        -- [Player] = true when flush scheduled
+
+local function _queueUpdatePlayerData(Player: Player, Path: string, NewValue: any)
+	local q = _pendingPdUpdates[Player]
+	if not q then
+		q = {}
+		_pendingPdUpdates[Player] = q
+	end
+	q[Path] = NewValue
+
+	if _pendingPdFlush[Player] then return end
+	_pendingPdFlush[Player] = true
+
+	task.delay(UPDATE_DEBOUNCE_SEC, function()
+		_pendingPdFlush[Player] = nil
+		local queued = _pendingPdUpdates[Player]
+		_pendingPdUpdates[Player] = nil
+		if not queued then return end
+		for path, value in pairs(queued) do
+			RE_UpdatePlayerData:FireClient(Player, value, path)
+		end
+	end)
+end
 
 -- >>> CHANGED: No‑commit window (staging + rollback) ------------------------
 -- We treat WorldReloadBegin..WorldReloadEnd as a "no-commit" window:
@@ -129,6 +191,32 @@ local function _sessionDurationFor(userId: number)
 	return 0
 end
 
+-- Budget helpers need to be defined before any DataStore calls use them.
+local function _waitForBudget(requestType: Enum.DataStoreRequestType, minBudget: number?, timeoutSec: number?)
+	minBudget = math.max(1, tonumber(minBudget) or 1)
+	local deadline = os.clock() + (timeoutSec or 8)
+	repeat
+		local ok, budget = pcall(DataStoreService.GetRequestBudgetForRequestType, DataStoreService, requestType)
+		if ok and budget >= minBudget then
+			return true
+		end
+		task.wait(0.2)
+	until os.clock() >= deadline
+	return false
+end
+
+local function _dsCallWithBudget(requestType: Enum.DataStoreRequestType, label: string, fn: () -> any)
+	if not _waitForBudget(requestType, 1, 8) then
+		warn(("[PlayerDataService] Budget low for %s; letting Roblox queue the request"):format(label))
+	end
+	local ok, result = pcall(fn)
+	if not ok then
+		warn(("[PlayerDataService] %s failed: %s"):format(label, tostring(result)))
+		return nil, false, result
+	end
+	return result, true
+end
+
 local function _hasPendingOrphans(idx)
 	if not idx or not idx.slots then
 		return false
@@ -175,14 +263,18 @@ local function _pruneBackupsForUserId(userId)
 		if pending and #pending > 0 then
 			local survivors = {}
 			for _, key in ipairs(pending) do
-				local ok, err = pcall(function()
-					store:RemoveAsync(key)
-				end)
-				if ok then
+				local _, removed = _dsCallWithBudget(
+					Enum.DataStoreRequestType.SetIncrementAsync,
+					("PruneBackup:%s"):format(key),
+					function()
+						return store:RemoveAsync(key)
+					end
+				)
+				if removed then
 					mutated = true
 					log(("[RETENTION][USER] Deleted orphaned backup for %s slot=%s key=%s"):format(userId, tostring(slotId), key))
 				else
-					warn("[RETENTION][ERROR] per-user delete failed", userId, key, err)
+					warn("[RETENTION][ERROR] per-user delete failed", userId, key)
 					table.insert(survivors, key)
 				end
 				task.wait(SavePolicy.YIELD_BETWEEN_DELETES)
@@ -267,7 +359,7 @@ local function _commitNoCommitWindow(Player: Player)
 	_lastGoodSlotSnapshot[Player] = _deepClone(sfNow)
 
 	-- Sync to the client (single full snapshot is simplest & robust)
-	RE_UpdatePlayerData:FireClient(Player, pd, nil)
+	RE_UpdatePlayerData:FireClient(Player, _copyForClient(pd), nil)
 
 	-- Clear window
 	_stagedPatches[Player] = nil
@@ -320,11 +412,14 @@ local function _rememberEnvelopeMeta(Player, env)
 end
 
 local function _fetchKeyValue(store, key)
-	local ok, value = pcall(function()
-		return store:GetAsync(key)
-	end)
-	if not ok then
-		warn("[SAVE] GetAsync failed for", key)
+	local value, ok = _dsCallWithBudget(
+		Enum.DataStoreRequestType.GetAsync,
+		("GetAsync:%s"):format(tostring(key)),
+		function()
+			return store:GetAsync(key)
+		end
+	)
+	if ok == false then
 		return nil, false
 	end
 	return value, true
@@ -366,11 +461,15 @@ local function _recoverFromBackups(Player)
 			hadError = true
 		elseif env then
 			if SavePolicy.APPLY_CHANGES == true then
-				local ok, err = pcall(function()
-					store:SetAsync(_primaryKey(Player.UserId), SaveEnvelope.touch(env))
-				end)
-				if not ok then
-					warn("[DEDUP][ERROR] restore primary failed", Player.UserId, err)
+				local _, wrote = _dsCallWithBudget(
+					Enum.DataStoreRequestType.SetIncrementAsync,
+					("RestorePrimary:%s"):format(Player.UserId),
+					function()
+						return store:SetAsync(_primaryKey(Player.UserId), SaveEnvelope.touch(env))
+					end
+				)
+				if not wrote then
+					warn("[DEDUP][ERROR] restore primary failed", Player.UserId)
 				else
 					log(("[DEDUP] Restored primary for %s from %s"):format(Player.UserId, key))
 				end
@@ -615,10 +714,14 @@ function PlayerDataService.ModifyData(Player: Player, Path: string?, NewValue: a
 			return
 		end
 		Utility.ModifyTableByPath(PlayerDataService.AllPlayerData[Player], Path, NewValue)
-		RE_UpdatePlayerData:FireClient(Player, NewValue, Path)
+		-- Skip cityStorage replication to avoid large network spikes
+		if _isCityStoragePath(Path) then
+			return
+		end
+		_queueUpdatePlayerData(Player, Path, NewValue)
 	else
 		PlayerDataService.AllPlayerData[Player] = NewValue
-		RE_UpdatePlayerData:FireClient(Player, NewValue, nil)
+		RE_UpdatePlayerData:FireClient(Player, _copyForClient(NewValue), nil)
 	end
 end
 
@@ -768,17 +871,25 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 					log(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
 					_rememberEnvelopeMeta(Player, env)
 				else
-					local okBackup, errBackup = pcall(function()
-						store:SetAsync(backupKey, env)
-					end)
+					local _, okBackup, errBackup = _dsCallWithBudget(
+						Enum.DataStoreRequestType.SetIncrementAsync,
+						("BackupWrite:%s"):format(backupKey),
+						function()
+							return store:SetAsync(backupKey, env)
+						end
+					)
 					if not okBackup then
 						warn("[DEDUP][ERROR] backup write failed", backupKey, errBackup)
 					end
 
 					env = SaveEnvelope.touch(env)
-					local okPrimary, errPrimary = pcall(function()
-						store:SetAsync(primaryKey, env)
-					end)
+					local _, okPrimary, errPrimary = _dsCallWithBudget(
+						Enum.DataStoreRequestType.SetIncrementAsync,
+						("PrimaryWrite:%s"):format(primaryKey),
+						function()
+							return store:SetAsync(primaryKey, env)
+						end
+					)
 					if not okPrimary then
 						warn("[DEDUP][ERROR] primary write failed", primaryKey, errPrimary)
 					else
@@ -907,6 +1018,8 @@ function PlayerDataService.PlayerRemoved(Player: Player)
 	_lastEnvelopeMeta[Player] = nil
 	_highChurnTouches[Player] = nil
 	_sessionStart[Player] = nil
+	_pendingPdUpdates[Player] = nil
+	_pendingPdFlush[Player] = nil
 	_pruneBackupsForUserId(Player.UserId)
 
 	if ShouldUseSessionLocking() then

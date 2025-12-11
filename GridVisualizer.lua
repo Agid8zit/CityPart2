@@ -34,10 +34,21 @@ local BE = ReplicatedStorage:WaitForChild("Events"):WaitForChild("BindableEvents
 local BE_GridGuard  = BE:WaitForChild("OBGridGuard")        -- step specs: start/advance/stop
 local BE_GuardFB    = BE:WaitForChild("OBGuardFeedback")    -- feedback: done/canceled
 local BE_ToggleOB   = BE:WaitForChild("OnboardingToggle")   -- true/false
+local BE_OnboardingGridClick = BE:FindFirstChild("OnboardingGridClick")
+local BE_OnboardingGridSelect = BE:FindFirstChild("OnboardingGridSelect")
+local BE_OnboardingGridAccepted = BE:FindFirstChild("OnboardingGridSelectAccepted")
+local BE_MobileClick = BE:FindFirstChild("MobileClick")
+if not BE_OnboardingGridAccepted then
+	local ev = Instance.new("BindableEvent")
+	ev.Name = "OnboardingGridSelectAccepted"
+	ev.Parent = BE
+	BE_OnboardingGridAccepted = ev
+end
 
 local FuncRS        = ReplicatedStorage:WaitForChild("FuncTestGroundRS")
 local AlarmsFolder  = FuncRS:WaitForChild("Alarms")
 local OnboardAlarmTemplate = AlarmsFolder:WaitForChild("OnboardAlarm")
+local BeamTemplate  = AlarmsFolder:FindFirstChild("Beam")
 
 -- For spawning the Water Tower ghost
 local BuildingGhostManager = require(ReplicatedStorage.Scripts.BuildingManager.BuildingGhostManager)
@@ -238,6 +249,134 @@ local guardMarks = {}  -- [BasePart] = true
 local alarmModel = nil
 local YELLOW = Color3.new(1,1,0)
 local _pendingPointGuardPayload = nil
+local lastOffStepWarn = 0
+local OFFSTEP_COOLDOWN = 1.0
+
+-- Block any attempt to place off-path items while an onboarding step is active.
+local function _warnOffStep(mode)
+	local now = os.clock()
+	local expected = guard.spec and guard.spec.mode
+	if now - lastOffStepWarn >= OFFSTEP_COOLDOWN then
+		lastOffStepWarn = now
+		pcall(function()
+			StarterGui:SetCore("SendNotification", {
+				Title = "Finish onboarding step",
+				Text  = "Complete the current placement before building something else.",
+				Duration = 2
+			})
+		end)
+	end
+	warn(("[Onboarding] Blocked build for %s (expected %s)"):format(tostring(mode), tostring(expected)))
+end
+
+-- Onboarding beam (points from player torso to target grid)
+local beamModel, beamAnchorPart, beamGridAttachment, beamTorsoAttachment
+local beamNextCoord = nil
+local beamSpecMode = nil
+local beamPendingMove = false
+local beamPendingDestroy = false
+local beamStartCoordWanted = nil
+local beamConnChar
+local beamTorsoConn
+
+local function _destroyBeam()
+	beamPendingMove = false
+	beamPendingDestroy = false
+	beamStartCoordWanted = nil
+	beamNextCoord = nil
+	beamSpecMode = nil
+	beamGridAttachment = nil
+	beamTorsoAttachment = nil
+	beamAnchorPart = nil
+	if beamTorsoConn then
+		beamTorsoConn:Disconnect()
+		beamTorsoConn = nil
+	end
+	if beamModel then
+		beamModel:Destroy()
+		beamModel = nil
+	end
+end
+
+local function _findTorsoPart()
+	local char = player.Character
+	if not char then return nil end
+	return char:FindFirstChild("UpperTorso")
+		or char:FindFirstChild("Torso")
+		or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function _ensureBeamForCoord(coord)
+	if not (BeamTemplate and coord and globalBounds and terrains) then return end
+	local x, y, z = GridUtil.globalGridToWorldPosition(coord.x, coord.z, globalBounds, terrains)
+	if not (x and y and z) then return end
+
+	_destroyBeam()
+
+	local clone = BeamTemplate:Clone()
+	beamModel = clone
+	beamAnchorPart = clone:IsA("BasePart") and clone or clone:FindFirstChildWhichIsA("BasePart", true)
+	beamGridAttachment = clone:FindFirstChild("Grid", true)
+	beamTorsoAttachment = clone:FindFirstChild("Torso", true)
+	local beamObj = clone:FindFirstChildWhichIsA("Beam", true)
+
+	if not (beamAnchorPart and beamGridAttachment and beamTorsoAttachment and beamObj) then
+		_destroyBeam()
+		return
+	end
+
+	beamAnchorPart.Anchored = true
+	beamAnchorPart.Position = Vector3.new(x, y, z)
+
+	-- Attach torso end to player so it follows movement.
+	local torsoPart = _findTorsoPart()
+	if torsoPart then
+		beamTorsoAttachment.Parent = torsoPart
+		beamTorsoAttachment.CFrame = CFrame.new()
+	else
+		-- keep it on the anchor if torso missing to avoid errors
+		beamTorsoAttachment.Parent = beamAnchorPart
+		beamTorsoAttachment.CFrame = CFrame.new()
+	end
+	beamGridAttachment.CFrame = CFrame.new()
+
+	beamObj.Attachment0 = beamGridAttachment
+	beamObj.Attachment1 = beamTorsoAttachment
+
+	clone.Parent = Workspace
+	beamStartCoordWanted = nil
+
+	-- Keep trying to attach to torso until we succeed (covers delayed character load)
+	if beamTorsoConn then
+		beamTorsoConn:Disconnect()
+	end
+	beamTorsoConn = RunService.Heartbeat:Connect(function()
+		if not beamModel or not beamTorsoAttachment then
+			if beamTorsoConn then beamTorsoConn:Disconnect() end
+			beamTorsoConn = nil
+			return
+		end
+		local torso = _findTorsoPart()
+		if torso and beamTorsoAttachment.Parent ~= torso then
+			beamTorsoAttachment.Parent = torso
+			beamTorsoAttachment.CFrame = CFrame.new()
+			beamGridAttachment.CFrame = CFrame.new()
+		end
+		if torso and beamTorsoAttachment.Parent == torso then
+			if beamTorsoConn then beamTorsoConn:Disconnect() end
+			beamTorsoConn = nil
+		end
+	end)
+
+	return true
+end
+
+local function _moveBeamToCoord(coord)
+	if not (beamAnchorPart and coord and globalBounds and terrains) then return end
+	local x, y, z = GridUtil.globalGridToWorldPosition(coord.x, coord.z, globalBounds, terrains)
+	if not (x and y and z) then return end
+	beamAnchorPart.Position = Vector3.new(x, y, z)
+end
 
 local function _gridPartAt(coord)
 	if not coord then return nil end
@@ -316,6 +455,37 @@ end
 local function _clearGuardUI()
 	_unmarkAll()
 	_destroyAlarm()
+	_destroyBeam()
+end
+
+-- Pure check: does this grid coordinate match the current guard target?
+-- Does NOT mutate guard state; used to drive mobile onboarding pulses.
+local function _isGuardSelectionTarget(gx, gz)
+	if not (guard.active and guard.spec and currentMode == guard.spec.mode) then
+		return nil
+	end
+	local spec = guard.spec
+	if spec.kind == "line" then
+		if guard.stage == "await_first" and gx == spec.from.x and gz == spec.from.z then
+			return "first"
+		end
+		if guard.stage == "await_second" and gx == spec.to.x and gz == spec.to.z then
+			return "second"
+		end
+	elseif spec.kind == "rect" then
+		if guard.stage == "await_first" and gx == spec.from.x and gz == spec.from.z then
+			return "first"
+		end
+		if guard.stage == "await_second" and gx == spec.to.x and gz == spec.to.z then
+			return "second"
+		end
+	elseif spec.kind == "point" then
+		local p = spec.point or spec.from
+		if p and gx == p.x and gz == p.z then
+			return "point"
+		end
+	end
+	return nil
 end
 
 local function _activateGuard(spec)
@@ -350,6 +520,18 @@ BE_GridGuard.Event:Connect(function(action, spec)
 	if action == "start" or action == "advance" then
 		_clearGuardUI()
 		_activateGuard(spec)
+		if spec and spec.from and (spec.kind == "line" or spec.kind == "rect" or spec.kind == "point") then
+			beamSpecMode = spec.mode
+			beamNextCoord = spec.to
+			beamPendingMove = false
+			beamPendingDestroy = false
+			beamStartCoordWanted = spec.from
+			if not _ensureBeamForCoord(spec.from) then
+				-- defer until grid/globalBounds available
+			end
+		else
+			_destroyBeam()
+		end
 	elseif action == "stop" then
 		-- Break the stop<->canceled echo loop with OnboardingController.
 		_clearGuardUI()
@@ -1020,6 +1202,17 @@ local function click(target)
 
 		print("Clicked grid coords: x =", x_grid, "z =", z_grid)
 
+		if guard.active and guard.spec and guard.spec.mode and currentMode and currentMode ~= guard.spec.mode then
+			_warnOffStep(currentMode)
+			return
+		end
+
+		if BE_OnboardingGridClick then
+			pcall(function()
+				BE_OnboardingGridClick:Fire(x_grid, z_grid)
+			end)
+		end
+
 		-- === Guided lock (generic) ==========================================
 		if guard.active and guard.spec and currentMode == guard.spec.mode then
 			local gx, gz = x_grid, z_grid
@@ -1033,6 +1226,11 @@ local function click(target)
 					_markLineInclusive(spec.from, spec.to)   -- show full path now
 					_spawnOrMoveAlarmAtCoord(spec.to)        -- alarm moves to the end
 					guard.stage = "await_second"
+					if BE_OnboardingGridAccepted then
+						pcall(function()
+							BE_OnboardingGridAccepted:Fire(gx, gz, "first", spec.mode, spec.kind)
+						end)
+					end
 					return -- swallow base logic
 				else
 					-- second click: exact end (unless explicitly relaxed)
@@ -1057,6 +1255,11 @@ local function click(target)
 					end
 					_finishGuard(true)
 					clearAll()
+					if BE_OnboardingGridAccepted then
+						pcall(function()
+							BE_OnboardingGridAccepted:Fire(gx, gz, "second", spec.mode, spec.kind)
+						end)
+					end
 					return
 				end
 
@@ -1067,12 +1270,22 @@ local function click(target)
 					_markRectInclusive(spec.from, spec.to)   -- show whole rectangle now
 					_spawnOrMoveAlarmAtCoord(spec.to)
 					guard.stage = "await_second"
+					if BE_OnboardingGridAccepted then
+						pcall(function()
+							BE_OnboardingGridAccepted:Fire(gx, gz, "first", spec.mode, spec.kind)
+						end)
+					end
 					return
 				else
 					if gx ~= spec.to.x or gz ~= spec.to.z then return end
 					ExecuteCommandEvent:FireServer("BuildZone", spec.from, spec.to, spec.mode)
 					_finishGuard(true)
 					clearAll()
+					if BE_OnboardingGridAccepted then
+						pcall(function()
+							BE_OnboardingGridAccepted:Fire(gx, gz, "second", spec.mode, spec.kind)
+						end)
+					end
 					return
 				end
 
@@ -1094,6 +1307,11 @@ local function click(target)
 				guard.spec=nil
 				guard.stage=nil
 				-- fall through to base logic for the actual BuildZone call
+				if BE_OnboardingGridAccepted then
+					pcall(function()
+						BE_OnboardingGridAccepted:Fire(gx, gz, "point", spec.mode, spec.kind)
+					end)
+				end
 			end
 		end
 		-- === end Guided lock ================================================
@@ -1358,7 +1576,62 @@ local function onInputBegan(input, gameProcessed)
 		click(mouse.Target)
 	elseif input.UserInputType == Enum.UserInputType.Touch then
 		targetMobile = mouse.Target
+		if targetMobile and (targetMobile.Name == "GridSquare" or targetMobile.Name == "CardinalGridSquare") then
+			local gx = targetMobile:GetAttribute("GridX")
+			local gz = targetMobile:GetAttribute("GridZ")
+			if BE_OnboardingGridSelect and gx and gz then
+				pcall(function()
+					BE_OnboardingGridSelect:Fire(gx, gz)
+				end)
+			end
+			local tag = gx and gz and _isGuardSelectionTarget(gx, gz)
+			if tag and BE_OnboardingGridAccepted then
+				pcall(function()
+					BE_OnboardingGridAccepted:Fire(gx, gz, tag, guard.spec and guard.spec.mode, guard.spec and guard.spec.kind)
+				end)
+			end
+		end
 	end
+end
+
+-- Beam progression: move on correct grid/placement, then clear on completion.
+if BE_OnboardingGridAccepted then
+	BE_OnboardingGridAccepted.Event:Connect(function(gx, gz, tag, mode, kind)
+		if not beamModel then return end
+		if beamSpecMode and mode and mode ~= beamSpecMode then return end
+		local targetCoord = beamNextCoord
+		if (not targetCoord) and guard.active and guard.spec then
+			targetCoord = guard.spec.to or guard.spec.point
+			beamNextCoord = targetCoord
+		end
+		-- Only gate on true-touch devices; hybrid PCs with a mouse should move immediately.
+		local isTouch = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+		if tag == "first" and targetCoord then
+			if isTouch then
+				beamPendingMove = true
+			else
+				_moveBeamToCoord(targetCoord)
+			end
+		elseif tag == "second" or tag == "point" then
+			if isTouch then
+				beamPendingDestroy = true
+			else
+				_destroyBeam()
+			end
+		end
+	end)
+end
+
+if BE_MobileClick then
+	BE_MobileClick.Event:Connect(function()
+		if not beamModel then return end
+		if beamPendingMove and beamNextCoord then
+			_moveBeamToCoord(beamNextCoord)
+			beamPendingMove = false
+		elseif beamPendingDestroy then
+			_destroyBeam()
+		end
+	end)
 end
 
 -- CANCEL & ROTATE SHORTCUTS
@@ -1382,12 +1655,30 @@ UserInputService.InputBegan:Connect(onInputBegan)
 
 -- DISPLAY GRID EVENT
 displayGridEvent.OnClientEvent:Connect(function(mode)
+	if guard.active and guard.spec and guard.spec.mode and mode ~= guard.spec.mode then
+		_warnOffStep(mode)
+		return
+	end
 	removeGhost()
 	clearAll()
+
+	-- If the player closed/reopened the build menu mid-guard, restart the guard stage so the
+	-- alarm/beam and the gating agree (lets them click the first cell again).
+	if guard.active and guard.spec and guard.spec.mode == mode then
+		if guard.spec.kind == "line" or guard.spec.kind == "rect" then
+			guard.stage = "await_first"
+		else
+			guard.stage = "await_point"
+		end
+	end
 
 	currentMode = mode
 	print("Displaying grid for mode:", mode)
 	createGrid(mode)
+	-- If we have a pending beam start (e.g., guard started before grid spawned), try again now
+	if beamStartCoordWanted then
+		_ensureBeamForCoord(beamStartCoordWanted)
+	end
 
 	local newGhost = BuildingGhostManager.getGhostModel(mode)
 	if newGhost then
@@ -1402,9 +1693,34 @@ displayGridEvent.OnClientEvent:Connect(function(mode)
 		local p = _gridPartAt(first)
 		if p then _mark(p) end
 		_spawnOrMoveAlarmAtCoord(first)
+		if not beamSpecMode then beamSpecMode = guard.spec.mode end
+		if not beamNextCoord then beamNextCoord = guard.spec.to or guard.spec.point end
+		if not beamModel and first then
+			beamStartCoordWanted = beamStartCoordWanted or first
+			_ensureBeamForCoord(first)
+		end
+		if beamStartCoordWanted and not beamModel then
+			_ensureBeamForCoord(beamStartCoordWanted)
+		end
 	end
 
 end)
+
+-- Re-attach torso end on respawn
+local function _onCharacterAdded()
+	if beamTorsoAttachment and beamModel then
+		local torso = _findTorsoPart()
+		if torso then
+			beamTorsoAttachment.Parent = torso
+			beamTorsoAttachment.CFrame = CFrame.new()
+		end
+	end
+end
+if player.Character then
+	_onCharacterAdded()
+end
+if beamConnChar then beamConnChar:Disconnect() end
+beamConnChar = player.CharacterAdded:Connect(_onCharacterAdded)
 
 -- PLOT ASSIGNED EVENT
 plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
@@ -1432,7 +1748,7 @@ plotAssignedEvent.OnClientEvent:Connect(function(plotName, unlockData)
 	if roadStart then
 		GridConfig.setStableAnchorFromPart(roadStart)
 	else
-		warn(("GridVisualizer: RoadStart missing on plot %s – falling back to first-terrain logic.")
+		warn(("GridVisualizer: RoadStart missing on plot %s - falling back to first-terrain logic.")
 			:format(plotName))
 	end
 

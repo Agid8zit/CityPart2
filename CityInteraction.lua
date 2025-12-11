@@ -11,6 +11,13 @@ local Events        = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents= Events:WaitForChild("BindableEvents")
 local RemoteEvents  = Events:WaitForChild("RemoteEvents")
 local PlayUISoundRE = RemoteEvents:FindFirstChild("PlayUISound")
+local UxpAlarmRE    = RemoteEvents:FindFirstChild("UxpAlarm")
+if not UxpAlarmRE then
+	-- create a dedicated RemoteEvent so upgrade/downgrade alarms can be client-only (no workspace replication)
+	UxpAlarmRE = Instance.new("RemoteEvent")
+	UxpAlarmRE.Name = "UxpAlarm"
+	UxpAlarmRE.Parent = RemoteEvents
+end
 
 local S3            = game:GetService("ServerScriptService")
 local Build         = S3:WaitForChild("Build")
@@ -1428,6 +1435,13 @@ local function _spawnUxpAlarm(player: Player, zoneId: string, x: number, z: numb
 		return -- rate-limit micro-spam on rapid recompute
 	end
 	_lastFlashAt[key] = now
+
+	-- Upgrade/downgrade: push to client via RemoteEvent to avoid world replication spam.
+	if (alarmType == "AlarmUpgrade" or alarmType == "AlarmDowngrade") and UxpAlarmRE then
+		local tintData = tint and { tint.R, tint.G, tint.B } or nil
+		UxpAlarmRE:FireClient(player, alarmType, zoneId, x, z, tintData)
+		return
+	end
 
 	local zoneModel, playerPlot = _getZoneModelFor(player, zoneId)
 	if not (zoneModel and playerPlot) then return end
