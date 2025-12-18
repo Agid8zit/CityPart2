@@ -6,6 +6,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
 -- Dependencies
 local DefaultData = require(script.DefaultData)
@@ -36,6 +37,23 @@ local PLAYERDATA_DATASTORE = SavePolicy.PLAYER_DS_BY_ENV[SavePolicy.ENV] or DEFA
 local SLOT_ID = "player"
 local PER_USER_PRUNE_INTERVAL = 90
 local PER_USER_PRUNE_BATCH = 2
+local SESSION_LOCK_TTL = 30 -- seconds; aligns with server shutdown window
+local function _findExistingPlotForPlayer(player: Player)
+	if not player then
+		return nil
+	end
+	local plotName = ("plot_%s"):format(player.UserId)
+	-- try common containers first to avoid deep scans
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if plotsFolder then
+		local hit = plotsFolder:FindFirstChild(plotName) or plotsFolder:FindFirstChild(player.Name) or plotsFolder:FindFirstChild(tostring(player.UserId))
+		if hit then
+			return hit
+		end
+	end
+	-- fallback: shallow search at root, then recursive
+	return Workspace:FindFirstChild(plotName) or Workspace:FindFirstChild(player.Name) or Workspace:FindFirstChild(tostring(player.UserId)) or Workspace:FindFirstChild(plotName, true)
+end
 
 -- Fail-safe: world reload staging should be brief; auto-heal if it ever gets stuck.
 local NO_COMMIT_TIMEOUT_SEC = 60
@@ -217,6 +235,29 @@ local function _dsCallWithBudget(requestType: Enum.DataStoreRequestType, label: 
 	return result, true
 end
 
+local DEFAULT_DS_RETRIES = 3
+local function _dsCallWithRetry(requestType: Enum.DataStoreRequestType, label: string, fn: () -> any, maxAttempts: number?)
+	local attempts = math.clamp(math.floor(maxAttempts or DEFAULT_DS_RETRIES), 1, 5)
+	local delaySec = 0.5
+	local lastErr = nil
+
+	for attempt = 1, attempts do
+		local result, ok, err = _dsCallWithBudget(requestType, label, fn)
+		if ok ~= false then
+			return result, ok, err
+		end
+
+		lastErr = err
+		if attempt < attempts then
+			local jitter = math.random() * 0.25
+			task.wait(delaySec + jitter)
+			delaySec = math.min(delaySec * 2, 4)
+		end
+	end
+
+	return nil, false, lastErr
+end
+
 local function _hasPendingOrphans(idx)
 	if not idx or not idx.slots then
 		return false
@@ -263,7 +304,7 @@ local function _pruneBackupsForUserId(userId)
 		if pending and #pending > 0 then
 			local survivors = {}
 			for _, key in ipairs(pending) do
-				local _, removed = _dsCallWithBudget(
+				local _, removed = _dsCallWithRetry(
 					Enum.DataStoreRequestType.SetIncrementAsync,
 					("PruneBackup:%s"):format(key),
 					function()
@@ -412,7 +453,7 @@ local function _rememberEnvelopeMeta(Player, env)
 end
 
 local function _fetchKeyValue(store, key)
-	local value, ok = _dsCallWithBudget(
+	local value, ok = _dsCallWithRetry(
 		Enum.DataStoreRequestType.GetAsync,
 		("GetAsync:%s"):format(tostring(key)),
 		function()
@@ -461,7 +502,7 @@ local function _recoverFromBackups(Player)
 			hadError = true
 		elseif env then
 			if SavePolicy.APPLY_CHANGES == true then
-				local _, wrote = _dsCallWithBudget(
+				local _, wrote = _dsCallWithRetry(
 					Enum.DataStoreRequestType.SetIncrementAsync,
 					("RestorePrimary:%s"):format(Player.UserId),
 					function()
@@ -669,6 +710,40 @@ local function CreateSessionLockingDataStoreIfNoneExists()
 	return SessionLocking ~= nil
 end
 
+local function _acquireSessionLock(Player: Player): boolean
+	if not ShouldUseSessionLocking() then
+		return true
+	end
+
+	while not SessionLocking do task.wait() end
+
+	local myJob = game.JobId
+	local deadline = os.time() + SESSION_LOCK_TTL + 1
+	local lock, success = SessionLocking:GetAsync(Player.UserId)
+
+	-- Wait while another server holds a fresh lock
+	while success and lock and lock.jobId and lock.jobId ~= myJob and (os.time() - (lock.at or 0)) < SESSION_LOCK_TTL and os.time() < deadline do
+		warn(("[!] Player (%s | %d) session locked by %s; waiting..."):format(Player.Name, Player.UserId, tostring(lock.jobId)))
+		task.wait(4)
+		lock, success = SessionLocking:GetAsync(Player.UserId)
+	end
+
+	-- If still locked by someone else within TTL, fail
+	if success and lock and lock.jobId and lock.jobId ~= myJob and (os.time() - (lock.at or 0)) < SESSION_LOCK_TTL then
+		warn(("[!] Session lock held by another server for %s (%d); aborting load."):format(Player.Name, Player.UserId))
+		return false
+	end
+
+	-- Claim the lock for this job
+	local _, okSet = SessionLocking:SetAsync(Player.UserId, { jobId = myJob, at = os.time() })
+	if not okSet then
+		warn(("[!] Failed to set session lock for %s (%d)"):format(Player.Name, Player.UserId))
+		return false
+	end
+
+	return true
+end
+
 local function CreatePlayerDataDataStoreIfNoneExists(Player: Player): boolean
 	-- Keys are derived on demand now; nothing to initialize per-player
 	return true
@@ -785,10 +860,22 @@ function PlayerDataService.Load(Player: Player)
 		warn("[!] Cannot Load PlayerData until SessionLocking has not been loaded")
 		return
 	end
+	if ShouldUseSessionLocking() then
+		if not _acquireSessionLock(Player) then
+			PlayerDataService.PlayerDataFailed[Player] = true
+			pcall(function()
+				Player:Kick("Data failed to load. Please rejoin.")
+			end)
+			return
+		end
+	end
 	if not DEBUG_IGNORE_PLAYERDATA_LOAD and not DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
 			warn("[!] Cannot access player datastore for load")
 			PlayerDataService.PlayerDataFailed[Player] = true
+			if ShouldUseSessionLocking() and SessionLocking then
+				SessionLocking:SetAsync(Player.UserId, false)
+			end
 			return
 		end
 	end
@@ -807,6 +894,13 @@ function PlayerDataService.Load(Player: Player)
 		if ok == false then
 			PlayerDataService.PlayerDataFailed[Player] = true
 			warn("[LOAD FAIL] PlayerData ("..Player.UserId..")")
+			if ShouldUseSessionLocking() and SessionLocking then
+				SessionLocking:SetAsync(Player.UserId, false)
+			end
+			pcall(function()
+				Player:Kick("Data failed to load. Please rejoin.")
+			end)
+			return
 		elseif env and env.data then
 			PlayerData = Utility.MergeTables(env.data, PlayerData)
 			PlayerDataService.PlayerDataFailed[Player] = nil
@@ -815,6 +909,7 @@ function PlayerDataService.Load(Player: Player)
 		else
 			PlayerDataService.PlayerDataFailed[Player] = nil
 			DebugPrintLoad("[NEW] PlayerData ("..Player.UserId..")")
+			warn(("[LOAD] No datastore payload for %s (%d); using defaults"):format(Player.Name, Player.UserId))
 		end
 	end
 
@@ -871,7 +966,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 					log(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
 					_rememberEnvelopeMeta(Player, env)
 				else
-					local _, okBackup, errBackup = _dsCallWithBudget(
+					local _, okBackup, errBackup = _dsCallWithRetry(
 						Enum.DataStoreRequestType.SetIncrementAsync,
 						("BackupWrite:%s"):format(backupKey),
 						function()
@@ -883,7 +978,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 					end
 
 					env = SaveEnvelope.touch(env)
-					local _, okPrimary, errPrimary = _dsCallWithBudget(
+					local _, okPrimary, errPrimary = _dsCallWithRetry(
 						Enum.DataStoreRequestType.SetIncrementAsync,
 						("PrimaryWrite:%s"):format(primaryKey),
 						function()
@@ -964,27 +1059,15 @@ end
 
 function PlayerDataService.PlayerAdded(Player: Player)
 	_sessionStart[Player] = os.clock()
-	_detectExistingOrphans(Player.UserId)
-	if ShouldUseSessionLocking() then
-		while not SessionLocking do task.wait() end
-		local IsLocked, Success = SessionLocking:GetAsync(Player.UserId)
-		if IsLocked == true or not Success then
-			local deadline = os.time() + 31
-			while (IsLocked == true or not Success) and os.time() < deadline do
-				warn(("[!] Player (%s | %d) session locked; waiting... locked=%s success=%s")
-					:format(Player.Name, Player.UserId, tostring(IsLocked), tostring(Success)))
-				task.wait(4)
-				IsLocked, Success = SessionLocking:GetAsync(Player.UserId)
-			end
-			if IsLocked == true or not Success then
-				warn(("[!] Session lock wait timed out for %s (%d); continuing without confirmed unlock."):format(Player.Name, Player.UserId))
-			end
-		end
+	local ghostPlot = _findExistingPlotForPlayer(Player)
+	if ghostPlot then
+		warn(("[WORLD] Existing plot detected for %s (%d): %s (destroying to avoid stale assignment)"):format(Player.Name, Player.UserId, ghostPlot:GetFullName()))
 		task.spawn(function()
-			SessionLocking:SetAsync(Player.UserId, false)
+			pcall(function()
+				ghostPlot:Destroy()
+			end)
 		end)
 	end
-
 	if not DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
 			warn("[!] Cannot access player datastore during join")
@@ -994,6 +1077,12 @@ function PlayerDataService.PlayerAdded(Player: Player)
 	end
 
 	PlayerDataService.Load(Player)
+
+	-- Per-user retention: delete any evicted/orphaned backup keys as soon as the user joins.
+	-- (Avoids relying on the global SaveGC tool or long sweep intervals.)
+	task.defer(function()
+		_pruneBackupsForUserId(Player.UserId)
+	end)
 end
 
 function PlayerDataService.PlayerRemoved(Player: Player)

@@ -184,11 +184,14 @@ local function isValidB64(s: string?): boolean
 end
 
 -- If serialization fails, prefer a previous valid snapshot; otherwise fall back to empty cityStorage.
-local function finalizeCityStorageBuffer(newBuffer: string?, prevB64: string?, prevValid: boolean, label: string): string
+local function finalizeCityStorageBuffer(saveOk: boolean, newBuffer: string?, prevB64: string?, prevValid: boolean, label: string): string
 	local buf = (type(newBuffer) == "string") and newBuffer or ""
 	local prior = (type(prevB64) == "string") and prevB64 or ""
 
-	if buf ~= "" then
+	-- IMPORTANT:
+	-- An empty serialized buffer ("") is a valid representation of "no rows" (e.g. last zone deleted).
+	-- Only treat this as a failure when the *save attempt* itself failed.
+	if saveOk then
 		return b64enc(buf)
 	end
 
@@ -1022,6 +1025,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 	local bufferUnlock = ""
 	local unlockNames  = {}
 	local missingSetForSummary : { [string]: boolean }? = nil
+	local zoneSaveOk, roadSaveOk, unlockSaveOk = false, false, false
 
 	-- Keep a reference to previous cityStorage in case we need to retain it
 	local prevZonesB64, prevRoadsB64, prevUnlocksB64 = "", "", ""
@@ -1064,6 +1068,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 		local okZ, outOrErr = pcall(function()
 			return Sload.Save("Zone", zoneRows)
 		end)
+		zoneSaveOk = okZ == true
 		if okZ then
 			bufferZone = outOrErr
 		else
@@ -1078,6 +1083,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 			-- [FIX] robust road snapshotting with in-memory + per-zone previous fallback
 			return Sload.Save("RoadSnapshot", makeRoadRows(player, prevRoadById))
 		end)
+		roadSaveOk = okRoad == true
 		if okRoad then
 			bufferRoad = outOrErr
 		else
@@ -1099,6 +1105,7 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 			for _, r in ipairs(rows) do unlockNames[#unlockNames+1] = r.name end
 			return Sload.Save("Unlock", rows)
 		end)
+		unlockSaveOk = okU == true
 		if okU then
 			bufferUnlock = outOrErr
 		else
@@ -1107,9 +1114,9 @@ savePlayer = function(player: Player, isFinal: boolean?, opts: {[string]: any}?)
 		end
 	end
 
-	local zonesB64Out   = finalizeCityStorageBuffer(bufferZone,   prevZonesB64,   prevZonesValid,   "Zone")
-	local roadsB64Out   = finalizeCityStorageBuffer(bufferRoad,   prevRoadsB64,   prevRoadsValid,   "RoadSnapshot")
-	local unlocksB64Out = finalizeCityStorageBuffer(bufferUnlock, prevUnlocksB64, prevUnlocksValid, "Unlock")
+	local zonesB64Out   = finalizeCityStorageBuffer(zoneSaveOk,   bufferZone,   prevZonesB64,   prevZonesValid,   "Zone")
+	local roadsB64Out   = finalizeCityStorageBuffer(roadSaveOk,   bufferRoad,   prevRoadsB64,   prevRoadsValid,   "RoadSnapshot")
+	local unlocksB64Out = finalizeCityStorageBuffer(unlockSaveOk, bufferUnlock, prevUnlocksB64, prevUnlocksValid, "Unlock")
 
 	-- Apply to save object
 	pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64",   zonesB64Out) end)
@@ -1157,6 +1164,30 @@ local ZoneRemovedBE = expectChild(BindableEvents, "ZoneRemoved", "BindableEvent"
 
 -- [NEW] Per-player coalescer for saves triggered by zone deletions
 local _zoneDeleteSaveCoalesce : { [Player]: boolean } = {}
+-- Track pending delete-triggered saves so we can flush before reload wipes the world
+local _pendingZoneDeleteSave : { [Player]: any } = {}
+
+local function flushPendingZoneDeleteSave(player: Player, reasonTag: string?)
+	if not _pendingZoneDeleteSave[player] then return end
+	if not player or not player.Parent then
+		_pendingZoneDeleteSave[player] = nil
+		_zoneDeleteSaveCoalesce[player] = nil
+		return
+	end
+
+	local now = os.clock()
+	_pendingZoneDeleteSave[player] = nil
+	_zoneDeleteSaveCoalesce[player] = nil
+
+	savePlayer(player, false, {
+		reason = "ZoneRemoved:"..tostring(reasonTag or "Flush"),
+		awaitPipelines = false,
+		skipWorldWhenReloading = false, -- force a world snapshot; we're about to reload
+		force = true,
+	})
+	pcall(function() PlayerDataService.SaveFlush(player, "ZoneRemoved") end)
+	_lastSaveAt[player] = now
+end
 
 -- [ENHANCED] Drop blueprint cache when zones are removed (wipe/switch) **and trigger a coalesced save**
 ZoneRemovedBE.Event:Connect(function(player: Player, zoneId: string)
@@ -1172,24 +1203,40 @@ ZoneRemovedBE.Event:Connect(function(player: Player, zoneId: string)
 		return
 	end
 
+	-- Mark pending so we can flush before a reload wipes live world state
+	_pendingZoneDeleteSave[player] = zoneId or true
+
 	-- Coalesce burst deletions (drag delete/multi delete)
 	if _zoneDeleteSaveCoalesce[player] then return end
 	_zoneDeleteSaveCoalesce[player] = true
 
-	task.delay(0.25, function()
+	task.defer(function()
 		_zoneDeleteSaveCoalesce[player] = nil
 		if not player or not player.Parent then return end
+		if not _pendingZoneDeleteSave[player] then return end
+		if InReload[player] then return end -- let reload flush handle it
 
 		-- Throttle quick repeats
 		local now = os.clock()
-		if not _lastSaveAt[player] or (now - _lastSaveAt[player] > 1.0) then
+		local sinceLast = _lastSaveAt[player] and (now - _lastSaveAt[player]) or math.huge
+		if sinceLast > 1.0 then
 			savePlayer(player, false, {
 				reason = "ZoneRemoved:"..tostring(zoneId),
 				awaitPipelines = false,            -- nothing to wait for on delete
-				skipWorldWhenReloading = true,
+				skipWorldWhenReloading = false,    -- take the snapshot even if reload arms immediately after
 			})
-			pcall(function() PlayerDataService.Save(player, { reason = "ZoneRemoved" }) end)
+			pcall(function() PlayerDataService.SaveFlush(player, "ZoneRemoved") end)
 			_lastSaveAt[player] = now
+			_pendingZoneDeleteSave[player] = nil
+		else
+			-- If throttled, flush after the window so deletes always persist
+			local waitSec = math.max(0.05, 1.05 - sinceLast)
+			task.delay(waitSec, function()
+				if not player or not player.Parent then return end
+				if not _pendingZoneDeleteSave[player] then return end
+				if InReload[player] then return end
+				flushPendingZoneDeleteSave(player, zoneId or "Cooldown")
+			end)
 		end
 	end)
 end)
@@ -1311,6 +1358,9 @@ end
 -- Build an initial load state (blocking prep in a coroutine; the scheduler consumes slices after)
 local function buildInitialLoadState(player: Player)
 	PlayerDataService.WaitForPlayerData(player)
+
+	-- If a delete-triggered save is pending, flush it before we wipe the world
+	flushPendingZoneDeleteSave(player, "PreReload")
 
 	-- Notify listeners we’re about to rebuild this player’s world
 	WorldReloadBeginBE:Fire(player)
@@ -2134,19 +2184,23 @@ local function runSaveSlice(state, budgetMs)
 
 		-- Serialize & commit
 		local bufferZone, bufferRoad, bufferUnlock = "", "", ""
+		local okZone, okRoad, okUnlock = false, false, false
 
 		local okZ, outZ = pcall(function() return Sload.Save("Zone", state.outZoneRows) end)
+		okZone = okZ == true
 		if okZ then bufferZone = outZ else warn("[ProgSave] Zone Save skipped:", outZ) end
 
 		local okR, outR = pcall(function() return Sload.Save("RoadSnapshot", state.outRoadRows) end)
+		okRoad = okR == true
 		if okR then bufferRoad = outR else warn("[ProgSave] RoadSnapshot Save skipped:", outR) end
 
 		local okU, outU = pcall(function() return Sload.Save("Unlock", state.unlockRows or {}) end)
+		okUnlock = okU == true
 		if okU then bufferUnlock = outU else warn("[ProgSave] Unlock Save skipped:", outU) end
 
-		local zonesB64Out   = finalizeCityStorageBuffer(bufferZone,   state.prevZonesB64 or "",   state.prevZonesValid == true,   "Zone")
-		local roadsB64Out   = finalizeCityStorageBuffer(bufferRoad,   state.prevRoadsB64 or "",   state.prevRoadsValid == true,   "RoadSnapshot")
-		local unlocksB64Out = finalizeCityStorageBuffer(bufferUnlock, state.prevUnlocksB64 or "", state.prevUnlocksValid == true, "Unlock")
+		local zonesB64Out   = finalizeCityStorageBuffer(okZone,   bufferZone,   state.prevZonesB64 or "",   state.prevZonesValid == true,   "Zone")
+		local roadsB64Out   = finalizeCityStorageBuffer(okRoad,   bufferRoad,   state.prevRoadsB64 or "",   state.prevRoadsValid == true,   "RoadSnapshot")
+		local unlocksB64Out = finalizeCityStorageBuffer(okUnlock, bufferUnlock, state.prevUnlocksB64 or "", state.prevUnlocksValid == true, "Unlock")
 
 		-- Apply to savefile (will stage automatically if a reload window is open)
 		pcall(function() PlayerDataService.ModifySaveData(player, "cityStorage/zonesB64",   zonesB64Out) end)
@@ -2248,6 +2302,40 @@ if manualSaveBE and manualSaveBE:IsA("BindableEvent") then
 	end)
 end
 
+-- Synchronous save hook (used by SwitchToSlot to avoid racing BindableEvent handlers)
+local manualSaveBF = BindableEvents:FindFirstChild("ManualSaveSync")
+if not manualSaveBF then
+	manualSaveBF = Instance.new("BindableFunction")
+	manualSaveBF.Name = "ManualSaveSync"
+	manualSaveBF.Parent = BindableEvents
+end
+if manualSaveBF and manualSaveBF:IsA("BindableFunction") then
+	(manualSaveBF :: BindableFunction).OnInvoke = function(plr: Player, reason: any): boolean
+		local tag = (typeof(reason) == "string" and reason) or "ManualSaveSync"
+		if not plr or not plr.Parent then return false end
+
+		if _loading[plr] or InReload[plr] then
+			_saveQueuedOnReloadEnd[plr] = true
+			LOG(tag, "deferred (loading/reloading) for", plr.Name)
+			return false
+		end
+
+		-- Cancel any in-flight progressive autosave so its FINALIZE can't land on a different slot mid-switch.
+		_activeSaves[plr] = nil
+
+		local ok, err = pcall(function()
+			savePlayer(plr, false, { reason = tag })
+			PlayerDataService.SaveFlush(plr, tag)
+		end)
+		if not ok then
+			warn("[SaveManager] ManualSaveSync failed for", plr.Name, err)
+		end
+		return ok
+	end
+else
+	warn("[SaveManager] ManualSaveSync is not a BindableFunction; slot switching may race saves.")
+end
+
 ----------------------------------------------------------------
 --  NEW: external reload hook used by SwitchToSlot
 ----------------------------------------------------------------
@@ -2255,9 +2343,8 @@ local RequestReloadFromCurrent = expectChild(BindableEvents, "RequestReloadFromC
 
 RequestReloadFromCurrent.Event:Connect(function(plr: Player)
 	LOG("ReloadFromCurrent requested for", plr and plr.Name or "<nil>")
-	task.spawn(function()
-		enqueueLoad(plr, "RequestReloadFromCurrent")
-	end)
+	_activeSaves[plr] = nil
+	enqueueLoad(plr, "RequestReloadFromCurrent")
 end)
 
 ----------------------------------------------------------------
@@ -2276,6 +2363,8 @@ Players.PlayerRemoving:Connect(function(plr)
 	InflightPopByUid[plr.UserId] = 0
 	InReload[plr] = nil
 	LastRehydrateAttemptAt[plr.UserId] = nil
+	_zoneDeleteSaveCoalesce[plr] = nil
+	_pendingZoneDeleteSave[plr] = nil
 	destroyOcclusionCube(plr)
 
 	local firedPlayerSaved = false

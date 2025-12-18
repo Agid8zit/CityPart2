@@ -205,8 +205,8 @@ local BADGE_DEFINITIONS = {
 BadgeService.Badges = BADGE_DEFINITIONS
 BadgeService.Keys = BADGE_KEYS
 
-local function ensureOwnedBadgeTable(player: Player)
-	local playerData = PlayerDataService.AllPlayerData[player]
+local function ensureOwnedBadgeTable(player: Player, playerDataOverride: table?)
+	local playerData = playerDataOverride or PlayerDataService.AllPlayerData[player]
 	if not playerData then
 		return nil
 	end
@@ -214,8 +214,8 @@ local function ensureOwnedBadgeTable(player: Player)
 	return playerData.OwnedBadges
 end
 
-local function markBadgeOwned(player: Player, badgeKey: string)
-	local owned = ensureOwnedBadgeTable(player)
+local function markBadgeOwned(player: Player, badgeKey: string, playerDataOverride: table?)
+	local owned = ensureOwnedBadgeTable(player, playerDataOverride)
 	if not owned then
 		warn(string.format("[BadgeService] Player data missing while recording %s for %s", badgeKey, player.Name))
 		return false
@@ -225,7 +225,10 @@ local function markBadgeOwned(player: Player, badgeKey: string)
 	end
 
 	owned[badgeKey] = true
-	PlayerDataService.ModifyData(player, "OwnedBadges/" .. badgeKey, true)
+	-- If PlayerDataService has already attached the player data, mutate it via ModifyData so clients stay in sync.
+	if PlayerDataService.AllPlayerData[player] then
+		PlayerDataService.ModifyData(player, "OwnedBadges/" .. badgeKey, true)
+	end
 	return true
 end
 
@@ -259,19 +262,19 @@ function BadgeService.GetBadgeInfo(badgeKey: string)
 	return BADGE_DEFINITIONS[badgeKey]
 end
 
-function BadgeService.Award(player: Player, badgeKey: string): (boolean, string?)
+function BadgeService.Award(player: Player, badgeKey: string, playerDataOverride: table?): (boolean, string?)
 	local definition = BADGE_DEFINITIONS[badgeKey]
 	if not definition then
 		return false, "UnknownBadgeKey"
 	end
 
-	local owned = ensureOwnedBadgeTable(player)
+	local owned = ensureOwnedBadgeTable(player, playerDataOverride)
 	if owned and owned[badgeKey] then
 		return true, "AlreadyRecorded"
 	end
 
 	if safeUserHasBadge(player.UserId, definition.id) then
-		markBadgeOwned(player, badgeKey)
+		markBadgeOwned(player, badgeKey, playerDataOverride)
 		return true, "AlreadyOwned"
 	end
 
@@ -285,7 +288,7 @@ function BadgeService.Award(player: Player, badgeKey: string): (boolean, string?
 		return false, tostring(err)
 	end
 
-	markBadgeOwned(player, badgeKey)
+	markBadgeOwned(player, badgeKey, playerDataOverride)
 	return true, "Awarded"
 end
 

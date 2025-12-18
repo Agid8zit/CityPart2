@@ -1,31 +1,111 @@
 ﻿local DataStoreService = game:GetService("DataStoreService")
-local MemoryStoreService = game:GetService("MemoryStoreService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local SavePolicy = require(script.Parent.Parent.Config.SavePolicy)
 local SaveIndex = require(script.Parent.Parent.Services.SaveIndex)
 local SaveKeyNames = require(script.Parent.Parent.Services.SaveKeyNames)
 
+-- This tool is expensive (lists every key) and can be destructive (RemoveAsync).
+-- Only run when explicitly enabled.
+if not SavePolicy.RUN_GC_ON_BOOT then
+	warn("[RETENTION] SaveGC skipped: RUN_GC_ON_BOOT=false")
+	return
+end
+
+-- Extra safety: never hammer production servers automatically.
+if not RunService:IsStudio() and not SavePolicy.ALLOW_GC_OUTSIDE_STUDIO then
+	warn("[RETENTION] SaveGC skipped outside Studio (set ALLOW_GC_OUTSIDE_STUDIO=true to override)")
+	return
+end
+
 local function withLock(name, ttlSeconds, fn)
-	local queue = MemoryStoreService:GetQueue("save-gc:" .. name)
-	local token = tostring(math.random())
-	local okPush = pcall(function()
-		queue:AddAsync(token, 1, ttlSeconds)
+	-- Use a DataStore lock so only one server runs GC at a time.
+	local lockStoreName = SavePolicy.GC_LOCK_STORE or "SaveGC_Lock_v1"
+	local lockStore = DataStoreService:GetDataStore(lockStoreName)
+	local token = HttpService:GenerateGUID(false)
+	local now = os.time()
+	local key = "lock:" .. tostring(name)
+
+	local okLock, lockValOrErr = pcall(function()
+		return lockStore:UpdateAsync(key, function(old)
+			if type(old) == "table" and type(old.expiresAt) == "number" and old.expiresAt > now then
+				return old
+			end
+			return { token = token, expiresAt = now + ttlSeconds }
+		end)
 	end)
-	if not okPush then
-		return false, 'lock-failed'
+
+	if not okLock then
+		warn(("[RETENTION] GC lock acquisition failed (%s): %s"):format(tostring(name), tostring(lockValOrErr)))
+		return false, "lock_error"
 	end
+
+	if type(lockValOrErr) ~= "table" or lockValOrErr.token ~= token then
+		warn(("[RETENTION] GC lock held (%s); skipping run"):format(tostring(name)))
+		return false, "locked"
+	end
+
 	local ok, err = pcall(fn)
+
+	-- Best-effort release (still protected by token); TTL remains a safety net if this fails.
+	pcall(function()
+		lockStore:UpdateAsync(key, function(old)
+			if type(old) == "table" and old.token == token then
+				return nil
+			end
+			return old
+		end)
+	end)
+
 	return ok, err
 end
 
-local function collectStore(storeName)
+local function _sleepBackoff(attempt: number)
+	local base = tonumber(SavePolicy.GC_LIST_RETRY_BASE_DELAY_SEC) or 0.5
+	local maxDelay = tonumber(SavePolicy.GC_LIST_RETRY_MAX_DELAY_SEC) or 8
+	local waitSec = math.min(maxDelay, base * (2 ^ math.max(0, attempt - 1)))
+	task.wait(waitSec)
+end
+
+local function listKeysWithRetry(ds, storeName: string)
+	local maxAttempts = math.clamp(math.floor(tonumber(SavePolicy.GC_LIST_RETRIES) or 10), 1, 25)
+	for attempt = 1, maxAttempts do
+		local ok, pagesOrErr = pcall(function()
+			return ds:ListKeysAsync(nil, SavePolicy.LIST_PAGE_SIZE, nil, true)
+		end)
+		if ok and pagesOrErr then
+			return pagesOrErr
+		end
+		warn(("[RETENTION] ListKeysAsync failed for %s (attempt %d/%d): %s")
+			:format(storeName, attempt, maxAttempts, tostring(pagesOrErr)))
+		_sleepBackoff(attempt)
+	end
+	return nil
+end
+
+local function advancePageWithRetry(pages, storeName: string): boolean
+	local maxAttempts = math.clamp(math.floor(tonumber(SavePolicy.GC_ADVANCE_RETRIES) or 10), 1, 25)
+	for attempt = 1, maxAttempts do
+		local ok, err = pcall(function()
+			pages:AdvanceToNextPageAsync()
+		end)
+		if ok then
+			return true
+		end
+		warn(("[RETENTION] AdvanceToNextPageAsync failed for %s (attempt %d/%d): %s")
+			:format(storeName, attempt, maxAttempts, tostring(err)))
+		_sleepBackoff(attempt)
+	end
+	return false
+end
+
+local function collectStore(storeName, doDeletes: boolean)
 	local ds = DataStoreService:GetDataStore(storeName)
 	local keysByUser = {}
 
-	local ok, pages = pcall(function()
-		return ds:ListKeysAsync(nil, SavePolicy.LIST_PAGE_SIZE, nil, true)
-	end)
-	if not ok or not pages then
+	local pages = listKeysWithRetry(ds, storeName)
+	if not pages then
 		warn('[RETENTION] Cannot list keys for', storeName)
 		return
 	end
@@ -57,10 +137,7 @@ local function collectStore(storeName)
 		if pages.IsFinished then
 			break
 		end
-		local advOk = pcall(function()
-			pages:AdvanceToNextPageAsync()
-		end)
-		if not advOk then
+		if not advancePageWithRetry(pages, storeName) then
 			break
 		end
 		task.wait(SavePolicy.YIELD_BETWEEN_PAGES)
@@ -109,13 +186,15 @@ local function collectStore(storeName)
 			for i = start, #bucket.backups do
 				table.insert(idx.slots[slot].backups, bucket.backups[i])
 			end
-			SaveIndex.write(userId, idx)
+			if doDeletes then
+				SaveIndex.write(userId, idx)
+			end
 		end
 	end
 
 	print(('[RETENTION] %s planned deletions=%d'):format(storeName, #planned))
 
-	if SavePolicy.APPLY_CHANGES ~= true then
+	if not doDeletes then
 		for i = 1, math.min(#planned, 20) do
 			local p = planned[i]
 			print(('[RETENTION][DRY-RUN] would delete %s %s (%s)'):format(p.store, p.key, p.reason))
@@ -140,15 +219,13 @@ local function collectStore(storeName)
 	print(('[RETENTION] %s deletions applied=%d'):format(storeName, deleted))
 end
 
-if SavePolicy.APPLY_CHANGES then
-	withLock('global', 300, function()
-		for _, name in ipairs(SavePolicy.PLAYER_DS_ALL) do
-			collectStore(name)
-		end
-	end)
-else
-	print('[RETENTION] Running in dry-run mode; no deletions will occur.')
-	for _, name in ipairs(SavePolicy.PLAYER_DS_ALL) do
-		collectStore(name)
+local doDeletes = (SavePolicy.APPLY_CHANGES == true) and (SavePolicy.GC_APPLY_CHANGES == true)
+
+withLock("global", tonumber(SavePolicy.GC_LOCK_TTL_SECONDS) or 3600, function()
+	if not doDeletes then
+		print("[RETENTION] Running in dry-run mode; no deletions or index writes will occur. (set GC_APPLY_CHANGES=true to enable)")
 	end
-end
+	for _, name in ipairs(SavePolicy.PLAYER_DS_ALL) do
+		collectStore(name, doDeletes)
+	end
+end)

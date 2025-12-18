@@ -39,6 +39,28 @@ local GridScripts = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Grid
 local GridUtil    = require(GridScripts:WaitForChild("GridUtil"))
 local GridConfig  = require(GridScripts:WaitForChild("GridConfig"))
 local notifyPlayerEvent = RemoteEvents:WaitForChild("NotifyPlayer")
+local NOTIFY_KEYS = {
+	NeedsRoad        = "ZoneNeedsRoad",
+	NeedsWater       = "ZoneNeedsWater",
+	NeedsPower       = "ZoneNeedsPower",
+	HasRoad          = "ZoneHasRoad",
+	LostRoad         = "ZoneLostRoad",
+	HasWater         = "ZoneHasWater",
+	LostWater        = "ZoneLostWater",
+	HasPower         = "ZoneHasPower",
+	LostPower        = "ZoneLostPower",
+}
+local NOTIFY_FALLBACK = {
+	[NOTIFY_KEYS.NeedsRoad]  = "A zone needs a road connection.",
+	[NOTIFY_KEYS.NeedsWater] = "A zone needs water service.",
+	[NOTIFY_KEYS.NeedsPower] = "A zone needs power.",
+	[NOTIFY_KEYS.HasRoad]    = "A zone is now connected to a road.",
+	[NOTIFY_KEYS.LostRoad]   = "A zone lost its road connection.",
+	[NOTIFY_KEYS.HasWater]   = "A zone now has water.",
+	[NOTIFY_KEYS.LostWater]  = "A zone lost water service.",
+	[NOTIFY_KEYS.HasPower]   = "A zone now has power.",
+	[NOTIFY_KEYS.LostPower]  = "A zone lost power.",
+}
 local UtilityAlertsRE = RemoteEvents:FindFirstChild("UtilityAlerts")
 local CityInteractions =require(script.Parent.CityInteraction)
 
@@ -2175,18 +2197,22 @@ function ZoneRequirementsChecker.getNearbyCoords(coord, radius)
 	return nearby
 end
 
-function ZoneRequirementsChecker.notifyPlayer(player, message)
+function ZoneRequirementsChecker.notifyPlayer(player, langKey)
 	if not player or not player:IsA("Player") then
 		warn("Invalid player in notifyPlayer.")
 		return
 	end
-	if type(message) ~= "string" then
-		warn("Invalid message in notifyPlayer.")
+	if type(langKey) ~= "string" or langKey == "" then
+		warn("Invalid langKey in notifyPlayer.")
 		return
 	end
-	debugPrint(string.format("Notifying '%s': %s", player.Name, message))
+	debugPrint(string.format("Notifying '%s' (langKey=%s)", player.Name, langKey))
 	if notifyPlayerEvent then
-		notifyPlayerEvent:FireClient(player, message)
+		notifyPlayerEvent:FireClient(player, {
+			LangKey   = langKey,
+			Text      = NOTIFY_FALLBACK[langKey],
+			ForceText = true, -- ensure readable even if localization loader fails
+		})
 	else
 		warn("notifyPlayerEvent not found.")
 	end
@@ -2503,13 +2529,13 @@ function ZoneRequirementsChecker.checkZoneRequirements(player, zoneId, mode, gri
 			ZoneTrackerModule.markZoneRequirement(player, zoneId, "Power", allPower)
 
 			if not allRoad then
-				ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' needs a road within %d blocks."):format(zoneId, SEARCH_RADIUS))
+				ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.NeedsRoad)
 			end
 			if not allWater then
-				ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' needs water. Build tower/pipes within %d blocks."):format(zoneId, SEARCH_RADIUS))
+				ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.NeedsWater)
 			end
 			if not allPower then
-				ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' needs power. Build plant/lines within %d blocks."):format(zoneId, SEARCH_RADIUS))
+				ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.NeedsPower)
 			end
 
 			-- >>> ADDED: sequence bump per alarmType
@@ -2641,11 +2667,11 @@ function ZoneRequirementsChecker.checkPendingRoadRequirements(player, zoneId, mo
 
 		if allRoad and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", true)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' is now connected to a road."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.HasRoad)
 			ZoneRequirementsChecker.attemptActivatePendingZone(player, bZone.zoneId)
 		elseif not allRoad and wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' lost road connection."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostRoad)
 		end
 
 		local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
@@ -2677,11 +2703,11 @@ function ZoneRequirementsChecker.checkPendingWaterRequirements(player, zoneId, m
 
 		if allWater and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", true)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' now has water."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.HasWater)
 			ZoneRequirementsChecker.attemptActivatePendingZone(player, bZone.zoneId)
 		elseif not allWater and wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' lost water connection."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostWater)
 		end
 
 		task.defer(function()
@@ -2708,10 +2734,10 @@ function ZoneRequirementsChecker.checkPendingPowerRequirements(player, zoneId, m
 
 		if allPower and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", true)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' now has power."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.HasPower)
 		elseif not allPower and wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' lost power connection."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostPower)
 		end
 	end
 end
@@ -2733,11 +2759,11 @@ function ZoneRequirementsChecker.checkDependentZonesAfterRoadRemoval(player, rem
 
 		if allRoad and not wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", true)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' is again connected to a road."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.HasRoad)
 			ZoneRequirementsChecker.attemptActivatePendingZone(player, bZone.zoneId)
 		elseif not allRoad and wasOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Road", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' is no longer connected to a road."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostRoad)
 		end
 
 		local allWater, missW = ZoneRequirementsChecker.evaluateWaterForZone(player, bZone.zoneId, data.gridList)
@@ -2765,7 +2791,7 @@ function ZoneRequirementsChecker.checkDependentZonesAfterWaterRemoval(player, re
 
 		if not allOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Water", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' is no longer connected to water."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostWater)
 		end
 	end
 end
@@ -2783,7 +2809,7 @@ function ZoneRequirementsChecker.checkDependentZonesAfterPowerRemoval(player, re
 
 		if not allOK then
 			ZoneTrackerModule.markZoneRequirement(player, bZone.zoneId, "Power", false)
-			ZoneRequirementsChecker.notifyPlayer(player, ("Zone '%s' is no longer connected to power."):format(bZone.zoneId))
+			ZoneRequirementsChecker.notifyPlayer(player, NOTIFY_KEYS.LostPower)
 		end
 	end
 end

@@ -11,11 +11,39 @@ local Constants = require(ReplicatedStorage.Scripts.Constants)
 local Gamepasses = require(ReplicatedStorage.Scripts.Gamepasses)
 local PlayerDataService = require(ServerScriptService.Services.PlayerDataService)
 local BadgeServiceModule = require(ServerScriptService.Services.BadgeService)
+local DefaultDataModule = require(ServerScriptService.Services.PlayerDataService.DefaultData)
 local OnboardingServiceOk, OnboardingService = pcall(function()
 	return require(ServerScriptService.Players.OnboardingService)
 end)
 if not OnboardingServiceOk then
 	OnboardingService = nil
+end
+
+local defaultExclusives = DefaultDataModule.SaveFile.exclusiveLocations or {}
+
+local function normalizeExclusiveLocations(saveFile)
+	if type(saveFile) ~= "table" then return end
+	if type(saveFile.exclusiveLocations) ~= "table" then
+		saveFile.exclusiveLocations = {}
+	end
+
+	local function clampExclusive(val, defaultVal)
+		local n = tonumber(val)
+		if n == nil then n = tonumber(defaultVal) or 0 end
+		if n == 420 then n = tonumber(defaultVal) or 0 end
+		if n < 0 then n = 0 end
+		if n > 1 then n = 1 end
+		return n
+	end
+
+	for key, defaultVal in pairs(defaultExclusives) do
+		saveFile.exclusiveLocations[key] = clampExclusive(saveFile.exclusiveLocations[key], defaultVal)
+	end
+	for key, val in pairs(saveFile.exclusiveLocations) do
+		if defaultExclusives[key] == nil then
+			saveFile.exclusiveLocations[key] = clampExclusive(val, 0)
+		end
+	end
 end
 
 local EventsFolder = ReplicatedStorage:WaitForChild("Events")
@@ -33,20 +61,38 @@ end
 local ForceDisableOnboardingBE: BindableEvent = ensureBE("ForceDisableOnboarding")
 
 local MoneyBadgeThresholds = {
-	{ amount = 1000000000, award = BadgeServiceModule.AwardMoney1B },
-	{ amount = 100000000,  award = BadgeServiceModule.AwardMoney100M },
-	{ amount = 1000000,    award = BadgeServiceModule.AwardMoney1M },
-	{ amount = 100000,     award = BadgeServiceModule.AwardMoney100K },
-	{ amount = 10000,      award = BadgeServiceModule.AwardMoney10K },
+	{ amount = 1000000000, badgeKey = BadgeServiceModule.Keys.Money1B },
+	{ amount = 100000000,  badgeKey = BadgeServiceModule.Keys.Money100M },
+	{ amount = 1000000,    badgeKey = BadgeServiceModule.Keys.Money1M },
+	{ amount = 100000,     badgeKey = BadgeServiceModule.Keys.Money100K },
+	{ amount = 10000,      badgeKey = BadgeServiceModule.Keys.Money10K },
 }
 
-local function checkMoneyBadges(player, amount)
+local function checkMoneyBadges(player, amount, playerDataOverride)
 	if not player or type(amount) ~= "number" then return end
 	for _, entry in ipairs(MoneyBadgeThresholds) do
 		if amount >= entry.amount then
-			entry.award(player)
+			BadgeServiceModule.Award(player, entry.badgeKey, playerDataOverride)
 		end
 	end
+end
+
+-- Defensive helper to guarantee callers see a savefile with economy fields.
+local function getCurrentSaveFile(player)
+	local playerData = PlayerDataService.AllPlayerData[player]
+	if not playerData then return nil end
+
+	local saveFile = playerData.savefiles and playerData.savefiles[playerData.currentSaveFile]
+	if not saveFile then return nil end
+
+	saveFile.economy = saveFile.economy or {}
+	saveFile.economy.money = tonumber(saveFile.economy.money) or 0
+	saveFile.economy.bustickets = tonumber(saveFile.economy.bustickets) or 0
+	saveFile.economy.planetickets = tonumber(saveFile.economy.planetickets) or 0
+
+	normalizeExclusiveLocations(saveFile)
+
+	return saveFile, playerData
 end
 
 -- ======================================================================
@@ -89,38 +135,23 @@ end
 
 -- Module Functions
 function PlayerDataInterfaceService.OnLoad(Player: Player, PlayerData)
-	-- Round any currency decimals
-	--PlayerData.Coins = math.round(PlayerData.Coins)
-	warn("!!! START WITH EVERYTHING FOR TESTING !!!")
-
 	PlayerData.OwnedBadges = PlayerData.OwnedBadges or {}
 	local SaveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if SaveFile and SaveFile.economy then
-		checkMoneyBadges(Player, SaveFile.economy.money or 0)
+	if SaveFile then
+		-- Ensure core tables exist without overwriting saved values
+		SaveFile.economy = SaveFile.economy or {}
+		SaveFile.economy.money = tonumber(SaveFile.economy.money) or 0
+		SaveFile.economy.bustickets = tonumber(SaveFile.economy.bustickets) or 0
+		SaveFile.economy.planetickets = tonumber(SaveFile.economy.planetickets) or 0
+
+		normalizeExclusiveLocations(SaveFile)
+
+		checkMoneyBadges(Player, SaveFile.economy.money or 0, PlayerData)
 	end
 
 	_ensureTransitNode(SaveFile, "busDepot")
 	_ensureTransitNode(SaveFile, "airport")
 	-- ==================================================================
-
-	SaveFile.xp         = 9999999
-	SaveFile.cityLevel  = 26
-	SaveFile.economy = {
-		money        = 9950000,
-		bustickets   = 3000000,
-		planetickets = 3000000,
-	}
-	SaveFile.exclusiveLocations = {
-		["FirePrecinct"] = 420,
-		["PolicePrecinct"] = 420,
-		["MajorHospital"] = 420,
-		["Museum"] = 420,
-		["FootballStadium"] = 420,
-		["StatueOfLiberty"] = 420,
-		["EiffelTower"] = 420,
-		["NuclearPowerPlant"] = 420,
-		["MolecularWaterPlant"] = 420,
-	}
 
 	return PlayerData
 end
@@ -206,26 +237,19 @@ function PlayerDataInterfaceService.GiveMissingBadges(Player: Player)
 end
 
 function PlayerDataInterfaceService.GetCoinsInSaveData(Player: Player)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	return saveFile.economy.money
 end
 
 local RE_PlayerDataChanged_Money = ReplicatedStorage.Events.RemoteEvents.PlayerDataChanged_Money
 function PlayerDataInterfaceService.IncrementCoinsInSaveData(Player: Player, IncrementAmount: number)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	local Coins = (saveFile.economy.money or 0) + (IncrementAmount or 0)
+	saveFile.economy.money = Coins
 	PlayerDataService.ModifySaveData(Player, "economy/money", Coins)
 
 	RE_PlayerDataChanged_Money:FireClient(Player, Coins)
@@ -233,13 +257,11 @@ function PlayerDataInterfaceService.IncrementCoinsInSaveData(Player: Player, Inc
 end
 
 function PlayerDataInterfaceService.SetCoinsInSaveData(Player: Player, NewAmount: number)
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	local clamped = math.max(0, tonumber(NewAmount) or 0)
+	saveFile.economy.money = clamped
 	PlayerDataService.ModifySaveData(Player, "economy/money", clamped)
 	RE_PlayerDataChanged_Money:FireClient(Player, clamped)
 	checkMoneyBadges(Player, clamped)
@@ -253,14 +275,11 @@ end
 
 local RE_PlayerDataChanged_PlaneTickets = ReplicatedStorage.Events.RemoteEvents.PlayerDataChanged_PlaneTickets
 function PlayerDataInterfaceService.IncrementPlaneTicketsInSaveData(Player: Player, IncrementAmount: number)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	local Coins = (saveFile.economy.planetickets or 0) + (IncrementAmount or 0)
+	saveFile.economy.planetickets = Coins
 	PlayerDataService.ModifySaveData(Player, "economy/planetickets", Coins)
 
 	RE_PlayerDataChanged_PlaneTickets:FireClient(Player, Coins)
@@ -268,14 +287,11 @@ end
 
 local RE_PlayerDataChanged_BusTickets = ReplicatedStorage.Events.RemoteEvents.PlayerDataChanged_BusTickets
 function PlayerDataInterfaceService.IncrementBusTicketsInSaveData(Player: Player, IncrementAmount: number)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	local Coins = (saveFile.economy.bustickets or 0) + (IncrementAmount or 0)
+	saveFile.economy.bustickets = Coins
 	PlayerDataService.ModifySaveData(Player, "economy/bustickets", Coins)
 
 	RE_PlayerDataChanged_BusTickets:FireClient(Player, Coins)
@@ -283,12 +299,8 @@ end
 
 local RE_PlayerDataChanged_ExclusiveLocations = ReplicatedStorage.Events.RemoteEvents.PlayerDataChanged_ExclusiveLocations
 function PlayerDataInterfaceService.IncrementExclusiveLocation(Player: Player, ExclusiveLocationName: string, IncrementAmount: number)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
-	if not saveFile then return false end
+	local saveFile = getCurrentSaveFile(Player)
+	if not saveFile then return end
 
 	local CurrentAmount = saveFile.exclusiveLocations[ExclusiveLocationName]
 	if CurrentAmount == nil then
@@ -300,14 +312,32 @@ function PlayerDataInterfaceService.IncrementExclusiveLocation(Player: Player, E
 end
 
 function PlayerDataInterfaceService.GetExclusiveLocationAmount(Player: Player, ExclusiveLocationName: string)
-	-- Data check
-	local PlayerData = PlayerDataService.AllPlayerData[Player]
-	if not PlayerData then return end
-
-	local saveFile = PlayerData.savefiles[PlayerData.currentSaveFile]
+	local saveFile = getCurrentSaveFile(Player)
 	if not saveFile then return 0 end
 
 	return saveFile.exclusiveLocations[ExclusiveLocationName]
+end
+
+local function reemitCurrentSaveSignals(player: Player)
+	local saveFile = getCurrentSaveFile(player)
+	if not saveFile then return end
+
+	local money = tonumber(saveFile.economy.money) or 0
+	local plane = tonumber(saveFile.economy.planetickets) or 0
+	local bus = tonumber(saveFile.economy.bustickets) or 0
+
+	RE_PlayerDataChanged_Money:FireClient(player, money)
+	RE_PlayerDataChanged_PlaneTickets:FireClient(player, plane)
+	RE_PlayerDataChanged_BusTickets:FireClient(player, bus)
+
+	for name, val in pairs(saveFile.exclusiveLocations or {}) do
+		RE_PlayerDataChanged_ExclusiveLocations:FireClient(player, name, tonumber(val) or 0)
+	end
+end
+
+-- Public helper so slot switches can push the fresh save's values to the client.
+function PlayerDataInterfaceService.ResendCurrentSaveSignals(Player: Player)
+	reemitCurrentSaveSignals(Player)
 end
 
 function PlayerDataInterfaceService.PlayerBoughtSomething(Player: Player)
@@ -391,6 +421,12 @@ RF_LoadSaveFile.OnServerInvoke = function(Player: Player, SlotID: string)
 
 	-- 2) Switch the active slot
 	PlayerDataService.ModifyData(Player, "currentSaveFile", SlotID)
+	-- Push a fresh full snapshot to the client so UI reflects the new slot (exclusives, etc.)
+	local pdNow = PlayerDataService.GetData(Player)
+	if pdNow then
+		PlayerDataService.ModifyData(Player, nil, pdNow)
+	end
+	reemitCurrentSaveSignals(Player)
 
 	-- 3) Tell SaveManager to wipe and reload from the *current* slot
 	local BEFolder = ReplicatedStorage:FindFirstChild("Events") and ReplicatedStorage.Events:FindFirstChild("BindableEvents")

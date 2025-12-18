@@ -323,7 +323,6 @@ local _obGateItemID: string? = nil  -- single source of truth
 local function _refreshPulseTargets()
 	-- Transport
 	local transportBtn; pcall(function() transportBtn = UI.main.tabs.transport.Background end)
-	if not transportBtn then pcall(function() transportBtn = UI.main.tabs.transpot and UI.main.tabs.transpot.Background end) end
 	_regTarget("BM_Transport", transportBtn)
 
 	-- Zones
@@ -341,18 +340,6 @@ local function _refreshPulseTargets()
 	local roadBtn = FrameButtons and FrameButtons["DirtRoad"] or nil
 	_regTarget("BM_DirtRoad", roadBtn)
 
-	-- Core onboarding items (so gates/hints have real targets)
-	_regTarget("BM_WaterPipe",    FrameButtons and FrameButtons["WaterPipe"] or nil)
-	_regTarget("BM_WaterTower",   FrameButtons and FrameButtons["WaterTower"] or nil)
-	_regTarget("BM_WindTurbine",  FrameButtons and FrameButtons["WindTurbine"] or nil)
-	_regTarget("BM_PowerLines",   FrameButtons and FrameButtons["PowerLines"] or nil)
-	_regTarget("BM_SolarPanels",  FrameButtons and FrameButtons["SolarPanels"] or nil)
-	_regTarget("BM_Industrial",   FrameButtons and FrameButtons["Industrial"] or nil)
-
-	-- Supply hubs (use Supply tab as fallback if a dedicated hub button is missing)
-	_regTarget("BM_Supply_Power", supplyBtn)
-	_regTarget("BM_Supply_Water", supplyBtn)
-
 	-- Mobile confirm / placement button
 	_regTarget("BM_PlaceButton", UI_PlaceButton)
 end
@@ -365,23 +352,6 @@ function BuildMenu.ApplyGateVisual(itemID: string?)
 		_obGateItemID = nil
 	end
 	if _updatePulses then _updatePulses() end
-end
-
--- React to onboarding enable/disable so gates/pulses clear when onboarding ends
-local function _setOnboardingEnabled(enabled: boolean)
-	_obEnabled = (enabled ~= false)
-	if not _obEnabled then
-		_obGateItemID = nil
-		_stopAllPulses()
-	end
-	if _updatePulses then _updatePulses() end
-end
-
-local BE_OnboardingToggle = BE:FindFirstChild("OnboardingToggle")
-if BE_OnboardingToggle and BE_OnboardingToggle:IsA("BindableEvent") then
-	BE_OnboardingToggle.Event:Connect(function(enabled)
-		_setOnboardingEnabled(enabled)
-	end)
 end
 
 -- Default pulsing logic (gate ALWAYS wins)

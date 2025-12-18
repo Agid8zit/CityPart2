@@ -28,6 +28,7 @@ local ZoneRequirementsChecker = require(ZoneMgr:WaitForChild("ZoneRequirementsCh
 local Events          = RS:WaitForChild("Events")
 local BindableEvents  = Events:WaitForChild("BindableEvents")
 local StatsChanged    = BindableEvents:WaitForChild("StatsChanged")
+local RemoteEvents    = Events:FindFirstChild("RemoteEvents")
 local Balancing       = RS:WaitForChild("Balancing")
 
 local Balance = require(Balancing:WaitForChild("BalanceEconomy"))
@@ -82,6 +83,8 @@ local zoneSums = {}
 local playerBaseIncome = {}
 -- per-tick payout cache (authoritative pay last applied)
 local playerIncomeCache = {} -- [userId] = pay per tick (integer)
+local playerLastPayoutAt = {} -- [userId] = time() last payout was applied
+local _coverageWarnAt = {}    -- [userId] = os.clock() last warn (to rate-limit)
 
 -- Active player roster for round-robin scheduling
 local activePlayers = {}       -- array of Player
@@ -125,6 +128,7 @@ local function ensurePlayerTables(playerId)
 	tileIncomeCache[playerId]  = tileIncomeCache[playerId] or {}
 	zoneSums[playerId]         = zoneSums[playerId] or {}
 	playerBaseIncome[playerId] = playerBaseIncome[playerId] or 0
+	playerLastPayoutAt[playerId] = playerLastPayoutAt[playerId] or time()
 	tileZoneIndex[playerId]    = tileZoneIndex[playerId] or {}
 	if not playerWork[playerId] then
 		playerWork[playerId] = { queue = {}, idx = 1, keySet = {}, lastProcessedAt = time() }
@@ -140,6 +144,7 @@ local function clearPlayerState(playerId)
 	playerBaseIncome[playerId] = nil
 	tileZoneIndex[playerId] = nil
 	playerIncomeCache[playerId] = nil
+	playerLastPayoutAt[playerId] = nil
 	pendingRebuild[playerId] = nil
 end
 
@@ -304,6 +309,103 @@ local function computeCoverage(player)
 end
 
 -- =========================
+-- Payout helpers (shared between scheduled + interactive triggers)
+-- =========================
+local function computePayPerTickForPlayer(player)
+	local playerId = player.UserId
+	ensurePlayerTables(playerId)
+
+	local baseTotal = playerBaseIncome[playerId] or 0
+
+	if PlayerDataInterfaceService.HasGamepass(player, "x2 Money") then
+		baseTotal = baseTotal * 2
+	end
+
+	local coverage = computeCoverage(player)
+	local rate = Balance.IncomeRate and Balance.IncomeRate.TICK_INCOME or 1
+
+	local payPerTick = math.floor(baseTotal * coverage * rate + 0.5)
+
+	-- Cache the per-tick value for clients/diagnostics
+	playerIncomeCache[playerId] = payPerTick
+
+	return payPerTick, coverage, baseTotal
+end
+
+local function payoutPlayerNow(player, now, reason, saveData)
+	if not player or not player.Parent then
+		return 0, 0
+	end
+
+	-- Require a live save to avoid charging/paying ghost players
+	saveData = saveData or PlayerDataService.GetSaveFileData(player)
+	if not saveData then
+		return 0, 0
+	end
+
+	now = now or time()
+	local playerId = player.UserId
+	ensurePlayerTables(playerId)
+
+	local payPerTick, coverage, baseTotal = computePayPerTickForPlayer(player)
+	local lastPaidAt = playerLastPayoutAt[playerId] or now
+	local dt = math.max(0, now - lastPaidAt)
+
+	-- Pro-rate against the configured tick interval so ad-hoc payouts stay fair
+	local payoutAmount = math.floor(payPerTick * (dt / TICK_INTERVAL) + 0.5)
+	playerLastPayoutAt[playerId] = now
+
+	-- Throttled warning for collapsed income/coverage
+	if coverage < 0.15 or payPerTick == 0 then
+		local nowClock = os.clock()
+		local lastWarn = _coverageWarnAt[playerId] or 0
+		if nowClock - lastWarn >= 10 then
+			_coverageWarnAt[playerId] = nowClock
+			local statsByZone = DistrictStatsModule.getStatsForPlayer(playerId)
+			local zoneCount = 0
+			for _ in pairs(statsByZone) do zoneCount += 1 end
+			local totalsReq = ZoneRequirementsChecker.getEffectiveServedTotals(player)
+				or DistrictStatsModule.getTotalsForPlayer(player)
+				or { water = 0, power = 0 }
+			local produced = ZoneRequirementsChecker.getEffectiveProduction(player)
+				or DistrictStatsModule.getUtilityProduction(player)
+				or { water = 0, power = 0 }
+
+			warn(string.format(
+				"[Income] Low coverage/pay for %s (uid=%d): coverage=%.3f pay=%d base=%d zones=%d reqW/P=%.1f/%.1f prodW/P=%.1f/%.1f",
+				player.Name,
+				playerId,
+				coverage,
+				payPerTick,
+				baseTotal,
+				zoneCount,
+				(totalsReq.water or 0),
+				(totalsReq.power or 0),
+				(produced.water or 0),
+				(produced.power or 0)
+			))
+		end
+	end
+
+	if payoutAmount ~= 0 then
+		EconomyService.adjustBalance(player, payoutAmount)
+	end
+	StatsChanged:Fire(player)
+
+	if VERBOSE_LOG and reason then
+		log(("[PAY %s] %s dt=%.2fs payPerTick=%d applied=%d"):format(
+			reason,
+			player.Name,
+			dt,
+			payPerTick,
+			payoutAmount
+		))
+	end
+
+	return payoutAmount, payPerTick
+end
+
+-- =========================
 -- Legacy exact calculation (kept for ops / diagnostics)
 -- =========================
 local function calculateZoneIncome_exact(player, zoneData)
@@ -342,34 +444,12 @@ local function doPayoutChunked()
 				return
 			end
 
-			local SaveData = PlayerDataService.GetSaveFileData(player)
-			if not SaveData then
+			local saveData = PlayerDataService.GetSaveFileData(player)
+			if not saveData then
 				return
 			end
 
-			local playerId = player.UserId
-			ensurePlayerTables(playerId)
-
-			-- 1) Base income from cache (sum of per-tile rounded incomes)
-			local baseTotal = playerBaseIncome[playerId] or 0
-
-			-- 2) Gamepass
-			if PlayerDataInterfaceService.HasGamepass(player, "x2 Money") then
-				baseTotal = baseTotal * 2
-			end
-
-			-- 3) Coverage and global rate scaling
-			local coverage = computeCoverage(player)
-			local rate = Balance.IncomeRate and Balance.IncomeRate.TICK_INCOME or 1
-
-			local pay = math.floor(baseTotal * coverage * rate + 0.5)
-
-			-- cache per-tick
-			playerIncomeCache[playerId] = pay
-
-			-- 4) Apply and 5) notify
-			EconomyService.adjustBalance(player, pay)
-			StatsChanged:Fire(player)
+			payoutPlayerNow(player, time(), "scheduled", saveData)
 		end)
 
 		if not ok then
@@ -419,6 +499,26 @@ local function tryConnectBuildEvents()
 					end
 				end
 			end
+		end)
+	end
+end
+
+local function tryConnectInteractivePayoutEvents()
+	if not RemoteEvents then
+		return
+	end
+
+	local selectZoneEvent = RemoteEvents:FindFirstChild("SelectZoneType")
+	if selectZoneEvent then
+		selectZoneEvent.OnServerEvent:Connect(function(player)
+			payoutPlayerNow(player, time(), "SelectZoneType")
+		end)
+	end
+
+	local gridSelectionEvent = RemoteEvents:FindFirstChild("GridSelection")
+	if gridSelectionEvent then
+		gridSelectionEvent.OnServerEvent:Connect(function(player)
+			payoutPlayerNow(player, time(), "GridSelection")
 		end)
 	end
 end
@@ -563,6 +663,11 @@ function Income.getIncomePerSecond(player)
 	return perSecond
 end
 
+-- Immediate payout helper (pro-rated to avoid double-paying)
+function Income.payoutNow(player, reason)
+	return payoutPlayerNow(player, time(), reason or "manual")
+end
+
 function Income.setBalance(player, amount)
 	EconomyService.setBalance(player, amount)
 	log(("[SET] %s balance to %d"):format(player.Name, amount))
@@ -644,6 +749,7 @@ end
 
 -- Initialize optional event hooks and scheduled loops
 tryConnectBuildEvents()
+tryConnectInteractivePayoutEvents()
 startRebuildFlushLoop()
 startPassiveWorklistRefreshLoop()
 startPayoutLoop()

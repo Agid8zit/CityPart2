@@ -3999,4 +3999,35 @@ return {
 		["_default"] = "You Need to Build Roads",
 		["ru"] = "You Need to Build Roads",
 	},
+
+	["ZoneNeedsRoad"] = {
+		["_default"] = "A zone needs a road connection.",
+	},
+	["ZoneNeedsWater"] = {
+		["_default"] = "A zone needs water service.",
+	},
+	["ZoneNeedsPower"] = {
+		["_default"] = "A zone needs power.",
+	},
+	["ZoneHasRoad"] = {
+		["_default"] = "A zone is now connected to a road.",
+	},
+	["ZoneLostRoad"] = {
+		["_default"] = "A zone lost its road connection.",
+	},
+	["ZoneHasWater"] = {
+		["_default"] = "A zone now has water.",
+	},
+	["ZoneLostWater"] = {
+		["_default"] = "A zone lost water service.",
+	},
+	["ZoneHasPower"] = {
+		["_default"] = "A zone now has power.",
+	},
+	["ZoneLostPower"] = {
+		["_default"] = "A zone lost power.",
+	},
+	["ZonePollutedByIndustry"] = {
+		["_default"] = "A zone is being polluted by a nearby industrial zone.",
+	},
 }

@@ -10,6 +10,7 @@ local GridUtil      = require(Grid:WaitForChild("GridUtil"))  -- used for gridâ†
 local Events        = ReplicatedStorage:WaitForChild("Events")
 local BindableEvents= Events:WaitForChild("BindableEvents")
 local RemoteEvents  = Events:WaitForChild("RemoteEvents")
+local NotifyPlayerEvent = RemoteEvents:FindFirstChild("NotifyPlayer")
 local PlayUISoundRE = RemoteEvents:FindFirstChild("PlayUISound")
 local UxpAlarmRE    = RemoteEvents:FindFirstChild("UxpAlarm")
 if not UxpAlarmRE then
@@ -212,6 +213,35 @@ local function dprintFX (...: any) if DEBUG_UXP_ALARMS then print("[UxpFX]", ...
 local _loadPhase: { [Player]: boolean } = {}
 local _graceUntil: { [Player]: number } = {}
 local _pollutionClock: { [Player]: { [string]: { token: number } } } = {}
+local _pollutionNotice: { [Player]: { [string]: boolean } } = {}
+local POLLUTION_NOTICE_LANG_KEY = "ZonePollutedByIndustry"
+
+local function _markPollutionNotice(player: Player, zoneId: string, state: boolean?): boolean
+	if not (player and zoneId) then return false end
+	if state then
+		_pollutionNotice[player] = _pollutionNotice[player] or {}
+		if _pollutionNotice[player][zoneId] then return false end
+		_pollutionNotice[player][zoneId] = true
+		return true
+	end
+
+	local bucket = _pollutionNotice[player]; if not bucket then return false end
+	bucket[zoneId] = nil
+	if not next(bucket) then _pollutionNotice[player] = nil end
+	return true
+end
+
+local function _notifyPollution(player: Player, zoneId: string)
+	if not NotifyPlayerEvent then return end
+	-- Only notify once per polluted period for this zone
+	local fresh = _markPollutionNotice(player, zoneId, true)
+	if not fresh then return end
+	NotifyPlayerEvent:FireClient(player, {
+		LangKey   = POLLUTION_NOTICE_LANG_KEY,
+		Text      = "A zone is being polluted by a nearby industrial zone.",
+		ForceText = true,
+	})
+end
 local _incomePollutionTiles: { [Player]: { [string]: { [string]: number } } } = {}
 local _pollTickCursor: { [Player]: { [string]: number } } = {}
 
@@ -2092,6 +2122,7 @@ local function _startPollutionClock(player: Player, zoneId: string)
 	-- If already ticking, don't spawn a second loop.
 	if _pollutionClock[player][zoneId] then return end
 
+	_notifyPollution(player, zoneId)
 	_pollutionClock[player][zoneId] = { token = 1 }
 	local myToken = 1
 
@@ -2164,6 +2195,7 @@ local function _stopPollutionClock(player: Player, zoneId: string)
 	slot.token += 1 -- invalidate loop
 	m[zoneId] = nil
 	if not next(m) then _pollutionClock[player] = nil end
+	_markPollutionNotice(player, zoneId, false)
 end
 
 -- Optional: after load, seed clocks for any zones that already have negative synergy.
@@ -3225,4 +3257,3 @@ function CityInteractions.bulkWealthRebuild(player: Player, zoneId: string)
 end
 
 return CityInteractions
-

@@ -58,35 +58,54 @@ end
 
 local ManualSaveBE: BindableEvent           = ensureBE("ManualSave")
 local ReloadFromCurrentBE: BindableEvent    = ensureBE("RequestReloadFromCurrent")
-local ForceDisableOnboardingBE: BindableEvent = ensureBE("ForceDisableOnboarding")
+
+-- Synchronous save (used for slot switching to avoid races with async BindableEvent handlers)
+local function ensureBF(name: string): BindableFunction
+	local bf = BindableEvents:FindFirstChild(name)
+	if bf and bf:IsA("BindableFunction") then return bf end
+	local nb = Instance.new("BindableFunction")
+	nb.Name = name
+	nb.Parent = BindableEvents
+	return nb
+end
+local ManualSaveSyncBF: BindableFunction = ensureBF("ManualSaveSync")
+
+local function manualSaveSync(player: Player, reason: string, timeoutSec: number?): boolean
+	if not (player and player.Parent) then return false end
+	local deadline = os.clock() + (timeoutSec or 30)
+	while os.clock() < deadline do
+		local ok, res = pcall(function()
+			return ManualSaveSyncBF:Invoke(player, reason)
+		end)
+		if ok then
+			return res == true
+		end
+		task.wait(0.05)
+	end
+	return false
+end
 
 -- Deps
 local PlayerDataService: any = require(ServerScriptService.Services.PlayerDataService)
+local PlayerDataInterfaceService: any = require(ServerScriptService.Services.PlayerDataInterfaceService)
 local OnboardingService: any = require(ServerScriptService.Players.OnboardingService)
 local DefaultData: any       = PlayerDataService.GetDefaultData()
-
-local VERBOSE_LOG = false
-local function log(...)
-	if VERBOSE_LOG then print(...) end
-end
 
 -- Types
 type SaveLite = { id: string, cityName: string?, lastPlayed: number?, hasData: boolean? }
 type GetSaveSlotsResult = { current: string, slots: {SaveLite} }
 
 local function recordDeletionDuringOnboarding(player: Player)
-	if OnboardingService then
-		local okRecord, err = pcall(function()
-			OnboardingService.RecordDeletionDuringOnboarding(player.UserId, player)
-		end)
-		if not okRecord then
-			warn("[SaveEndpoints] RecordDeletionDuringOnboarding failed: ", err)
-		end
-	else
-		warn("[SaveEndpoints] OnboardingService missing; forcing disable only")
+	if not OnboardingService then
+		return
 	end
 
-	ForceDisableOnboardingBE:Fire(player)
+	local okRecord, err = pcall(function()
+		OnboardingService.RecordDeletionDuringOnboarding(player.UserId, player)
+	end)
+	if not okRecord then
+		warn("[SaveEndpoints] RecordDeletionDuringOnboarding failed: ", err)
+	end
 end
 
 -- Simple per-player mutex
@@ -102,9 +121,7 @@ end
 
 -- Event: manual save (unchanged trigger; SaveManager now flushes)
 RequestSaveNow.OnServerEvent:Connect(function(player: Player)
-	ManualSaveBE:Fire(player)
-	-- >>> CHANGED: in case a caller wants to block here, they still can:
-	PlayerDataService.WaitForSavesToDrain(player, 15)
+	manualSaveSync(player, "RequestSaveNow", 30)
 end)
 
 -- RF: list slots
@@ -139,6 +156,12 @@ SwitchToSlotRF.OnServerInvoke = function(player: Player, slotId: any, createIfMi
 		warn("[SaveEndpoints] SwitchToSlot: busy for ", player.Name)
 		return false
 	end
+	-- Prevent overlapping with an active reload (no-commit window) to avoid mixed slot state
+	if typeof(PlayerDataService.IsInNoCommitWindow) == "function" and PlayerDataService.IsInNoCommitWindow(player) then
+		warn("[SaveEndpoints] SwitchToSlot: reload in progress for ", player.Name)
+		finish(player)
+		return false
+	end
 
 	local ok, success = pcall(function(): boolean
 		local target = tostring(slotId or "")
@@ -147,12 +170,14 @@ SwitchToSlotRF.OnServerInvoke = function(player: Player, slotId: any, createIfMi
 			return false
 		end
 
-		log(("[SaveEndpoints] SwitchToSlot slot=%s createIfMissing=%s by %s")
+		print(("[SaveEndpoints] SwitchToSlot slot=%s createIfMissing=%s by %s")
 			:format(target, tostring(createIfMissing), player.Name))
 
 		-- 1) Save current city first (flush + wait)
-		ManualSaveBE:Fire(player)
-		PlayerDataService.WaitForSavesToDrain(player, 20)
+		if not manualSaveSync(player, "SwitchToSlot:pre", 30) then
+			warn("[SaveEndpoints] SwitchToSlot: pre-save failed for ", player.Name)
+			return false
+		end
 
 		-- 2) Ensure target exists (if requested)
 		local pd = PlayerDataService.GetData(player)
@@ -171,13 +196,21 @@ SwitchToSlotRF.OnServerInvoke = function(player: Player, slotId: any, createIfMi
 			return false
 		end
 
+		-- Stamp metadata on the destination slot so lists sort correctly post-switch.
+		pcall(function()
+			PlayerDataService.ModifyData(player, ("savefiles/%s/lastPlayed"):format(target), os.time())
+		end)
+
 		-- 3) Switch
 		PlayerDataService.ModifyData(player, "currentSaveFile", target)
+		local pdNow = PlayerDataService.GetData(player)
+		if pdNow then
+			PlayerDataService.ModifyData(player, nil, pdNow)
+		end
+		PlayerDataInterfaceService.ResendCurrentSaveSignals(player)
 
 		-- 4) Ask SaveManager to RELOAD from the *new* current slot
-		task.defer(function()
-			ReloadFromCurrentBE:Fire(player)
-		end)
+		ReloadFromCurrentBE:Fire(player)
 
 		return true
 	end)
@@ -195,6 +228,12 @@ end
 DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 	if not begin(player) then
 		warn("[SaveEndpoints] DeleteSaveFile: busy for ", player.Name)
+		return false
+	end
+	-- Avoid mutating savefiles while a reload window is active
+	if typeof(PlayerDataService.IsInNoCommitWindow) == "function" and PlayerDataService.IsInNoCommitWindow(player) then
+		warn("[SaveEndpoints] DeleteSaveFile: reload in progress for ", player.Name)
+		finish(player)
 		return false
 	end
 
@@ -224,6 +263,11 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 			recordDeletionDuringOnboarding(player)
 			local fresh = (DefaultData :: any).newSaveFile()
 			PlayerDataService.ModifyData(player, "savefiles/"..target, fresh)
+			local pdNow = PlayerDataService.GetData(player)
+			if pdNow then
+				PlayerDataService.ModifyData(player, nil, pdNow)
+			end
+			PlayerDataInterfaceService.ResendCurrentSaveSignals(player)
 			task.defer(function()
 				ReloadFromCurrentBE:Fire(player)
 			end)
@@ -231,7 +275,7 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 			return true
 		end
 
-		log(("[SaveEndpoints] DeleteSaveFile slot=%s by %s"):format(target, player.Name))
+		print(("[SaveEndpoints] DeleteSaveFile slot=%s by %s"):format(target, player.Name))
 
 		local deletingCurrent = (pd.currentSaveFile == target)
 
@@ -254,6 +298,11 @@ DeleteSaveFileRF.OnServerInvoke = function(player: Player, slotId: any): boolean
 			local newCur = minN and tostring(minN) or nil
 			if newCur then
 				PlayerDataService.ModifyData(player, "currentSaveFile", newCur)
+				local pdNow = PlayerDataService.GetData(player)
+				if pdNow then
+					PlayerDataService.ModifyData(player, nil, pdNow)
+				end
+				PlayerDataInterfaceService.ResendCurrentSaveSignals(player)
 				task.defer(function()
 					ReloadFromCurrentBE:Fire(player)
 				end)
