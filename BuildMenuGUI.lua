@@ -42,7 +42,7 @@ local Catalog = require(script.Parent:WaitForChild("BuildMenuCatalog"))
 local UnlockState = Catalog.UnlockState or { requirement = {}, order = {}, types = {}, prev = {} }
 local FeatureModels, RangeVisualTemplate, FLAGS, ITEMNAME_TO_SECTION = Catalog.getCatalog()
 
--- Constant
+-- Constant4
 local BUTTON_SCROLL_SPEED = 300
 
 -- Defines
