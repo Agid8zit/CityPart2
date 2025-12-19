@@ -13,8 +13,8 @@ local WORDS_PER_MINUTE = 230
 local MIN_HOLD_SECONDS = 2.5          -- floor so short lines don't vanish
 local FADE_IN_SECONDS  = 0.25
 local FADE_OUT_SECONDS = 0.35
-local MAX_ACTIVE_BUBBLES = 1          -- concurrent bubbles allowed (<=0 disables limit)
-local GLOBAL_BUBBLE_COOLDOWN = 3.0    -- seconds between bubbles once the prior one fades
+local MAX_ACTIVE_BUBBLES = 1          -- concurrent bubbles allowed per plot (<=0 disables limit)
+local GLOBAL_BUBBLE_COOLDOWN = 3.0    -- seconds between bubbles once the prior one fades (per plot)
 
 ---------------------------------------------------------------------
 -- Template lookup (error fast if missing)
@@ -166,6 +166,28 @@ local function findCivByNameAllPlots(name: string): Model?
 	return nil
 end
 
+-- Find the owning plot for a civ model so we can enforce per-plot limits.
+local function findOwningPlot(model: Instance): Instance?
+	local pp = Workspace:FindFirstChild("PlayerPlots")
+	if not (pp and model) then return nil end
+
+	-- Walk ancestors until we find a direct child of PlayerPlots.
+	local cur = model
+	while cur and cur ~= pp do
+		if cur.Parent == pp then
+			return cur
+		end
+		cur = cur.Parent
+	end
+
+	-- Fallback: infer from OwnerUserId attribute.
+	local ownerId = model:GetAttribute("OwnerUserId") or model:GetAttribute("ownerId")
+	if ownerId ~= nil then
+		return pp:FindFirstChild("Plot_" .. tostring(ownerId))
+	end
+	return nil
+end
+
 ---------------------------------------------------------------------
 -- Core: ensure a civ has a following TextDialog cloned from template
 ---------------------------------------------------------------------
@@ -215,6 +237,10 @@ local function ensureTextDialogOn(model: Model)
 			bb.Enabled = true
 		end
 	end
+
+	-- Start hidden until a line is actually shown (prevents default template text from leaking).
+	setGuiAlpha(collectGuiObjectsForFade(clone), 1.0)
+
 	RequestRandomBubbleLine:Fire(model)
 end
 
@@ -224,8 +250,46 @@ end
 -- Per-model sequence number so a newer line cancels older animations.
 local ActiveSeq = setmetatable({}, { __mode = "k" }) -- weak keys so models can GC
 local bubbleTokens = setmetatable({}, { __mode = "k" })
-local activeBubbleCount = 0
-local lastBubbleReleasedAt = 0
+local bubbleSlots = setmetatable({}, { __mode = "k" }) -- model -> { kind="plot"|"owner"|"global", key }
+local modelPlots = setmetatable({}, { __mode = "k" }) -- cache owning plot per model
+local modelOwners = setmetatable({}, { __mode = "k" })
+local activeBubbleCountByPlot = setmetatable({}, { __mode = "k" })
+local lastBubbleReleasedAtByPlot = setmetatable({}, { __mode = "k" })
+local activeBubbleCountByOwner = {}
+local lastBubbleReleasedAtByOwner = {}
+local globalActiveBubbleCount = 0
+local globalLastBubbleReleasedAt = 0
+
+local function getOwnerId(model)
+	if not model then return nil end
+	local cached = modelOwners[model]
+	if cached then return cached end
+	local ownerId = model:GetAttribute("OwnerUserId") or model:GetAttribute("ownerId")
+	if ownerId ~= nil then
+		local str = tostring(ownerId)
+		modelOwners[model] = str
+		return str
+	end
+	return nil
+end
+
+-- Resolve the bucket to rate-limit against. Prefer plot instance; fall back to owner id so client-owned civs still share a slot.
+local function resolveBubbleKey(model)
+	local plot = modelPlots[model]
+	if plot and plot.Parent then
+		return plot, "plot"
+	end
+	plot = findOwningPlot(model)
+	if plot then
+		modelPlots[model] = plot
+		return plot, "plot"
+	end
+	local ownerId = getOwnerId(model)
+	if ownerId then
+		return ownerId, "owner"
+	end
+	return nil, "global"
+end
 
 local function tryAcquireBubbleSlot(model)
 	if not model then return nil end
@@ -234,19 +298,51 @@ local function tryAcquireBubbleSlot(model)
 		bubbleTokens[model] = token
 		return token
 	end
+
+	local key, keyKind = resolveBubbleKey(model)
+
 	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 then
-		if activeBubbleCount >= MAX_ACTIVE_BUBBLES then
-			return nil
-		end
-		if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and activeBubbleCount == 0 then
-			local since = os.clock() - lastBubbleReleasedAt
-			if since < GLOBAL_BUBBLE_COOLDOWN then
+		if keyKind == "plot" and key then
+			local active = activeBubbleCountByPlot[key] or 0
+			if active >= MAX_ACTIVE_BUBBLES then
 				return nil
 			end
+			if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and active == 0 then
+				local since = os.clock() - (lastBubbleReleasedAtByPlot[key] or 0)
+				if since < GLOBAL_BUBBLE_COOLDOWN then
+					return nil
+				end
+			end
+			activeBubbleCountByPlot[key] = active + 1
+		elseif keyKind == "owner" and key then
+			local active = activeBubbleCountByOwner[key] or 0
+			if active >= MAX_ACTIVE_BUBBLES then
+				return nil
+			end
+			if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and active == 0 then
+				local since = os.clock() - (lastBubbleReleasedAtByOwner[key] or 0)
+				if since < GLOBAL_BUBBLE_COOLDOWN then
+					return nil
+				end
+			end
+			activeBubbleCountByOwner[key] = active + 1
+		else
+			if globalActiveBubbleCount >= MAX_ACTIVE_BUBBLES then
+				return nil
+			end
+			if GLOBAL_BUBBLE_COOLDOWN and GLOBAL_BUBBLE_COOLDOWN > 0 and globalActiveBubbleCount == 0 then
+				local since = os.clock() - globalLastBubbleReleasedAt
+				if since < GLOBAL_BUBBLE_COOLDOWN then
+					return nil
+				end
+			end
+			globalActiveBubbleCount += 1
+			keyKind = "global"
 		end
-		activeBubbleCount += 1
 	end
+
 	bubbleTokens[model] = token
+	bubbleSlots[model] = { kind = keyKind, key = key }
 	return token
 end
 
@@ -254,9 +350,44 @@ local function releaseBubbleSlot(model, token)
 	if not model then return end
 	if bubbleTokens[model] ~= token then return end
 	bubbleTokens[model] = nil
-	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 and activeBubbleCount > 0 then
-		activeBubbleCount -= 1
-		lastBubbleReleasedAt = os.clock()
+
+	local slot = bubbleSlots[model]
+	bubbleSlots[model] = nil
+	local keyKind = slot and slot.kind or nil
+	local key = slot and slot.key or nil
+	if not keyKind then
+		key, keyKind = resolveBubbleKey(model)
+	end
+
+	if MAX_ACTIVE_BUBBLES and MAX_ACTIVE_BUBBLES > 0 then
+		if keyKind == "plot" and key then
+			local active = activeBubbleCountByPlot[key] or 0
+			if active > 0 then
+				active -= 1
+				if active == 0 then
+					activeBubbleCountByPlot[key] = nil
+					lastBubbleReleasedAtByPlot[key] = os.clock()
+				else
+					activeBubbleCountByPlot[key] = active
+				end
+			end
+		elseif keyKind == "owner" and key then
+			local active = activeBubbleCountByOwner[key] or 0
+			if active > 0 then
+				active -= 1
+				if active == 0 then
+					activeBubbleCountByOwner[key] = nil
+					lastBubbleReleasedAtByOwner[key] = os.clock()
+				else
+					activeBubbleCountByOwner[key] = active
+				end
+			end
+		else
+			if globalActiveBubbleCount > 0 then
+				globalActiveBubbleCount -= 1
+				globalLastBubbleReleasedAt = os.clock()
+			end
+		end
 	end
 end
 
@@ -273,17 +404,22 @@ local function compute_hold_seconds(text: string): number
 	return seconds
 end
 
-local function show_then_fade(model: Model, root: Instance, text: string)
-	-- bump sequence
+local function show_then_fade(model: Model, root: Instance, text: string, guiList: {GuiObject}?, preacquiredSlot: any?)
+	-- Collect gui objects for fading (or reuse caller-provided list)
+	guiList = guiList or collectGuiObjectsForFade(root)
+
+	-- Pre-acquire if caller already got a slot (so we don't double count).
+	local slotToken = preacquiredSlot or tryAcquireBubbleSlot(model)
+	if not slotToken then
+		-- Explicitly hide suppressed bubbles so they never render when a plot is at capacity.
+		setGuiAlpha(guiList, 1.0)
+		return false
+	end
+
+	-- bump sequence only once we know we're actually showing a bubble
 	local seq = (ActiveSeq[model] or 0) + 1
 	ActiveSeq[model] = seq
 
-	-- Collect gui objects for fading
-	local guiList = collectGuiObjectsForFade(root)
-	local slotToken = tryAcquireBubbleSlot(model)
-	if not slotToken then
-		return
-	end
 	-- Start hidden
 	setGuiAlpha(guiList, 1.0)
 
@@ -298,6 +434,8 @@ local function show_then_fade(model: Model, root: Instance, text: string)
 		task.wait(FADE_IN_SECONDS + holdSeconds)
 		-- If a newer line arrived, abort
 		if ActiveSeq[model] ~= seq then
+			-- Make sure the old line is not left visible when superseded.
+			setGuiAlpha(guiList, 1.0)
 			releaseBubbleSlot(model, slotToken)
 			return
 		end
@@ -306,6 +444,8 @@ local function show_then_fade(model: Model, root: Instance, text: string)
 		task.wait(FADE_OUT_SECONDS)
 		releaseBubbleSlot(model, slotToken)
 	end)
+
+	return true
 end
 
 ---------------------------------------------------------------------
@@ -328,6 +468,14 @@ local function setDialogText(target: Instance | string, newText: string)
 	local root = model:FindFirstChild("TextDialog")
 	if not root then return end
 
+	-- Respect per-plot limit up front; hide if the slot is unavailable.
+	local guiList = collectGuiObjectsForFade(root)
+	local slotToken = tryAcquireBubbleSlot(model)
+	if not slotToken then
+		setGuiAlpha(guiList, 1.0)
+		return
+	end
+
 	-- Set the text
 	local label = getTextLabel(root)
 	if label then
@@ -335,7 +483,8 @@ local function setDialogText(target: Instance | string, newText: string)
 	end
 
 	-- Animate bubble: fade-in, hold (based on 230 WPM), fade-out
-	show_then_fade(model, root, newText)
+	-- Pass the slot + gui list we already resolved so we don't double-count the rate limiter.
+	show_then_fade(model, root, newText, guiList, slotToken)
 end
 
 UpdateTextDialog.Event:Connect(setDialogText)

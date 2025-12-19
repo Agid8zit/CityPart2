@@ -54,11 +54,145 @@ local GridUtil    = require(GridScripts:WaitForChild("GridUtil"))
 local GridConfig  = require(GridScripts:WaitForChild("GridConfig"))
 local Balance     = require(ReplicatedStorage:WaitForChild("Balancing"):WaitForChild("BalanceEconomy"))
 
-local Progression do
-	local ok, mod = pcall(function()
-		return require(ServerScriptService:FindFirstChild("Progression") or error("Progression not found"))
-	end)
-	Progression = ok and mod or nil
+-- Progression module (robust loader). If we cannot resolve it, we will fall back to
+-- Balance.ProgressionConfig + PlayerDataService cityLevel instead of silently
+-- treating every category as unlocked.
+local Progression, triedProgressionLoad = nil, false
+
+local function tryRequireModule(inst: Instance?)
+	if not inst then return nil end
+	local ok, mod = pcall(require, inst)
+	if ok then
+		return mod
+	end
+	return nil
+end
+
+local function ensureProgression()
+	if Progression or triedProgressionLoad then
+		return Progression
+	end
+	triedProgressionLoad = true
+
+	local candidates = {}
+
+	local direct = ServerScriptService:FindFirstChild("Progression")
+	if direct then table.insert(candidates, direct) end
+
+	local build = ServerScriptService:FindFirstChild("Build")
+	if build then
+		local districts = build:FindFirstChild("Districts")
+		local stats     = districts and districts:FindFirstChild("Stats")
+		local prog      = stats and stats:FindFirstChild("Progression")
+		if prog then table.insert(candidates, prog) end
+	end
+
+	local rsProg = ReplicatedStorage:FindFirstChild("Progression")
+	if rsProg then table.insert(candidates, rsProg) end
+
+	for _, inst in ipairs(candidates) do
+		local mod = tryRequireModule(inst)
+		if mod then
+			Progression = mod
+			return Progression
+		end
+	end
+
+	return nil
+end
+
+-- PlayerDataService (optional) for fallback level checks
+local PlayerDataServiceModule, triedPDSLoad = nil, false
+local function ensurePlayerDataService()
+	if PlayerDataServiceModule or triedPDSLoad then
+		return PlayerDataServiceModule
+	end
+	triedPDSLoad = true
+
+	local candidates = {
+		ServerScriptService:FindFirstChild("PlayerDataService"),
+		ReplicatedStorage:FindFirstChild("PlayerDataService"),
+	}
+	for _, inst in ipairs(candidates) do
+		local mod = tryRequireModule(inst)
+		if mod and type(mod.GetSaveFileData) == "function" then
+			PlayerDataServiceModule = mod
+			return PlayerDataServiceModule
+		end
+	end
+	return nil
+end
+
+local function getCityLevel(player: Player): number
+	local pds = ensurePlayerDataService()
+	if pds and type(pds.GetSaveFileData) == "function" then
+		local ok, data = pcall(pds.GetSaveFileData, player)
+		if ok and data and data.cityLevel ~= nil then
+			local lvl = tonumber(data.cityLevel)
+			if lvl then
+				return math.max(0, math.floor(lvl))
+			end
+		end
+	end
+	return 0
+end
+
+local function normalizeFeatureName(featureName: string?): string?
+	if type(featureName) == "string" and string.sub(featureName, 1, 5) == "Flag:" then
+		return "Flags"
+	end
+	return featureName
+end
+
+-- Precompute a fallback min-level map from Balance.ProgressionConfig.unlocksByLevel.
+local FALLBACK_MIN_LEVEL: { [string]: number } = {}
+do
+	local cfg = Balance and Balance.ProgressionConfig
+	local byLevel = cfg and cfg.unlocksByLevel
+	if type(byLevel) == "table" then
+		for lvl, list in pairs(byLevel) do
+			if type(list) == "table" then
+				for _, feat in ipairs(list) do
+					local name = normalizeFeatureName(feat)
+					if name then
+						local cur = FALLBACK_MIN_LEVEL[name]
+						local lvln = tonumber(lvl) or 0
+						if cur == nil or lvln < cur then
+							FALLBACK_MIN_LEVEL[name] = lvln
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function fallbackPlayerHasUnlock(player: Player, featureName: string): boolean
+	local lvl = getCityLevel(player)
+	local required = FALLBACK_MIN_LEVEL[normalizeFeatureName(featureName) or ""] or 0
+	return lvl >= required
+end
+
+local function progressionPlayerHasUnlock(player: Player, featureName: string): boolean
+	local P = ensureProgression()
+	if P and type((P :: any).playerHasUnlock) == "function" then
+		local ok, unlocked = pcall((P :: any).playerHasUnlock, player, featureName)
+		if ok then
+			return unlocked == true
+		end
+	end
+	return fallbackPlayerHasUnlock(player, featureName)
+end
+
+local function progressionRequiredLevel(featureName: string): number
+	local P = ensureProgression()
+	if P and type((P :: any).getRequiredLevel) == "function" then
+		local ok, lvl = pcall((P :: any).getRequiredLevel, featureName)
+		if ok and type(lvl) == "number" then
+			return lvl
+		end
+	end
+	return FALLBACK_MIN_LEVEL[normalizeFeatureName(featureName) or ""] or 0
 end
 
 -- NEW: try to load DevProducts so we can identify devproduct features by name
@@ -358,9 +492,9 @@ local function bestUnlockedProgressionFeature(player: Player, categoryName: stri
 	local bestFeat, bestScore = nil, -math.huge
 	for featureName, _ in pairs(bag) do
 		if not isDevProductFeature(featureName) then
-			local unlocked = (Progression and (Progression :: any).playerHasUnlock and (Progression :: any).playerHasUnlock(player, featureName)) or false
+			local unlocked = progressionPlayerHasUnlock(player, featureName)
 			if unlocked then
-				local score = ((UXP_TIER :: any)[featureName] or ((Progression and (Progression :: any).getRequiredLevel and (Progression :: any).getRequiredLevel(featureName)) or 0))
+				local score = ((UXP_TIER :: any)[featureName] or progressionRequiredLevel(featureName))
 				if score > bestScore then
 					bestScore = score
 					bestFeat  = featureName
@@ -384,7 +518,7 @@ local function topProgressionFeature(categoryName: string): string?
 		for featureName in pairs(bag) do
 			if not isDevProductFeature(featureName) then
 				local tier = (UXP_TIER :: any)[featureName]
-				local score = (type(tier) == "number" and tier) or (Progression and Progression.getRequiredLevel and Progression.getRequiredLevel(featureName)) or 0
+				local score = (type(tier) == "number" and tier) or progressionRequiredLevel(featureName)
 				if score > bestScore then
 					bestScore = score
 					bestName = featureName
@@ -535,9 +669,6 @@ end
 -- CORRECT CATEGORY UNLOCK CHECK (UPDATED)
 ----------------------------------------------------------------
 local function isCategoryUnlocked(player: Player, categoryName: string): boolean
-	-- No progression module? Keep legacy permissive behavior.
-	if not Progression then return true end
-
 	local bag = CATEGORY[categoryName]
 	if type(bag) ~= "table" then
 		return false

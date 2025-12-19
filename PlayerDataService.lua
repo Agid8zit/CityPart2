@@ -6,6 +6,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
 -- Dependencies
 local DefaultData = require(script.DefaultData)
@@ -26,11 +27,36 @@ local DEBUG_IGNORE_SESSION_LOCKING = false
 local DEBUG_IGNORE_PLAYERDATA_SAVE = false
 local DEBUG_IGNORE_PLAYERDATA_LOAD = false
 
-local DEFAULT_PLAYER_DS = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release1"
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
+local DEFAULT_PLAYER_DS = RunService:IsStudio() and "PlayerData_PublicTest2" or "PlayerData_Release2"
 local PLAYERDATA_DATASTORE = SavePolicy.PLAYER_DS_BY_ENV[SavePolicy.ENV] or DEFAULT_PLAYER_DS
 local SLOT_ID = "player"
 local PER_USER_PRUNE_INTERVAL = 90
 local PER_USER_PRUNE_BATCH = 2
+local SESSION_LOCK_TTL = 30 -- seconds; aligns with server shutdown window
+local function _findExistingPlotForPlayer(player: Player)
+	if not player then
+		return nil
+	end
+	local plotName = ("plot_%s"):format(player.UserId)
+	-- try common containers first to avoid deep scans
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if plotsFolder then
+		local hit = plotsFolder:FindFirstChild(plotName) or plotsFolder:FindFirstChild(player.Name) or plotsFolder:FindFirstChild(tostring(player.UserId))
+		if hit then
+			return hit
+		end
+	end
+	-- fallback: shallow search at root, then recursive
+	return Workspace:FindFirstChild(plotName) or Workspace:FindFirstChild(player.Name) or Workspace:FindFirstChild(tostring(player.UserId)) or Workspace:FindFirstChild(plotName, true)
+end
+
+-- Fail-safe: world reload staging should be brief; auto-heal if it ever gets stuck.
+local NO_COMMIT_TIMEOUT_SEC = 60
 
 -- Defines
 PlayerDataService.AllPlayerData = {} -- [Player] = PlayerData
@@ -56,10 +82,72 @@ local _lastEnvelopeMeta = {} -- [Player] = { hash, updatedAt, approxBytes }
 local _highChurnTouches = {} -- [Player] = os.time()
 local _sessionStart = {} -- [Player] = os.clock()
 local _pruneQueue = {} -- [userId] = true
+local function _isCityStoragePath(path: string?)
+	return type(path) == "string" and string.find(path, "cityStorage", 1, true) ~= nil
+end
+
+-- Trim large cityStorage blobs before sending to clients to avoid RECV spikes.
+local function _copyForClient(pd: any)
+	if type(pd) ~= "table" then
+		return pd
+	end
+
+	local copy = {}
+	for k, v in pairs(pd) do
+		if k == "savefiles" and type(v) == "table" then
+			local slots = {}
+			for slotId, slot in pairs(v) do
+				if type(slot) == "table" then
+					local slotCopy = {}
+					for sk, sv in pairs(slot) do
+						if sk ~= "cityStorage" then
+							slotCopy[sk] = sv
+						end
+					end
+					slots[slotId] = slotCopy
+				else
+					slots[slotId] = slot
+				end
+			end
+			copy.savefiles = slots
+		else
+			copy[k] = v
+		end
+	end
+
+	return copy
+end
 
 -- Networking
 local RE_UpdatePlayerData = ReplicatedStorage.Events.RemoteEvents.UpdatePlayerData
 local RF_RequestReload = ReplicatedStorage.Events.RemoteEvents.RequestReload
+
+-- Throttle UpdatePlayerData bursts (per-player coalescing)
+local UPDATE_DEBOUNCE_SEC = 0.1
+local _pendingPdUpdates = {}      -- [Player] = { [path] = value }
+local _pendingPdFlush = {}        -- [Player] = true when flush scheduled
+
+local function _queueUpdatePlayerData(Player: Player, Path: string, NewValue: any)
+	local q = _pendingPdUpdates[Player]
+	if not q then
+		q = {}
+		_pendingPdUpdates[Player] = q
+	end
+	q[Path] = NewValue
+
+	if _pendingPdFlush[Player] then return end
+	_pendingPdFlush[Player] = true
+
+	task.delay(UPDATE_DEBOUNCE_SEC, function()
+		_pendingPdFlush[Player] = nil
+		local queued = _pendingPdUpdates[Player]
+		_pendingPdUpdates[Player] = nil
+		if not queued then return end
+		for path, value in pairs(queued) do
+			RE_UpdatePlayerData:FireClient(Player, value, path)
+		end
+	end)
+end
 
 -- >>> CHANGED: No‑commit window (staging + rollback) ------------------------
 -- We treat WorldReloadBegin..WorldReloadEnd as a "no-commit" window:
@@ -69,6 +157,7 @@ local RF_RequestReload = ReplicatedStorage.Events.RemoteEvents.RequestReload
 local _noCommitWindow = {}                 -- [Player] = true
 local _stagedPatches = {}                  -- [Player] = { [path] = value }
 local _lastGoodSlotSnapshot = {}           -- [Player] = deep clone of current savefile (slot table)
+local _noCommitEnteredAt = {}              -- [Player] = os.clock() timestamp
 
 local function _getSaveData(Player: Player)
 	local pd = PlayerDataService.AllPlayerData[Player]
@@ -120,6 +209,55 @@ local function _sessionDurationFor(userId: number)
 	return 0
 end
 
+-- Budget helpers need to be defined before any DataStore calls use them.
+local function _waitForBudget(requestType: Enum.DataStoreRequestType, minBudget: number?, timeoutSec: number?)
+	minBudget = math.max(1, tonumber(minBudget) or 1)
+	local deadline = os.clock() + (timeoutSec or 8)
+	repeat
+		local ok, budget = pcall(DataStoreService.GetRequestBudgetForRequestType, DataStoreService, requestType)
+		if ok and budget >= minBudget then
+			return true
+		end
+		task.wait(0.2)
+	until os.clock() >= deadline
+	return false
+end
+
+local function _dsCallWithBudget(requestType: Enum.DataStoreRequestType, label: string, fn: () -> any)
+	if not _waitForBudget(requestType, 1, 8) then
+		warn(("[PlayerDataService] Budget low for %s; letting Roblox queue the request"):format(label))
+	end
+	local ok, result = pcall(fn)
+	if not ok then
+		warn(("[PlayerDataService] %s failed: %s"):format(label, tostring(result)))
+		return nil, false, result
+	end
+	return result, true
+end
+
+local DEFAULT_DS_RETRIES = 3
+local function _dsCallWithRetry(requestType: Enum.DataStoreRequestType, label: string, fn: () -> any, maxAttempts: number?)
+	local attempts = math.clamp(math.floor(maxAttempts or DEFAULT_DS_RETRIES), 1, 5)
+	local delaySec = 0.5
+	local lastErr = nil
+
+	for attempt = 1, attempts do
+		local result, ok, err = _dsCallWithBudget(requestType, label, fn)
+		if ok ~= false then
+			return result, ok, err
+		end
+
+		lastErr = err
+		if attempt < attempts then
+			local jitter = math.random() * 0.25
+			task.wait(delaySec + jitter)
+			delaySec = math.min(delaySec * 2, 4)
+		end
+	end
+
+	return nil, false, lastErr
+end
+
 local function _hasPendingOrphans(idx)
 	if not idx or not idx.slots then
 		return false
@@ -166,14 +304,18 @@ local function _pruneBackupsForUserId(userId)
 		if pending and #pending > 0 then
 			local survivors = {}
 			for _, key in ipairs(pending) do
-				local ok, err = pcall(function()
-					store:RemoveAsync(key)
-				end)
-				if ok then
+				local _, removed = _dsCallWithRetry(
+					Enum.DataStoreRequestType.SetIncrementAsync,
+					("PruneBackup:%s"):format(key),
+					function()
+						return store:RemoveAsync(key)
+					end
+				)
+				if removed then
 					mutated = true
-					print(("[RETENTION][USER] Deleted orphaned backup for %s slot=%s key=%s"):format(userId, tostring(slotId), key))
+					log(("[RETENTION][USER] Deleted orphaned backup for %s slot=%s key=%s"):format(userId, tostring(slotId), key))
 				else
-					warn("[RETENTION][ERROR] per-user delete failed", userId, key, err)
+					warn("[RETENTION][ERROR] per-user delete failed", userId, key)
 					table.insert(survivors, key)
 				end
 				task.wait(SavePolicy.YIELD_BETWEEN_DELETES)
@@ -233,6 +375,7 @@ local function _enterNoCommitWindow(Player: Player)
 	_noCommitWindow[Player] = true
 	_stagedPatches[Player] = {}
 	_lastGoodSlotSnapshot[Player] = _deepClone(sf)
+	_noCommitEnteredAt[Player] = os.clock()
 end
 
 local function _commitNoCommitWindow(Player: Player)
@@ -257,11 +400,12 @@ local function _commitNoCommitWindow(Player: Player)
 	_lastGoodSlotSnapshot[Player] = _deepClone(sfNow)
 
 	-- Sync to the client (single full snapshot is simplest & robust)
-	RE_UpdatePlayerData:FireClient(Player, pd, nil)
+	RE_UpdatePlayerData:FireClient(Player, _copyForClient(pd), nil)
 
 	-- Clear window
 	_stagedPatches[Player] = nil
 	_noCommitWindow[Player] = nil
+	_noCommitEnteredAt[Player] = nil
 end
 
 local function _rollbackNoCommitWindow(Player: Player)
@@ -273,6 +417,23 @@ local function _rollbackNoCommitWindow(Player: Player)
 	end
 	_stagedPatches[Player] = nil
 	_noCommitWindow[Player] = nil
+	_noCommitEnteredAt[Player] = nil
+end
+
+-- Guard: if WorldReloadEnd never fires, do not leave the player read-only forever.
+local function _maybeAutoCommitNoCommitWindow(Player: Player)
+	if not _noCommitWindow[Player] then return false end
+	local enteredAt = _noCommitEnteredAt[Player]
+	if not enteredAt then
+		_noCommitEnteredAt[Player] = os.clock()
+		return false
+	end
+	if (os.clock() - enteredAt) >= NO_COMMIT_TIMEOUT_SEC then
+		warn(("[PlayerDataService] Auto-committing stale no-commit window after %.1fs for %s"):format(os.clock() - enteredAt, Player.Name))
+		_commitNoCommitWindow(Player)
+		return true
+	end
+	return false
 end
 
 function PlayerDataService.IsInNoCommitWindow(Player: Player): boolean
@@ -292,11 +453,14 @@ local function _rememberEnvelopeMeta(Player, env)
 end
 
 local function _fetchKeyValue(store, key)
-	local ok, value = pcall(function()
-		return store:GetAsync(key)
-	end)
-	if not ok then
-		warn("[SAVE] GetAsync failed for", key)
+	local value, ok = _dsCallWithRetry(
+		Enum.DataStoreRequestType.GetAsync,
+		("GetAsync:%s"):format(tostring(key)),
+		function()
+			return store:GetAsync(key)
+		end
+	)
+	if ok == false then
 		return nil, false
 	end
 	return value, true
@@ -338,16 +502,20 @@ local function _recoverFromBackups(Player)
 			hadError = true
 		elseif env then
 			if SavePolicy.APPLY_CHANGES == true then
-				local ok, err = pcall(function()
-					store:SetAsync(_primaryKey(Player.UserId), SaveEnvelope.touch(env))
-				end)
-				if not ok then
-					warn("[DEDUP][ERROR] restore primary failed", Player.UserId, err)
+				local _, wrote = _dsCallWithRetry(
+					Enum.DataStoreRequestType.SetIncrementAsync,
+					("RestorePrimary:%s"):format(Player.UserId),
+					function()
+						return store:SetAsync(_primaryKey(Player.UserId), SaveEnvelope.touch(env))
+					end
+				)
+				if not wrote then
+					warn("[DEDUP][ERROR] restore primary failed", Player.UserId)
 				else
-					print(("[DEDUP] Restored primary for %s from %s"):format(Player.UserId, key))
+					log(("[DEDUP] Restored primary for %s from %s"):format(Player.UserId, key))
 				end
 			else
-				print(("[AUDIT] Would restore primary for %s from %s"):format(Player.UserId, key))
+				log(("[AUDIT] Would restore primary for %s from %s"):format(Player.UserId, key))
 			end
 			return env, true
 		end
@@ -542,6 +710,40 @@ local function CreateSessionLockingDataStoreIfNoneExists()
 	return SessionLocking ~= nil
 end
 
+local function _acquireSessionLock(Player: Player): boolean
+	if not ShouldUseSessionLocking() then
+		return true
+	end
+
+	while not SessionLocking do task.wait() end
+
+	local myJob = game.JobId
+	local deadline = os.time() + SESSION_LOCK_TTL + 1
+	local lock, success = SessionLocking:GetAsync(Player.UserId)
+
+	-- Wait while another server holds a fresh lock
+	while success and lock and lock.jobId and lock.jobId ~= myJob and (os.time() - (lock.at or 0)) < SESSION_LOCK_TTL and os.time() < deadline do
+		warn(("[!] Player (%s | %d) session locked by %s; waiting..."):format(Player.Name, Player.UserId, tostring(lock.jobId)))
+		task.wait(4)
+		lock, success = SessionLocking:GetAsync(Player.UserId)
+	end
+
+	-- If still locked by someone else within TTL, fail
+	if success and lock and lock.jobId and lock.jobId ~= myJob and (os.time() - (lock.at or 0)) < SESSION_LOCK_TTL then
+		warn(("[!] Session lock held by another server for %s (%d); aborting load."):format(Player.Name, Player.UserId))
+		return false
+	end
+
+	-- Claim the lock for this job
+	local _, okSet = SessionLocking:SetAsync(Player.UserId, { jobId = myJob, at = os.time() })
+	if not okSet then
+		warn(("[!] Failed to set session lock for %s (%d)"):format(Player.Name, Player.UserId))
+		return false
+	end
+
+	return true
+end
+
 local function CreatePlayerDataDataStoreIfNoneExists(Player: Player): boolean
 	-- Keys are derived on demand now; nothing to initialize per-player
 	return true
@@ -587,10 +789,14 @@ function PlayerDataService.ModifyData(Player: Player, Path: string?, NewValue: a
 			return
 		end
 		Utility.ModifyTableByPath(PlayerDataService.AllPlayerData[Player], Path, NewValue)
-		RE_UpdatePlayerData:FireClient(Player, NewValue, Path)
+		-- Skip cityStorage replication to avoid large network spikes
+		if _isCityStoragePath(Path) then
+			return
+		end
+		_queueUpdatePlayerData(Player, Path, NewValue)
 	else
 		PlayerDataService.AllPlayerData[Player] = NewValue
-		RE_UpdatePlayerData:FireClient(Player, NewValue, nil)
+		RE_UpdatePlayerData:FireClient(Player, _copyForClient(NewValue), nil)
 	end
 end
 
@@ -598,21 +804,32 @@ end
 function PlayerDataService.ModifySaveData(Player: Player, Path: string, NewValue: any)
 	local PlayerData = PlayerDataService.AllPlayerData[Player]
 	if not PlayerData then return end
-	local SaveData = PlayerData.savefiles[PlayerData.currentSaveFile]
+	local curSlot = PlayerData.currentSaveFile
+	if not curSlot then return end
+
+	local SaveData = PlayerData.savefiles[curSlot]
 	if not SaveData then return end
 	_markHighChurn(Player, Path)
+	local fullPath = ("savefiles/%s/%s"):format(curSlot, Path)
 
 	-- If a reload is in progress for this player, stage the mutation.
 	if _noCommitWindow[Player] then
-		local patches = _stagedPatches[Player]
-		if not patches then patches = {}; _stagedPatches[Player] = patches end
-		-- shallow copy is fine for our paths (strings/numbers/encoded blobs)
-		patches[Path] = (Utility and Utility.CloneTable) and Utility.CloneTable(NewValue) or NewValue
-		return
+		-- Auto-heal any stuck windows instead of silently dropping live updates (e.g., income).
+		if _maybeAutoCommitNoCommitWindow(Player) then
+			-- committed + window cleared; fall through to normal path below
+		else
+			local patches = _stagedPatches[Player]
+			if not patches then patches = {}; _stagedPatches[Player] = patches end
+			-- shallow copy is fine for our paths (strings/numbers/encoded blobs)
+			patches[Path] = (Utility and Utility.CloneTable) and Utility.CloneTable(NewValue) or NewValue
+			-- Keep live data/UI in sync even while staging (prevents income pauses).
+			PlayerDataService.ModifyData(Player, fullPath, NewValue)
+			return
+		end
 	end
 
 	-- Normal path: mutate live data and notify client
-	PlayerDataService.ModifyData(Player, "savefiles/"..PlayerData.currentSaveFile.."/"..Path, NewValue)
+	PlayerDataService.ModifyData(Player, fullPath, NewValue)
 end
 -- ---------------------------------------------------------------------------
 
@@ -643,10 +860,22 @@ function PlayerDataService.Load(Player: Player)
 		warn("[!] Cannot Load PlayerData until SessionLocking has not been loaded")
 		return
 	end
+	if ShouldUseSessionLocking() then
+		if not _acquireSessionLock(Player) then
+			PlayerDataService.PlayerDataFailed[Player] = true
+			pcall(function()
+				Player:Kick("Data failed to load. Please rejoin.")
+			end)
+			return
+		end
+	end
 	if not DEBUG_IGNORE_PLAYERDATA_LOAD and not DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
 			warn("[!] Cannot access player datastore for load")
 			PlayerDataService.PlayerDataFailed[Player] = true
+			if ShouldUseSessionLocking() and SessionLocking then
+				SessionLocking:SetAsync(Player.UserId, false)
+			end
 			return
 		end
 	end
@@ -656,7 +885,7 @@ function PlayerDataService.Load(Player: Player)
 	if DEBUG_IGNORE_PLAYERDATA_LOAD or DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		DebugPrintLoad("[NO LOAD] Ignoring PlayerData ("..Player.UserId..")")
 	else
-		print("[LOAD] PlayerData ("..Player.UserId..")")
+	log("[LOAD] PlayerData ("..Player.UserId..")")
 		local env, ok = _loadPrimaryEnvelope(Player)
 		if ok ~= false and not env then
 			env, ok = _recoverFromBackups(Player)
@@ -665,6 +894,13 @@ function PlayerDataService.Load(Player: Player)
 		if ok == false then
 			PlayerDataService.PlayerDataFailed[Player] = true
 			warn("[LOAD FAIL] PlayerData ("..Player.UserId..")")
+			if ShouldUseSessionLocking() and SessionLocking then
+				SessionLocking:SetAsync(Player.UserId, false)
+			end
+			pcall(function()
+				Player:Kick("Data failed to load. Please rejoin.")
+			end)
+			return
 		elseif env and env.data then
 			PlayerData = Utility.MergeTables(env.data, PlayerData)
 			PlayerDataService.PlayerDataFailed[Player] = nil
@@ -673,6 +909,7 @@ function PlayerDataService.Load(Player: Player)
 		else
 			PlayerDataService.PlayerDataFailed[Player] = nil
 			DebugPrintLoad("[NEW] PlayerData ("..Player.UserId..")")
+			warn(("[LOAD] No datastore payload for %s (%d); using defaults"):format(Player.Name, Player.UserId))
 		end
 	end
 
@@ -692,7 +929,7 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 	if DEBUG_IGNORE_PLAYERDATA_SAVE or DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		DebugPrintSave("[NO SAVE] PlayerData ("..Player.UserId..")")
 	else
-		print(("[SAVE] PlayerData (%d) %s"):format(Player.UserId, reason or ""))
+	log(("[SAVE] PlayerData (%d) %s"):format(Player.UserId, reason or ""))
 		PlayerDataService.AllPlayerData[Player] = PlayerDataInterfaceService.OnSave(Player, PlayerDataService.AllPlayerData[Player])
 
 		local pd = PlayerDataService.AllPlayerData[Player]
@@ -703,13 +940,15 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 		local meta = _lastEnvelopeMeta[Player]
 		local now = os.time()
 
-		if env._envelope.approxBytes > SavePolicy.LIMITS.PER_SAVE_BYTES then
-			warn(("[DEDUP][SIZE] payload exceeds soft limit (%d bytes) for %s"):format(env._envelope.approxBytes, Player.UserId))
+		-- Hard guard: never overwrite a good save with an oversized payload (common when a player leaves mid-load).
+		local oversize = env._envelope.approxBytes > SavePolicy.LIMITS.PER_SAVE_BYTES
+		if oversize then
+			warn(("[DEDUP][SIZE] payload exceeds soft limit (%d bytes) for %s; skipping commit"):format(env._envelope.approxBytes, Player.UserId))
 		end
 
-		if SavePolicy.DEDUPE_BY_HASH and meta and meta.hash == env._envelope.hash and not flush then
-			print(("[DEDUP] Skip unchanged save user=%s reason=%s"):format(Player.UserId, tostring(reason)))
-		else
+		if not oversize and SavePolicy.DEDUPE_BY_HASH and meta and meta.hash == env._envelope.hash and not flush then
+			log(("[DEDUP] Skip unchanged save user=%s reason=%s"):format(Player.UserId, tostring(reason)))
+		elseif not oversize then
 			local lastTime = meta and meta.updatedAt or 0
 			local since = now - lastTime
 			if not flush and lastTime > 0 and since < SavePolicy.MIN_COMMIT_INTERVAL_SECONDS then
@@ -717,31 +956,39 @@ local function _do_save_now(Player: Player, reason: string?, flush: boolean?)
 				if _highChurnTouches[Player] and (now - _highChurnTouches[Player]) < SavePolicy.MIN_COMMIT_INTERVAL_SECONDS then
 					suffix = " (high-churn staged)"
 				end
-				print(("[DEDUP] Skip due to min interval (%ds)%s user=%s"):format(SavePolicy.MIN_COMMIT_INTERVAL_SECONDS, suffix, Player.UserId))
+				log(("[DEDUP] Skip due to min interval (%ds)%s user=%s"):format(SavePolicy.MIN_COMMIT_INTERVAL_SECONDS, suffix, Player.UserId))
 			else
 				local store = _playerStore()
 				local primaryKey = _primaryKey(Player.UserId)
 				local backupKey = SaveKeyNames.backup(Player.UserId, _slotIdForPlayer())
 
 				if SavePolicy.APPLY_CHANGES ~= true then
-					print(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
+					log(("[DEDUP][DRY-RUN] would write backup=%s primary=%s reason=%s"):format(backupKey, primaryKey, tostring(reason)))
 					_rememberEnvelopeMeta(Player, env)
 				else
-					local okBackup, errBackup = pcall(function()
-						store:SetAsync(backupKey, env)
-					end)
+					local _, okBackup, errBackup = _dsCallWithRetry(
+						Enum.DataStoreRequestType.SetIncrementAsync,
+						("BackupWrite:%s"):format(backupKey),
+						function()
+							return store:SetAsync(backupKey, env)
+						end
+					)
 					if not okBackup then
 						warn("[DEDUP][ERROR] backup write failed", backupKey, errBackup)
 					end
 
 					env = SaveEnvelope.touch(env)
-					local okPrimary, errPrimary = pcall(function()
-						store:SetAsync(primaryKey, env)
-					end)
+					local _, okPrimary, errPrimary = _dsCallWithRetry(
+						Enum.DataStoreRequestType.SetIncrementAsync,
+						("PrimaryWrite:%s"):format(primaryKey),
+						function()
+							return store:SetAsync(primaryKey, env)
+						end
+					)
 					if not okPrimary then
 						warn("[DEDUP][ERROR] primary write failed", primaryKey, errPrimary)
 					else
-						print(("[DEDUP] Saved primary=%s backup=%s bytes=%d"):format(primaryKey, backupKey, env._envelope.approxBytes))
+						log(("[DEDUP] Saved primary=%s backup=%s bytes=%d"):format(primaryKey, backupKey, env._envelope.approxBytes))
 						_updateIndexWithBackup(Player, primaryKey, backupKey)
 						_rememberEnvelopeMeta(Player, env)
 					end
@@ -812,27 +1059,15 @@ end
 
 function PlayerDataService.PlayerAdded(Player: Player)
 	_sessionStart[Player] = os.clock()
-	_detectExistingOrphans(Player.UserId)
-	if ShouldUseSessionLocking() then
-		while not SessionLocking do task.wait() end
-		local IsLocked, Success = SessionLocking:GetAsync(Player.UserId)
-		if IsLocked == true or not Success then
-			local deadline = os.time() + 31
-			while (IsLocked == true or not Success) and os.time() < deadline do
-				warn(("[!] Player (%s | %d) session locked; waiting... locked=%s success=%s")
-					:format(Player.Name, Player.UserId, tostring(IsLocked), tostring(Success)))
-				task.wait(4)
-				IsLocked, Success = SessionLocking:GetAsync(Player.UserId)
-			end
-			if IsLocked == true or not Success then
-				warn(("[!] Session lock wait timed out for %s (%d); continuing without confirmed unlock."):format(Player.Name, Player.UserId))
-			end
-		end
+	local ghostPlot = _findExistingPlotForPlayer(Player)
+	if ghostPlot then
+		warn(("[WORLD] Existing plot detected for %s (%d): %s (destroying to avoid stale assignment)"):format(Player.Name, Player.UserId, ghostPlot:GetFullName()))
 		task.spawn(function()
-			SessionLocking:SetAsync(Player.UserId, false)
+			pcall(function()
+				ghostPlot:Destroy()
+			end)
 		end)
 	end
-
 	if not DEBUG_IGNORE_PLAYERDATA_DATASTORES then
 		if not CreatePlayerDataDataStoreIfNoneExists(Player) then
 			warn("[!] Cannot access player datastore during join")
@@ -842,6 +1077,12 @@ function PlayerDataService.PlayerAdded(Player: Player)
 	end
 
 	PlayerDataService.Load(Player)
+
+	-- Per-user retention: delete any evicted/orphaned backup keys as soon as the user joins.
+	-- (Avoids relying on the global SaveGC tool or long sweep intervals.)
+	task.defer(function()
+		_pruneBackupsForUserId(Player.UserId)
+	end)
 end
 
 function PlayerDataService.PlayerRemoved(Player: Player)
@@ -866,6 +1107,8 @@ function PlayerDataService.PlayerRemoved(Player: Player)
 	_lastEnvelopeMeta[Player] = nil
 	_highChurnTouches[Player] = nil
 	_sessionStart[Player] = nil
+	_pendingPdUpdates[Player] = nil
+	_pendingPdFlush[Player] = nil
 	_pruneBackupsForUserId(Player.UserId)
 
 	if ShouldUseSessionLocking() then
@@ -876,6 +1119,7 @@ function PlayerDataService.PlayerRemoved(Player: Player)
 	_noCommitWindow[Player] = nil
 	_stagedPatches[Player] = nil
 	_lastGoodSlotSnapshot[Player] = nil
+	_noCommitEnteredAt[Player] = nil
 end
 
 function PlayerDataService.Init()

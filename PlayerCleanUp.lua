@@ -10,6 +10,7 @@ local ZoneManager = require(ZoneMgr:WaitForChild("ZoneManager"))
 local ZoneTracker = require(ZoneMgr:WaitForChild("ZoneTracker"))
 local ZoneRequirementsCheck = require(ZoneMgr:WaitForChild("ZoneRequirementsCheck"))
 local EconomyService = require(ZoneMgr:WaitForChild("EconomyService"))
+local LayerManager = require(S3.Build.LayerManager)
 
 local Transport = Bld:WaitForChild("Transport")
 local Roads = Transport:WaitForChild("Roads")
@@ -23,12 +24,17 @@ local Workspace = game:GetService("Workspace")
 
 local alreadyCleaned = {}
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 function PlayerCleanupService.cleanupPlayer(player)
 	if alreadyCleaned[player.UserId] then return end
 	alreadyCleaned[player.UserId] = true
 	local userId = player.UserId
 	local plotName = "Plot_" .. userId
-	print("[Cleanup] Cleaning up player:", player.Name)
+	log("[Cleanup] Cleaning up player:", player.Name)
 
 	-- Clear ZoneManager state
 	ZoneManager.playerZoneCounters[userId] = nil
@@ -39,12 +45,22 @@ function PlayerCleanupService.cleanupPlayer(player)
 	-- Clear RequirementsCheck cache
 	ZoneRequirementsCheck.clearPlayerData(player)
 
+	-- Clear any archived layer data for this player (prevents cross-session restores)
+	LayerManager.clearPlayer(player)
+
 	-- Road-specific cleanup
 	local roadNetworks = PathingModule.getRoadNetworks()
-	for zoneId, network in pairs(roadNetworks) do
-		if network and network.id and string.find(network.id, tostring(userId)) then
+	local ownerKey = tostring(userId)
+	for key, network in pairs(roadNetworks) do
+		local zoneId = network and network.id or key
+		local owned = network and (
+			(network.owner and network.owner == ownerKey)
+			or (type(key) == "string" and string.find(key, "^" .. ownerKey .. "::"))
+			or (zoneId and string.find(tostring(zoneId), ownerKey))
+		)
+		if owned then
 			-- Unregister road
-			PathingModule.unregisterRoad(zoneId)
+			PathingModule.unregisterRoad(zoneId, userId)
 
 			-- Stop all car movement for this zone
 			CarMovement.stopMovementsForZone(zoneId)
@@ -58,7 +74,7 @@ function PlayerCleanupService.cleanupPlayer(player)
 		end
 	end
 
-	print("[Cleanup] Finished cleaning player:", player.Name)
+	log("[Cleanup] Finished cleaning player:", player.Name)
 end
 
 do

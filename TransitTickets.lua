@@ -112,11 +112,13 @@ local UpgradeAlarmParts = {}    -- [uid][zoneId] = BasePart
 -- Alarm bobbing & pool
 -- ===================================================================
 local USE_SHARED_BOBBING = 1==1
+local BOB_ON_CLIENT = true -- when true, server tags base pos and leaves bobbing to clients
 local BOB_SPEED = 2
 local BOB_AMPLITUDE = 0.5
 local ActiveUpgradeBobs = {} :: {[BasePart]: {base: Vector3, phase: number}}
 local heartbeatConn: (() -> ())? = nil
 local function ensureHeartbeat()
+	if BOB_ON_CLIENT then return end
 	if heartbeatConn then return end
 	heartbeatConn = RunServiceScheduler.onHeartbeat(function()
 		if not USE_SHARED_BOBBING then return end
@@ -136,6 +138,13 @@ local function ensureHeartbeat()
 	end)
 end
 local function startBobbing(part: BasePart, basePos: Vector3)
+	if not part then return end
+	if BOB_ON_CLIENT then
+		pcall(function()
+			part:SetAttribute("BobBase", basePos)
+		end)
+		return
+	end
 	ActiveUpgradeBobs[part] = { base = basePos, phase = math.random() * math.pi * 2 }
 	ensureHeartbeat()
 end
@@ -155,6 +164,9 @@ end
 local function returnAlarm(part: Instance?)
 	if not part or not part:IsA("BasePart") then return end
 	ActiveUpgradeBobs[part] = nil
+	pcall(function()
+		part:SetAttribute("BobBase", nil)
+	end)
 	part.Parent = nil
 	local key = part.Name:match("^(Alarm%u%l+)") or "AlarmUpgrade"
 	AlarmPool[key] = AlarmPool[key] or {}

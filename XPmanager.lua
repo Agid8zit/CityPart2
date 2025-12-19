@@ -1,4 +1,9 @@
-print("[XP] Module loaded")
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
+log("[XP] Module loaded")
 
 --// SERVICES --
 local Players        = game:GetService("Players")
@@ -18,6 +23,7 @@ local Events         = RS:WaitForChild("Events")
 local BindableEvents = Events:WaitForChild("BindableEvents")
 local ZoneCreated    = BindableEvents:WaitForChild("ZoneCreated")
 local ZoneRemoved    = BindableEvents:WaitForChild("ZoneRemoved")
+local ZonePopulated  = BindableEvents:WaitForChild("ZonePopulated")
 local XPChanged      = BindableEvents:WaitForChild("XPChanged")
 
 local Balancing      = RS:WaitForChild("Balancing")
@@ -26,7 +32,8 @@ local BuildingGhostManager   = require(RS.Scripts.BuildingManager:WaitForChild("
 
 local PlayerDataInterfaceService = require(game.ServerScriptService.Services.PlayerDataInterfaceService)
 
-local UNDO_WINDOW = 30 
+-- Keep the XP refund window aligned with coin refunds (starts when population clock starts).
+local UNDO_WINDOW = 60 
 
 --// STATE --
 local processedZones 	= {}       -- [userId] = set of zoneIds already awarded
@@ -46,7 +53,7 @@ local function awardXP(player, amount, zoneId)
 	local newXP = SaveData.xp + amount
 	PlayerDataService.ModifySaveData(player, "xp", newXP)
 
-	print(("[XP] %s +%d → %d"):format(player.Name, amount, newXP))
+	log(("[XP] %s +%d → %d"):format(player.Name, amount, newXP))
 	XPChanged:Fire(player, newXP)
 
 	if zoneId then
@@ -54,6 +61,7 @@ local function awardXP(player, amount, zoneId)
 		xpHistory[player.UserId][zoneId] = {
 			amount    = amount,
 			timestamp = os.time(),
+			windowStart = nil, -- set when population clock starts
 		}
 	end
 end
@@ -97,10 +105,21 @@ ZoneCreated.Event:Connect(function(player, zoneId)
 		totalReward = baseXP * gridCount
 	end
 
-	print(("[XP] %d XP for %s (%s)"):format(totalReward, zoneType, zoneId))
+	log(("[XP] %d XP for %s (%s)"):format(totalReward, zoneType, zoneId))
 	awardXP(player, totalReward, zoneId)
 
 	processedZones[uid][zoneId] = true
+end)
+
+-- Track population to start the XP refund window at the same time as coins.
+ZonePopulated.Event:Connect(function(player, zoneId)
+	local uid = player and player.UserId
+	if not uid or not zoneId then return end
+	xpHistory[uid] = xpHistory[uid] or {}
+	local rec = xpHistory[uid][zoneId]
+	if rec and not rec.windowStart then
+		rec.windowStart = os.time()
+	end
 end)
 
 ZoneRemoved.Event:Connect(function(player, zoneId)
@@ -108,12 +127,14 @@ ZoneRemoved.Event:Connect(function(player, zoneId)
 	xpHistory[uid] = xpHistory[uid] or {}
 	local rec = xpHistory[uid][zoneId]
 	-- If we remember this zone's award and we're within the window, do an exact revert.
-	if rec and (os.time() - (rec.timestamp or 0)) <= UNDO_WINDOW then
+	-- Use windowStart (population) when available; fall back to award time for legacy data.
+	local startAt = rec and (rec.windowStart or rec.timestamp)
+	if rec and startAt and (os.time() - startAt) <= UNDO_WINDOW then
 		local SaveData = PlayerDataService.GetSaveFileData(player)
 		if SaveData then
 			local newXP = math.max(0, (SaveData.xp or 0) - (rec.amount or 0))
 			PlayerDataService.ModifySaveData(player, "xp", newXP)
-			print(("[XP] %s AUTO-UNDO %d for %s → %d"):format(player.Name, rec.amount or 0, zoneId, newXP))
+			log(("[XP] %s AUTO-UNDO %d for %s → %d"):format(player.Name, rec.amount or 0, zoneId, newXP))
 			XPChanged:Fire(player, newXP)
 		end
 		-- Allow re-award if they build again.
@@ -134,7 +155,7 @@ function XP.getXP(player)
 	local SaveData = PlayerDataService.GetSaveFileData(player)
 	if not SaveData then return 0 end
 	
-	print(("[XP] %s: %d"):format(player.Name, SaveData.xp))
+	log(("[XP] %s: %d"):format(player.Name, SaveData.xp))
 	return SaveData.xp
 end
 
@@ -146,7 +167,7 @@ function XP.setXP(player, amount)
 	
 	PlayerDataService.ModifySaveData(player, "xp", amount)
 	
-	print(("[XP] %s set to %d"):format(player.Name, amount))
+	log(("[XP] %s set to %d"):format(player.Name, amount))
 	XPChanged:Fire(player, amount)
 end
 
@@ -162,11 +183,12 @@ function XP.removeXP(player, amount, zoneId)
 	-- Attempt zone-based revert
 	if zoneId and xpHistory[uid] and xpHistory[uid][zoneId] then
 		local rec = xpHistory[uid][zoneId]
-		if rec.amount == amount and (os.time() - rec.timestamp) <= UNDO_WINDOW then
+		local startAt = rec.windowStart or rec.timestamp
+		if rec.amount == amount and startAt and (os.time() - startAt) <= UNDO_WINDOW then
 			-- valid revert
 			local newXP = math.max(0, SaveData.xp - amount)
 			PlayerDataService.ModifySaveData(player, "xp", newXP)
-			print(("[XP] %s UNDO %d from zone %s → %d"):format(player.Name, amount, zoneId, newXP))
+			log(("[XP] %s UNDO %d from zone %s → %d"):format(player.Name, amount, zoneId, newXP))
 			XPChanged:Fire(player, newXP)
 
 			-- clear history and allow zone re-award if they build again
@@ -182,7 +204,7 @@ function XP.removeXP(player, amount, zoneId)
 	local newXP = math.max(0, SaveData.xp - amount)
 	PlayerDataService.ModifySaveData(player, "xp", newXP)
 
-	print(("[XP] %s –%d → %d (generic removal)"):format(player.Name, amount, newXP))
+	log(("[XP] %s –%d → %d (generic removal)"):format(player.Name, amount, newXP))
 	XPChanged:Fire(player, newXP)
 end
 

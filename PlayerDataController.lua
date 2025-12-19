@@ -16,11 +16,28 @@ local Listeners = {} -- [Path] = Array<Listener>
 local FullListeners = {} -- Array<Listener> (if entire data is changed)
 local AnyListeners = {} -- Array<Listener>
 
+local function setValueAtPath(targetTable, path, value)
+	local keys = string.split(path, "/")
+	local pointer = targetTable
+	for i = 1, #keys do
+		local key = keys[i]
+		if i == #keys then
+			pointer[key] = value
+		else
+			pointer[key] = pointer[key] or {}
+			pointer = pointer[key]
+		end
+	end
+end
+
 -- Helper Functions
 local function UpdatePlayerData(NewValue: any, Path: string?)
 	if Path then
-		-- Update Data
-		Utility.ModifyTableByPath(PlayerDataController.PlayerData, Path, NewValue)
+		-- Ensure a container exists, then update the path (creates missing tables)
+		if not PlayerDataController.PlayerData then
+			PlayerDataController.PlayerData = {}
+		end
+		setValueAtPath(PlayerDataController.PlayerData, Path, NewValue)
 		
 		-- Check for broader paths, ex: a/b/c will trigger a/b and a
 		local Paths = Utility.GetAllHierarchyPaths(Path)

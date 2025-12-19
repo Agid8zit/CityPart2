@@ -23,6 +23,7 @@ local WARN_SPAM_DELAY   = 10             -- seconds between identical warns
 local USE_DIAGONAL_ADJ  = true           -- keep 8-way; set false for 4-way strict
 local POST_TICK_RESCAN  = true           -- one-shot deferred rescan after add
 local USE_ZONE_TRACKER_FALLBACK = false  -- keep false to avoid “any zone” ambiguity
+local WARN_GRACE_SEC    = 8              -- suppress warnings for a short window after join
 
 -- Road source coordinate – any road zone that contains this grid
 -- acts as the single "source" for the Road network.
@@ -32,6 +33,7 @@ local ROAD_SOURCE_COORD = { x = 0, z = 0 }
 --  Private helpers
 ----------------------------------------------------------------------
 local warnOnce     = {}            -- [msg] = true  (cleared after delay)
+local warnGraceUntil = {}          -- [userId] = os.clock() + grace
 
 local function dPrint(...)
 	if DEBUG_LOGS then
@@ -39,7 +41,9 @@ local function dPrint(...)
 	end
 end
 
+local WARNINGS_ENABLED = false
 local function wPrint(msg)
+	if not WARNINGS_ENABLED then return end
 	if not warnOnce[msg] then
 		warn(msg)
 		warnOnce[msg] = true
@@ -285,7 +289,7 @@ local function indexZoneCells(net, zoneId, gridList)
 			local bucket = getCellBucket(net, x, z, true)
 			bucket[zoneId] = true
 		elseif DEBUG_LOGS then
-			warn("NetworkManager.indexZoneCells: bad coord:", coord)
+			wPrint("NetworkManager.indexZoneCells: bad coord")
 		end
 	end
 end
@@ -314,7 +318,7 @@ function NetworkManager.scheduleCellRebuild(player, networkType)
 	net.rebuildScheduled = true
 	task.defer(function()
 		net.rebuildScheduled = false
-		if net.ufCellsDirty then
+	if net.ufCellsDirty then
 			NetworkManager.rebuildCellUnionFind(player, networkType)
 			net.ufCellsDirty = false
 		end
@@ -541,13 +545,17 @@ function NetworkManager.isZoneConnected(player, zoneId, networkType)
 	local net = NetworkManager.networks[player.UserId]
 		and NetworkManager.networks[player.UserId][networkType]
 	if not net then
-		wPrint(("NetworkManager: '%s' network missing for %s")
-			:format(networkType, player.Name))
+		if not (warnGraceUntil[player.UserId] and os.clock() < warnGraceUntil[player.UserId]) then
+			wPrint(("NetworkManager: '%s' network missing for %s")
+				:format(networkType, player.Name))
+		end
 		return false
 	end
 	if not net.zones[zoneId] then
-		wPrint(("NetworkManager: Zone '%s' not found in %s for %s")
-			:format(zoneId, networkType, player.Name))
+		if not (warnGraceUntil[player.UserId] and os.clock() < warnGraceUntil[player.UserId]) then
+			wPrint(("NetworkManager: Zone '%s' not found in %s for %s")
+				:format(zoneId, networkType, player.Name))
+		end
 		return false
 	end
 
@@ -621,7 +629,7 @@ function NetworkManager.getAdjacentZones(player, gridList, networkType)
 					end
 				end
 			elseif DEBUG_LOGS then
-				warn("NetworkManager.getAdjacentZones: bad coord:", coord)
+				wPrint("NetworkManager.getAdjacentZones: bad coord")
 			end
 		end
 		return out
@@ -643,7 +651,7 @@ function NetworkManager.getAdjacentZones(player, gridList, networkType)
 					end
 				end
 			elseif DEBUG_LOGS then
-				warn("NetworkManager.getAdjacentZones: bad coord:", coord)
+				wPrint("NetworkManager.getAdjacentZones: bad coord")
 			end
 		end
 	end
@@ -747,6 +755,11 @@ end
 Players.PlayerRemoving:Connect(function(plr)
 	local pid = plr.UserId
 	NetworkManager.networks[pid] = nil
+	warnGraceUntil[pid] = nil
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	warnGraceUntil[plr.UserId] = os.clock() + WARN_GRACE_SEC
 end)
 
 ----------------------------------------------------------------------

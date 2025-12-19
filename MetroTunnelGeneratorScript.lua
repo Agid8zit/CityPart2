@@ -19,7 +19,7 @@ local function isMetroMode(mode: string?): boolean
 end
 
 -- Recreate idempotently: clear this zone's tunnels, then regenerate from coords
-local function recreateMetro(player: Player, zoneId: string, mode: string, coords: {any})
+local function recreateMetro(player: Player, zoneId: string, mode: string, coords: {any}, isReload: boolean?)
 	if not isMetroMode(mode) then return end
 	if type(coords) ~= "table" or #coords == 0 then
 		warn(("[MetroTunnelGeneratorScript] No coords to (re)create for %s (%s)"):format(zoneId, tostring(mode)))
@@ -32,7 +32,7 @@ local function recreateMetro(player: Player, zoneId: string, mode: string, coord
 	end
 
 	-- Generate fresh from the path coordinates (no stored snapshot required)
-	MetroTunnelGenerator.generateMetro(player, zoneId, mode, coords)
+	MetroTunnelGenerator.generateMetro(player, zoneId, mode, coords, isReload)
 end
 
 -- Events ----------------------------------------------------------------------
@@ -48,10 +48,10 @@ end)
 -- 2) Zone re-creation (e.g., on load)
 -- Signature: (player, zoneId, mode, coords, payloadOrSnapshot?, rotationOr0?)
 local ZoneReCreated = BindableEvents:WaitForChild("ZoneReCreated")
-ZoneReCreated.Event:Connect(function(player: Player, zoneId: string, mode: string, coords: {any})
+ZoneReCreated.Event:Connect(function(player: Player, zoneId: string, mode: string, coords: {any}, _payload, _rot, isReload)
 	if not isMetroMode(mode) then return end
 	print(string.format("[MetroTunnelGeneratorScript] Recreate: %s (%s)", zoneId, mode))
-	recreateMetro(player, zoneId, mode, coords)
+	recreateMetro(player, zoneId, mode, coords, isReload)
 end)
 
 -- 3) Zone removal → clean up occupancy and visuals so future placements aren’t blocked

@@ -250,6 +250,29 @@ function DistrictStatsModule.getStatsForPlayer(playerUserId)
 			result[zoneId] = stats
 		end
 	end
+
+	-- Defensive: if stats somehow went missing (e.g. after a reload hiccup),
+	-- rebuild them from the live zones so downstream systems (income, UI) keep working.
+	if next(result) == nil then
+		local player = Players:GetPlayerByUserId(playerUserId)
+		if player then
+			local zones = ZoneTrackerModule.getAllZones(player) or {}
+			for zid, zdata in pairs(zones) do
+				if Balance.ProductionConfig[zdata.mode] then
+					if not utilityZones[zid] then
+						utilityZones[zid] = { playerUserId = playerUserId, buildingType = zdata.mode }
+						DistrictStatsModule.addUtilityBuilding(player, zdata.mode)
+					end
+				elseif WHITELISTED_ZONE_TYPES[zdata.mode] then
+					calculateStats(zid, zdata)
+					if zoneStats[zid] then
+						result[zid] = zoneStats[zid]
+					end
+				end
+			end
+		end
+	end
+
 	return result
 end
 

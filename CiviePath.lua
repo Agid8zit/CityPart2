@@ -40,7 +40,8 @@ CivPathing.DestinationJitterProb   = 0.5
 -- Grid move rules
 CivPathing.AllowDiagonals          = true
 CivPathing.NoCornerCutting         = true
-CivPathing.AStarMaxNodes           = 50000
+CivPathing.AStarMaxNodes           = 12000
+CivPathing.AStarHeuristicWeight    = 1.5  -- f(n) = g(n) + weight * h(n)
 
 -- Prefer roads
 CivPathing.PreferRoads             = true
@@ -529,7 +530,8 @@ function CivPathing.findGridPathAvoiding(a, b, opts)
 		local dx, dz = math.abs(q.x - p.x), math.abs(q.z - p.z)
 		return (dx == 1 and dz == 1) and math.sqrt(2) or 1
 	end
-	local function h(p, q) return CivPathing.octile(p, q) end
+	local heuristicWeight = tonumber(opts.heuristicWeight) or CivPathing.AStarHeuristicWeight or 1
+	local function h(p, q) return CivPathing.octile(p, q) * heuristicWeight end
 
 	local startK, goalK = CivPathing.nodeKey(a), CivPathing.nodeKey(b)
 	local open, inOpen = {}, {}

@@ -26,6 +26,11 @@ local GridScripts  = ReplicatedStorage:WaitForChild("Scripts"):WaitForChild("Gri
 local GridUtils    = require(GridScripts:WaitForChild("GridUtil"))
 local GridConfig   = require(GridScripts:WaitForChild("GridConfig"))
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 local function _getGlobalBoundsForPlot(plot)
 	local terrains = {}
 	local unlocks  = plot:FindFirstChild("Unlocks")
@@ -223,7 +228,7 @@ local function _forEachRoadBillboard(player, callback)
 	end
 end
 
-local function _recordAndRemoveBillboard(ownerZoneId, inst)
+local function _recordAndRemoveBillboard(ownerZoneId, inst, player)
 	if not (ownerZoneId and inst) then return end
 	local cf = select(1, _getInstanceBoundingBox(inst))
 	local record = {
@@ -235,7 +240,7 @@ local function _recordAndRemoveBillboard(ownerZoneId, inst)
 		gridZ          = inst:GetAttribute("GridZ"),
 		zoneId         = inst:GetAttribute("ZoneId") or (inst.Parent and inst.Parent.Name),
 	}
-	LayerManagerModule.storeRemovedObject(REMOVED_BILLBOARD_TYPE, ownerZoneId, record)
+	LayerManagerModule.storeRemovedObject(REMOVED_BILLBOARD_TYPE, ownerZoneId, record, player)
 	inst:Destroy()
 end
 
@@ -244,7 +249,7 @@ local function _stripBillboardsInBox(player, ownerZoneId, boxCF, boxSize)
 	_forEachRoadBillboard(player, function(inst)
 		local cf, size = _getInstanceBoundingBox(inst)
 		if _overlapXZ(boxCF, boxSize, cf, size) then
-			_recordAndRemoveBillboard(ownerZoneId, inst)
+			_recordAndRemoveBillboard(ownerZoneId, inst, player)
 		end
 	end)
 end
@@ -371,6 +376,16 @@ end
 local zoneCreatedEvent   = BindableEvents:WaitForChild("ZoneCreated")
 local zoneRemovedEvent   = BindableEvents:WaitForChild("ZoneRemoved")
 local zoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
+
+local function _waitForZoneData(player, zoneId, timeoutSec)
+	local deadline = os.clock() + (timeoutSec or 0.5)
+	repeat
+		local z = ZoneTrackerModule.getZoneById(player, zoneId)
+		if z then return z end
+		task.wait(0.05)
+	until os.clock() > deadline
+	return nil
+end
 
 -- Utility: quick set from a gridList
 local function _gridSet(list)
@@ -552,26 +567,32 @@ zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, predefin
 	end
 
 	if isBuildingMode(mode) then
-		_stripBillboardsForZone(player, zoneId, gridList or {})
-		PowerGeneratorModule.suppressPolesOnGridList(player, zoneId, gridList)
 		local zoneData = ZoneTrackerModule.getZoneById(player, zoneId)
 		if not zoneData then
-			warn(string.format("BuildingGeneratorScript: No zoneData found for zoneId '%s'.", zoneId))
-			return
+			zoneData = _waitForZoneData(player, zoneId, 1)
 		end
 
+		local resolvedGrid = (zoneData and zoneData.gridList) or gridList or {}
+		local resolvedMode = (zoneData and zoneData.mode) or mode
+		if not zoneData then
+			warn(string.format("BuildingGeneratorScript: No zoneData found for zoneId '%s' (using event payload).", zoneId))
+		end
+
+		_stripBillboardsForZone(player, zoneId, resolvedGrid)
+		PowerGeneratorModule.suppressPolesOnGridList(player, zoneId, resolvedGrid)
+
 		if predefinedBuildings then
-			print(string.format(
+			log(string.format(
 				"BuildingGeneratorScript: Re-populating Zone '%s' for player '%s' with predefined buildings",
 				zoneId, player.Name
 				))
-			BuildingGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedBuildings, rotation)
+			BuildingGeneratorModule.populateZone(player, zoneId, resolvedMode, resolvedGrid, predefinedBuildings, rotation)
 		else
-			print(string.format(
+			log(string.format(
 				"BuildingGeneratorScript: Populating Zone '%s' for player '%s'",
 				zoneId, player.Name
 				))
-			BuildingGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation)
+			BuildingGeneratorModule.populateZone(player, zoneId, resolvedMode, resolvedGrid, nil, rotation)
 		end
 	else
 		-- Not a building zone; do nothing
@@ -636,7 +657,7 @@ zoneRemovedEvent.Event:Connect(function(player, zoneId, mode, gridList)
 		-- Use the snapshot provided by ZoneTracker (this is the ONLY reliable mask)
 		local removedGrid = gridList or {}
 
-		print(("[BuildingGeneratorScript] Removing buildings for Zone '%s' for player '%s'")
+		log(("[BuildingGeneratorScript] Removing buildings for Zone '%s' for player '%s'")
 			:format(zoneId, player.Name))
 
 		BuildingGeneratorModule.removeBuilding(player, zoneId)
@@ -648,4 +669,4 @@ zoneRemovedEvent.Event:Connect(function(player, zoneId, mode, gridList)
 	end
 end)
 
-print("BuildingGeneratorScript loaded.")
+log("BuildingGeneratorScript loaded.")

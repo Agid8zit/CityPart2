@@ -18,6 +18,92 @@ local RemoteEvents = Events:WaitForChild("RemoteEvents")
 local ZoneDisplayEvent = RemoteEvents:WaitForChild("ZoneDisplay")
 local ZoneRemoveDisplayEvent = RemoteEvents:WaitForChild("ZoneRemoveDisplay")
 
+-- Outbound batching so we don't overflow RemoteEvent queues on huge cities
+local ZONE_BATCH_SIZE       = 40      -- how many payloads to ship in one fire
+local ZONE_BATCH_INTERVAL   = 0.05    -- seconds between flushes while backlog exists
+local _pendingDisplayQueue  = {}      -- [Player] = { first=1, last=0, [n] = payload }
+local _flushingDisplayQueue = false
+
+local function _queueCount(q)
+	return q and (q.last - q.first + 1) or 0
+end
+
+local function _getOrCreateQueue(player)
+	local q = _pendingDisplayQueue[player]
+	if not q then
+		q = { first = 1, last = 0 }
+		_pendingDisplayQueue[player] = q
+	end
+	return q
+end
+
+local function _enqueueDisplayPayload(player, payload)
+	if not (player and player.Parent == Players) then return end
+	local q = _getOrCreateQueue(player)
+	q.last += 1
+	q[q.last] = payload
+end
+
+local function _popBatch(player)
+	local q = _pendingDisplayQueue[player]
+	if not q then return nil, 0 end
+
+	local available = _queueCount(q)
+	if available <= 0 then
+		_pendingDisplayQueue[player] = nil
+		return nil, 0
+	end
+
+	local count = math.min(ZONE_BATCH_SIZE, available)
+	local batch = table.create(count)
+	for i = 1, count do
+		batch[i] = q[q.first]
+		q[q.first] = nil
+		q.first += 1
+	end
+
+	if q.first > q.last then
+		_pendingDisplayQueue[player] = nil
+	end
+
+	return batch, count
+end
+
+local function _flushDisplayQueue()
+	if _flushingDisplayQueue then return end
+	_flushingDisplayQueue = true
+
+	task.spawn(function()
+		while true do
+			local sent = false
+			for player, _ in pairs(_pendingDisplayQueue) do
+				if not (player and player.Parent == Players) then
+					_pendingDisplayQueue[player] = nil
+				else
+					local batch, count = _popBatch(player)
+					if count and count > 0 then
+						sent = true
+						if count == 1 then
+							ZoneDisplayEvent:FireClient(player, batch[1])
+						else
+							ZoneDisplayEvent:FireClient(player, { batch = true, zones = batch })
+						end
+					end
+				end
+			end
+
+			if not sent then break end
+			task.wait(ZONE_BATCH_INTERVAL)
+		end
+		_flushingDisplayQueue = false
+	end)
+end
+
+local function queueZoneDisplay(player, payload)
+	_enqueueDisplayPayload(player, payload)
+	_flushDisplayQueue()
+end
+
 -- Bindables
 local zoneRemovedEvent = Events:WaitForChild("BindableEvents"):WaitForChild("ZoneRemoved")
 local zoneAddedEvent = Events:WaitForChild("BindableEvents"):WaitForChild("ZoneAdded")
@@ -354,7 +440,7 @@ function ZoneDisplayModule.displayZone(player, zoneId, mode, gridList, rotationY
 	createSiblingRangeVisual(parentFolder, zonePart, mode, zoneId)
 
 	-- 8) notify client
-	ZoneDisplayEvent:FireClient(player, {
+	queueZoneDisplay(player, {
 		zoneId      = zoneId,
 		zoneType    = mode,
 		bounds      = { minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ },
@@ -408,6 +494,7 @@ end
 
 Players.PlayerRemoving:Connect(function(leavingPlayer)
 	ZoneDisplayModule.clearZoneParts(leavingPlayer)
+	_pendingDisplayQueue[leavingPlayer] = nil
 end)
 
 function ZoneDisplayModule.recheckOverlapFor(plotFolder: Folder, zoneId: string): (boolean, {BasePart})

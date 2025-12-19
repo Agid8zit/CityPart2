@@ -98,6 +98,13 @@ local function debugPrint(...)
 	end
 end
 
+local function yieldEveryN(counter: number, interval: number?)
+	interval = interval or 200
+	if interval > 0 and counter % interval == 0 then
+		task.wait()
+	end
+end
+
 local function _dumpTypes(t)
 	local a = {}
 	for k,v in pairs(t or {}) do if v then table.insert(a, k) end end
@@ -197,6 +204,73 @@ local function planarGridDistance(posA: Vector3, posB: Vector3): number
 	return math.max(dx, dz) / GRID_SIZE
 end
 
+-- Building-population guards (used to defer rope rebuilds / pad-pole links during reload)
+local INFRA_MODES = {
+	DirtRoad   = true,
+	Pavement   = true,
+	Highway    = true,
+	Road       = true,
+	RoadZone   = true,
+	PowerLines = true,
+	WaterPipe  = true,
+	MetroTunnel= true,
+	MetroEntrance = true,
+}
+
+local function _isBuildingMode(mode: any): boolean
+	if not mode then return false end
+	return INFRA_MODES[mode] ~= true
+end
+
+local function _hasPopulatingBuildingZone(player): boolean
+	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
+		if z and z.isPopulating and _isBuildingMode(z.mode) then
+			return true
+		end
+	end
+	return false
+end
+
+local _pendingRebuildAfterBuildings = {} -- [uid] = true
+local _rebuildAllInProgress        = {} -- [uid] = true
+local _rebuildAllPending           = {} -- [uid] = true
+local _queuedPadPoleLinks = {}           -- [uid] = { [buildingZoneId] = { padPole, ... } }
+
+local function _queuePadPoleLink(player, buildingZoneId, padPole)
+	if not (player and buildingZoneId and padPole) then return false end
+	local uid = player.UserId
+	local perPlayer = _queuedPadPoleLinks[uid]
+	if not perPlayer then
+		perPlayer = {}
+		_queuedPadPoleLinks[uid] = perPlayer
+	end
+	local perZone = perPlayer[buildingZoneId]
+	if not perZone then
+		perZone = {}
+		perPlayer[buildingZoneId] = perZone
+	end
+	perZone[#perZone+1] = padPole
+	return true
+end
+
+local function _drainQueuedPadPoleLinks(player, buildingZoneId)
+	local uid = player and player.UserId
+	if not (uid and buildingZoneId) then return end
+	local perPlayer = _queuedPadPoleLinks[uid]
+	if not perPlayer then return end
+	local pending = perPlayer[buildingZoneId]
+	if not pending then return end
+	perPlayer[buildingZoneId] = nil
+	if not next(perPlayer) then
+		_queuedPadPoleLinks[uid] = nil
+	end
+	for _, pole in ipairs(pending) do
+		if pole and pole.Parent then
+			PowerGeneratorModule.connectPadPoleToPowerZone(player, pole)
+		end
+	end
+end
+
 -- Try to locate a padpole model in the player's plot. Adapt the name/attribute checks to your prefab.
 local function findNearestPadPole(plot, fromPos)
 	local nearest, best = nil, math.huge
@@ -238,7 +312,7 @@ function PowerGeneratorModule.suppressPolesOnGridList(player, suppressorZoneId, 
 						instanceClone  = inst:Clone(),
 						originalParent = inst.Parent,
 						cframe         = (inst:IsA("Model") and inst:GetPivot() or inst.CFrame),
-					})
+					}, player)
 					-- Unmark occupancy
 					local pzid  = inst:GetAttribute("ZoneId") or powerZoneId
 					local occId = string.format("%s_power_%d_%d", tostring(pzid), gx, gz)
@@ -298,7 +372,7 @@ end
 local BOX_DEBUG        = false
 local BOX_ASSET_NAMES  = { "ElectricalBox", "ElectricalCabinet", "TransformerBox", "UtilityBox" }
 local BOX_SIDE_OFFSET  = 2.6   -- shift off the centerline so it isn't on top of the road
-local BOX_Y_OFFSET     = 0.9   -- lift slightly above surface
+local BOX_Y_OFFSET     = 1.3   -- final absolute height for box placement
 
 -- NEW: how far a box will search for a pole to hook into
 local BOX_LINK_MAX_DISTANCE = 24
@@ -405,10 +479,10 @@ local function _ensureBox(player, zoneFolder, asset, assetName, powerZoneId, roa
 	-- Opposite sides for start/end for easy readability
 	local side = (endpoint == "Start") and 1 or -1
 
-	-- Base lateral offset (same as before)
+	-- Base lateral offset (same as before; Y handled separately to stay absolute)
 	local offset = (axis == "EW")
-		and Vector3.new(0, BOX_Y_OFFSET, side * BOX_SIDE_OFFSET)
-		or  Vector3.new(side * BOX_SIDE_OFFSET, BOX_Y_OFFSET, 0)
+		and Vector3.new(0, 0, side * BOX_SIDE_OFFSET)
+		or  Vector3.new(side * BOX_SIDE_OFFSET, 0, 0)
 
 	-- NEW: small forward/backward (Z) bias for visual alignment
 	-- e.g., +0.4 for one endpoint, -0.4 for the other
@@ -422,7 +496,8 @@ local function _ensureBox(player, zoneFolder, asset, assetName, powerZoneId, roa
 	end
 
 	local world = _gridToWorld(player, cell.x, cell.z)
-	local cf    = CFrame.new(world + offset) * CFrame.Angles(0, math.rad(yaw), 0)
+	local pos   = Vector3.new(world.X + offset.X, BOX_Y_OFFSET, world.Z + offset.Z)
+	local cf    = CFrame.new(pos) * CFrame.Angles(0, math.rad(yaw), 0)
 
 	local inst = existingByKey[key]
 	if not inst then
@@ -517,18 +592,27 @@ function PowerGeneratorModule.connectPadPoleToPowerZone(player, padPole)
 	-- but we won't guess here. (Spawn path stamps it for us.)
 	if not powerZoneId then return end
 
+	local owningZoneId = padPole:GetAttribute("ZoneId") or padPole:GetAttribute("BuildingZoneId")
+	if owningZoneId then
+		local owningZone = ZoneTrackerModule.getZoneById(player, owningZoneId)
+		if owningZone then
+			local populating = ZoneTrackerModule.isZonePopulating(player, owningZoneId)
+			local populated  = ZoneTrackerModule.isZonePopulated(player, owningZoneId)
+			if populating or (not populated) then
+				_queuePadPoleLink(player, owningZoneId, padPole)
+				return
+			end
+		end
+	end
+
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
 	local pf   = plot:FindFirstChild("PowerLines"); if not pf then return end
 	local zoneFolder = pf:FindFirstChild(powerZoneId); if not zoneFolder then return end
 
 	-- Find the nearest pole inside this *specific* zone folder
 	local pos = (padPole.PrimaryPart and padPole.PrimaryPart.Position) or padPole:GetPivot().Position
-	local pole, dist = _nearestPoleModel(zoneFolder, pos, PADPOLE_LINK_MAX_DISTANCE)
-	if not pole then
-		-- best-effort: unbounded search as a last resort
-		pole, dist = _nearestPoleModel(zoneFolder, pos, 1e9)
-		if not pole then return end
-	end
+	local pole = _nearestPoleModel(zoneFolder, pos, PADPOLE_LINK_MAX_DISTANCE)
+	if not pole then return end
 
 	local linkGridDelta = planarGridDistance(_modelPos(pole), pos)
 	if linkGridDelta > PADPOLE_LINK_MAX_GRIDS then
@@ -1185,10 +1269,11 @@ end
 ---------------------------------------------------------------------
 --  Main placement routine
 ---------------------------------------------------------------------
-function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
+function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList, _predefinedLines, _rotation, _skipStages, isReload)
 	--print("[PowerGeneratorModule] populateZone CALLED:", player, zoneId, mode)
 
 	task.spawn(function()
+		local isFastReload = isReload == true
 		debugPrint("Populating Power Zone:", zoneId, "(mode:", mode, ")")
 
 		-----------------------------------------------------------------
@@ -1197,7 +1282,7 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 		ZoneTrackerModule.setZonePopulating(player, zoneId, true) -- NEW
 
 		local _powerReserve = select(1, GridUtils.reserveArea(player, zoneId, "power", gridList or {}, { ttl = 20.0 }))
-		if not _powerReserve then
+		if not _powerReserve and not isFastReload then
 			local tries = 0
 			while tries < 5 do
 				task.wait(0.2); tries += 1
@@ -1461,7 +1546,7 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 							instanceClone  = ghost,
 							originalParent = zoneFolder,
 							cframe         = cf,
-						})
+						}, player)
 						bridgedZones[roadZoneId] = true
 						-- do not place the pole in-world here
 					end
@@ -1558,7 +1643,9 @@ function PowerGeneratorModule.populateZone(player, zoneId, mode, gridList)
 				lastPoleInstance = newInstance
 
 				table.insert(placedLinesData, {lineName = basePower.name or "PowerLines", gridX = cell.x, gridZ = cell.z})
-				task.wait(BUILD_INTERVAL)
+				if not isFastReload then
+					task.wait(BUILD_INTERVAL)
+				end
 			else
 				debugPrint(("Skipping (%d,%d) — occ:%s road:%s bld:%s")
 					:format(cell.x, cell.z, tostring(occupied), tostring(hasRoad), tostring(hasBuilding)))
@@ -1730,7 +1817,7 @@ function PowerGeneratorModule.suppressPoleForRoad(player, roadZoneId, gx, gz)
 		instanceClone  = target:Clone(),
 		originalParent = target.Parent,
 		cframe         = (target:IsA("Model") and target:GetPivot() or target.CFrame),
-	})
+	}, player)
 
 	-- unmark power occupancy for this grid
 	local occId = string.format("%s_power_%d_%d", tostring(pZoneId), gx, gz)
@@ -1780,6 +1867,15 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 
 	local function cx(seg) return seg.coord and seg.coord.x or seg.x end
 	local function cz(seg) return seg.coord and seg.coord.z or seg.z end
+	local occTypeCache = {}
+	local function _getOccupantTypesCached(gx, gz)
+		local k = tostring(gx)..","..tostring(gz)
+		local cached = occTypeCache[k]
+		if cached ~= nil then return cached end
+		local types = ZoneTrackerModule.getGridOccupantTypes(player, gx, gz) or {}
+		occTypeCache[k] = types
+		return types
+	end
 
 	-- Manhattan adjacency (keep original intent when no gap)
 	local function _manhattan1(ax, az, bx, bz)
@@ -1801,9 +1897,16 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 		for k = lastIdx + 1, currIdx - 1 do
 			local seg = segs[k]; local gx, gz = cx(seg), cz(seg)
 			if _findPoleInZone(zoneFolder, gx, gz) then return false end
-			local types = ZoneTrackerModule.getGridOccupantTypes(player, gx, gz) or {}
-			--DEBUG:
-			print(("gap %d,%d types: %s"):format(gx,gz, table.concat((function(t) local a={} for k,v in pairs(t) do if v then table.insert(a,k) end end; return a end)(types),",")))
+			local types = _getOccupantTypesCached(gx, gz)
+			if DEBUG_LOGS then
+				local typeList = {}
+				for k, v in pairs(types) do
+					if v then
+						table.insert(typeList, k)
+					end
+				end
+				print(("gap %d,%d types: %s"):format(gx, gz, table.concat(typeList, ",")))
+			end
 			if hasAnyNonRoad(types) and not isRoadCell(types) then return false end
 		end
 		return true
@@ -1870,6 +1973,7 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 	end
 
 	local boxesByRun = {}
+	local descCount = 0
 	for _, inst in ipairs(zoneFolder:GetDescendants()) do
 		if (inst:IsA("Model") or inst:IsA("BasePart")) and inst:GetAttribute("IsPowerRoadBox") == true then
 			local rkey = inst:GetAttribute("RunKey")
@@ -1878,6 +1982,8 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 				table.insert(boxesByRun[rkey], inst)
 			end
 		end
+		descCount += 1
+		yieldEveryN(descCount, 200)
 	end
 
 	for _, pair in pairs(boxesByRun) do
@@ -1906,6 +2012,7 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 	do
 		local populated = plot:FindFirstChild("Buildings") and plot.Buildings:FindFirstChild("Populated")
 		if populated then
+			local scanCount = 0
 			for _, f in ipairs(populated:GetChildren()) do
 				for _, inst in ipairs(f:GetDescendants()) do
 					if (inst:IsA("Model") or inst:IsA("BasePart")) then
@@ -1915,6 +2022,8 @@ function PowerGeneratorModule.rebuildRopesForZone(player, powerZoneId)
 							PowerGeneratorModule.connectPadPoleToPowerZone(player, inst)
 						end
 					end
+					scanCount += 1
+					yieldEveryN(scanCount, 250)
 				end
 			end
 		end
@@ -2002,14 +2111,33 @@ end
 --  PUBLIC: rebuild ropes for *all* power zones on the player's plot
 ---------------------------------------------------------------------
 function PowerGeneratorModule.rebuildRopesForAll(player)
-	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..player.UserId); if not plot then return end
-	local powerFolder = plot:FindFirstChild("PowerLines");                         if not powerFolder then return end
-	for _, zf in ipairs(powerFolder:GetChildren()) do
-		if zf:IsA("Folder") then
-			local zid = zf.Name
-			PowerGeneratorModule.rebuildRopesForZone(player, zid)
-		end
+	local uid = player and player.UserId
+	if not uid then return end
+	if _rebuildAllInProgress[uid] then
+		_rebuildAllPending[uid] = true
+		return
 	end
+	_rebuildAllInProgress[uid] = true
+
+	repeat
+		_rebuildAllPending[uid] = nil
+
+		local plot = Workspace.PlayerPlots:FindFirstChild("Plot_"..uid); if not plot then break end
+		local powerFolder = plot:FindFirstChild("PowerLines");           if not powerFolder then break end
+		if _hasPopulatingBuildingZone(player) then
+			_pendingRebuildAfterBuildings[uid] = true
+			break
+		end
+		_pendingRebuildAfterBuildings[uid] = nil
+		for _, zf in ipairs(powerFolder:GetChildren()) do
+			if zf:IsA("Folder") then
+				local zid = zf.Name
+				PowerGeneratorModule.rebuildRopesForZone(player, zid)
+			end
+		end
+	until not _rebuildAllPending[uid]
+
+	_rebuildAllInProgress[uid] = nil
 end
 
 ---------------------------------------------------------------------
@@ -2022,6 +2150,7 @@ function PowerGeneratorModule.reviveSuppressedPolesForRoad(player, roadZoneId)
 	local powerFolder = plot:FindFirstChild("PowerLines");                         if not powerFolder then return end
 
 	local touched = {}
+	local scanned = 0
 	for _, inst in ipairs(powerFolder:GetDescendants()) do
 		if (inst:IsA("Model") or inst:IsA("BasePart"))
 			and inst:GetAttribute("SuppressedByRoadId") == roadZoneId
@@ -2035,6 +2164,8 @@ function PowerGeneratorModule.reviveSuppressedPolesForRoad(player, roadZoneId)
 				touched[pzid] = true
 			end
 		end
+		scanned += 1
+		yieldEveryN(scanned, 200)
 	end
 
 	for zid in pairs(touched) do
@@ -2126,6 +2257,14 @@ if not _hookedRoadOverlap then
 	zonePopulatedEvent.Event:Connect(function(player, zoneId, _payload)
 		local z = ZoneTrackerModule.getZoneById(player, zoneId)
 		local mode = z and z.mode
+
+		if z and _isBuildingMode(mode) then
+			_drainQueuedPadPoleLinks(player, zoneId)
+			if _pendingRebuildAfterBuildings[player.UserId] and (not _hasPopulatingBuildingZone(player)) then
+				PowerGeneratorModule.rebuildRopesForAll(player)
+			end
+		end
+
 		if mode == "DirtRoad" or mode == "Pavement" or mode == "Highway" or mode == "Road" then
 			-- NEW: after the road zone is fully placed, do one authoritative pass
 			PowerGeneratorModule.rebuildRopesForAll(player)

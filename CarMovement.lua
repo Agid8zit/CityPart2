@@ -5,6 +5,7 @@ local CarMovement = {}
 local _intersectionLocks = {}   -- ["x_z"] = true
 local _edgeLocks         = {}   -- ["x_z->x2_z2"] = true (DIRECTED)
 local _edgeReleasedAt    = {}   -- ["x_z->x2_z2"] = os.clock() timestamp for headway
+local _locksByCar        = {}   -- [car] = { edge=..., intersection=... }
 
 -- Configuration
 local CONFIG = {
@@ -161,6 +162,39 @@ local function _releaseLock(tbl, key)
 	if key then tbl[key] = nil end
 end
 
+local function _rememberLock(car, edgeKey, intersectionKey)
+	if not car then return end
+	local rec = _locksByCar[car]
+	if not rec then
+		rec = {}
+		_locksByCar[car] = rec
+		car.AncestryChanged:Connect(function(_, parent)
+			if parent ~= nil then return end
+			-- car deleted; release any locks it was holding so others can proceed
+			if rec.edge then _releaseLock(_edgeLocks, rec.edge) end
+			if rec.intersection then _releaseLock(_intersectionLocks, rec.intersection) end
+			_locksByCar[car] = nil
+		end)
+	end
+	if edgeKey then rec.edge = edgeKey end
+	if intersectionKey then rec.intersection = intersectionKey end
+end
+
+local function _clearRememberedLock(car, which)
+	local rec = car and _locksByCar[car]
+	if not rec then return end
+	if which == "edge" then
+		rec.edge = nil
+	elseif which == "intersection" then
+		rec.intersection = nil
+	else
+		rec.edge, rec.intersection = nil, nil
+	end
+	if not rec.edge and not rec.intersection then
+		_locksByCar[car] = nil
+	end
+end
+
 
 -- Backward-compatible:
 -- moveCarAlongPath(car, path, [optionsOrOnDone], [onDoneOrZoneId], [maybeZoneId])
@@ -215,10 +249,12 @@ function CarMovement.moveCarAlongPath(car, path, arg3, arg4, arg5)
 			local lockKey = preStopKeysByIdx[currentIndex]
 			if lockKey then
 				if not _acquireLock(_intersectionLocks, lockKey, car) then return end
+				_rememberLock(car, nil, lockKey)
 				local untilT = os.clock() + stopSeconds
 				while os.clock() < untilT do
 					if not car or not car.Parent or not car.PrimaryPart then
 						_releaseLock(_intersectionLocks, lockKey)
+						_clearRememberedLock(car, "intersection")
 						return
 					end
 					task.wait(0.05)
@@ -250,6 +286,7 @@ function CarMovement.moveCarAlongPath(car, path, arg3, arg4, arg5)
 				-- car died
 				return
 			end
+			_rememberLock(car, edgeKey, nil)
 		end
 
 		-- 3) Orientation & lane offset (same as before)
@@ -289,10 +326,12 @@ function CarMovement.moveCarAlongPath(car, path, arg3, arg4, arg5)
 			if edgeKey then
 				_releaseLock(_edgeLocks, edgeKey)
 				_edgeReleasedAt[edgeKey] = os.clock() -- mark for headway timing
+				_clearRememberedLock(car, "edge")
 				edgeKey = nil
 			end
 			if pendingIntersectionKey then
 				_releaseLock(_intersectionLocks, pendingIntersectionKey)
+				_clearRememberedLock(car, "intersection")
 				pendingIntersectionKey = nil
 			end
 

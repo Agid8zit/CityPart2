@@ -26,6 +26,10 @@ DeleteZoneCommand.__className = "DeleteZoneCommand"
 setmetatable(DeleteZoneCommand, Command)
 
 local COIN_REFUND_WINDOW = 60
+local LATE_REFUND_MODES = {
+	Airport = 0.25,
+	BusDepot = 0.25,
+}
 local DEBUG = true
 local function d(...) if DEBUG then print("[DeleteZoneCommand]", ...) end end
 
@@ -37,23 +41,41 @@ function DeleteZoneCommand.new(player, zoneId)
 	self.zoneData   = nil   -- filled in execute()
 	self.skipQueue  = true  -- run immediately like BuildZoneCommand
 	-- bookkeeping to support symmetric undo
-	self._refundedCoins = false
+	self._coinRefundAmount = 0
 	self._returnedExclusive = 0
 	return self
 end
 
 --------------------------------------------------------------------- helpers
 local function computeAgeSeconds(self)
-	-- Prefer a server-authored createdAt on the zone record; fall back to XP timestamp; else "infinite"
-	local createdAt = self.zoneData and self.zoneData.createdAt
-	if type(createdAt) == "number" and createdAt > 0 then
-		return os.time() - createdAt
+	-- Prefer the refund clock (starts on population); if the zone never populated, treat age as 0.
+	local populated = self.zoneData and self.zoneData.requirements and self.zoneData.requirements.Populated
+
+	local startAt = ZoneTracker.getRefundClockAt(self.player, self.zoneId)
+	if not startAt and self.zoneData then
+		-- Allow a late-set refund clock from persisted data (populated-on-save)
+		startAt = self.zoneData.refundClockAt
+		-- Only fall back to createdAt if the zone was already populated in the snapshot
+		if not startAt and populated then
+			startAt = self.zoneData.createdAt
+		end
 	end
+
+	if type(startAt) == "number" and startAt > 0 then
+		return math.max(0, os.time() - startAt)
+	end
+
+	-- If never populated, do NOT fall back to XP timestamps; window hasn’t started.
+	if not populated then
+		return 0
+	end
+
 	local t0 = XPManager.getZoneAwardTimestamp(self.player, self.zoneId)
 	if type(t0) == "number" and t0 > 0 then
-		return os.time() - t0
+		return math.max(0, os.time() - t0)
 	end
-	return math.huge
+
+	return 0
 end
 
 local function removeZone(self)
@@ -72,12 +94,26 @@ local function removeZone(self)
 			local cost     = EconomyService.getCost(mode, #gridList)
 			local age      = computeAgeSeconds(self)
 
-			-- Coins: refund only if within window and it was a coin-priced placement
-			if cost ~= "ROBUX" and type(cost) == "number" and cost > 0 and age <= COIN_REFUND_WINDOW then
-				EconomyService.adjustBalance(self.player, cost)
-				self._refundedCoins = true
-				d(("Coins refunded %d (age=%ds ≤ %ds)"):format(cost, age, COIN_REFUND_WINDOW))
+			local refund   = 0
+
+			-- Coins: refund within window; after window allow partial for specific modes
+			if cost ~= "ROBUX" and type(cost) == "number" and cost > 0 then
+				if age <= COIN_REFUND_WINDOW then
+					refund = cost
+				else
+					local pct = LATE_REFUND_MODES[mode]
+					if pct then
+						refund = math.floor(cost * pct)
+					end
+				end
+			end
+
+			if refund > 0 then
+				EconomyService.adjustBalance(self.player, refund)
+				self._coinRefundAmount = refund
+				d(("Coins refunded %d (age=%ds, mode=%s)"):format(refund, age, tostring(mode)))
 			else
+				self._coinRefundAmount = 0
 				d(("Coins not refunded (cost=%s, age=%ds)"):format(tostring(cost), age))
 			end
 
@@ -117,16 +153,12 @@ local function rebuildZone(self)
 
 	-- ③ re-apply *only* what we actually refunded/returned
 	-- Coins: charge back only if we had refunded during delete
-	if self._refundedCoins then
-		local mode     = self.zoneData.mode
-		local gridList = (type(self.zoneData.gridList) == "table") and self.zoneData.gridList or {}
-		local cost     = EconomyService.getCost(mode, #gridList)
-		if type(cost) == "number" and cost > 0 then
-			EconomyService.chargePlayer(self.player, cost)
-			d(("Charged back %d coins on undo"):format(cost))
-		end
+	if self._coinRefundAmount and self._coinRefundAmount > 0 then
+		local mode = self.zoneData.mode
+		EconomyService.chargePlayer(self.player, self._coinRefundAmount)
+		d(("Charged back %d coins on undo (mode=%s)"):format(self._coinRefundAmount, tostring(mode)))
+		self._coinRefundAmount = 0
 	end
-
 	-- Robux-exclusive: if we returned one on delete, re-consume it now
 	if self._returnedExclusive > 0 then
 		PlayerDataInterfaceService.IncrementExclusiveLocation(self.player, self.zoneData.mode, -self._returnedExclusive)

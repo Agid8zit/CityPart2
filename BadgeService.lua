@@ -1,6 +1,7 @@
 local BadgeService = {}
 
 local RobloxBadgeService = game:GetService("BadgeService")
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
@@ -204,8 +205,8 @@ local BADGE_DEFINITIONS = {
 BadgeService.Badges = BADGE_DEFINITIONS
 BadgeService.Keys = BADGE_KEYS
 
-local function ensureOwnedBadgeTable(player: Player)
-	local playerData = PlayerDataService.AllPlayerData[player]
+local function ensureOwnedBadgeTable(player: Player, playerDataOverride: table?)
+	local playerData = playerDataOverride or PlayerDataService.AllPlayerData[player]
 	if not playerData then
 		return nil
 	end
@@ -213,8 +214,8 @@ local function ensureOwnedBadgeTable(player: Player)
 	return playerData.OwnedBadges
 end
 
-local function markBadgeOwned(player: Player, badgeKey: string)
-	local owned = ensureOwnedBadgeTable(player)
+local function markBadgeOwned(player: Player, badgeKey: string, playerDataOverride: table?)
+	local owned = ensureOwnedBadgeTable(player, playerDataOverride)
 	if not owned then
 		warn(string.format("[BadgeService] Player data missing while recording %s for %s", badgeKey, player.Name))
 		return false
@@ -224,7 +225,10 @@ local function markBadgeOwned(player: Player, badgeKey: string)
 	end
 
 	owned[badgeKey] = true
-	PlayerDataService.ModifyData(player, "OwnedBadges/" .. badgeKey, true)
+	-- If PlayerDataService has already attached the player data, mutate it via ModifyData so clients stay in sync.
+	if PlayerDataService.AllPlayerData[player] then
+		PlayerDataService.ModifyData(player, "OwnedBadges/" .. badgeKey, true)
+	end
 	return true
 end
 
@@ -258,19 +262,19 @@ function BadgeService.GetBadgeInfo(badgeKey: string)
 	return BADGE_DEFINITIONS[badgeKey]
 end
 
-function BadgeService.Award(player: Player, badgeKey: string): (boolean, string?)
+function BadgeService.Award(player: Player, badgeKey: string, playerDataOverride: table?): (boolean, string?)
 	local definition = BADGE_DEFINITIONS[badgeKey]
 	if not definition then
 		return false, "UnknownBadgeKey"
 	end
 
-	local owned = ensureOwnedBadgeTable(player)
+	local owned = ensureOwnedBadgeTable(player, playerDataOverride)
 	if owned and owned[badgeKey] then
 		return true, "AlreadyRecorded"
 	end
 
 	if safeUserHasBadge(player.UserId, definition.id) then
-		markBadgeOwned(player, badgeKey)
+		markBadgeOwned(player, badgeKey, playerDataOverride)
 		return true, "AlreadyOwned"
 	end
 
@@ -284,7 +288,7 @@ function BadgeService.Award(player: Player, badgeKey: string): (boolean, string?
 		return false, tostring(err)
 	end
 
-	markBadgeOwned(player, badgeKey)
+	markBadgeOwned(player, badgeKey, playerDataOverride)
 	return true, "Awarded"
 end
 
@@ -412,6 +416,28 @@ end
 
 function BadgeService.AwardMoney1B(player: Player)
 	return BadgeService.Award(player, BADGE_KEYS.Money1B)
+end
+
+-- Ensure the first-session badge gets attempted for everyone as soon as their data is ready.
+local function awardFirstSessionOnJoin(player: Player)
+	if not player then
+		return
+	end
+	if PlayerDataService.WaitForPlayerData and not PlayerDataService.WaitForPlayerData(player) then
+		warn(string.format("[BadgeService] Skipping first-session badge; data failed to load for %s", player.Name))
+		return
+	end
+	local ok, reason = BadgeService.AwardFirstSession(player)
+	if not ok and reason ~= "AlreadyRecorded" and reason ~= "AlreadyOwned" then
+		warn(string.format("[BadgeService] Failed to award first-session badge to %s (%s)", player.Name, tostring(reason)))
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.defer(awardFirstSessionOnJoin, player)
+end)
+for _, plr in ipairs(Players:GetPlayers()) do
+	task.defer(awardFirstSessionOnJoin, plr)
 end
 
 return BadgeService

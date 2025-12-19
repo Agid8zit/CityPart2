@@ -19,7 +19,13 @@ local ZoneValidationModule = require(script.Parent:WaitForChild("ZoneValidation"
 local ZoneRequirementsCheck = require(script.Parent:WaitForChild("ZoneRequirementsCheck"))
 local CityInteractions = require(script.Parent:WaitForChild("CityInteraction"))
 local Advisor = require(S3.Twitter.Advisor)
-print("Server: CityInteractions Module required successfully!")
+
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
+log("Server: CityInteractions Module required successfully!")
 
 -- Connect RemoteEvents to ZoneManager handlers
 --local selectZoneEvent = RemoteEvents:WaitForChild("SelectZoneType")
@@ -34,12 +40,12 @@ local placeWaterTowerEvent = RemoteEvents:WaitForChild("PlaceWaterTower")
 selectZoneEvent.OnServerEvent:Connect(function(player, zoneType)
 	ZoneManager.onSelectZoneType(player, zoneType)
 end)
-print("Server: 'SelectZoneType' RemoteEvent connected to ZoneManager.onSelectZoneType")
+log("Server: 'SelectZoneType' RemoteEvent connected to ZoneManager.onSelectZoneType")
 ]]
 gridSelectionEvent.OnServerEvent:Connect(function(player, selectedCoords)
 	ZoneManager.onGridSelection(player, selectedCoords)
 end)
-print("Server: 'GridSelection' RemoteEvent connected to ZoneManager.onGridSelection")
+log("Server: 'GridSelection' RemoteEvent connected to ZoneManager.onGridSelection")
 
 -- Server-side event handler for building roads
 buildRoadEvent.OnServerEvent:Connect(function(player, startCoord, endCoord, mode)
@@ -54,20 +60,20 @@ buildRoadEvent.OnServerEvent:Connect(function(player, startCoord, endCoord, mode
 	end
 
 	-- Handle road building logic
-	print("Received buildRoadEvent from", player.Name)
-	print("Start Coord:", startCoord.x, startCoord.z)
-	print("End Coord:", endCoord.x, endCoord.z)
-	print("Mode:", mode)
+	log("Received buildRoadEvent from", player.Name)
+	log("Start Coord:", startCoord.x, startCoord.z)
+	log("End Coord:", endCoord.x, endCoord.z)
+	log("Mode:", mode)
 
 	-- Call ZoneManager.buildRoad
 	local success, message = ZoneManager.buildRoad(player, startCoord, endCoord, mode)
 	if success then
-		print("Road built successfully.")
+		log("Road built successfully.")
 	else
 		warn("Failed to build road:", message)
 	end
 end)
-print("Server: 'BuildRoad' RemoteEvent connected to ZoneManager.buildRoad")
+log("Server: 'BuildRoad' RemoteEvent connected to ZoneManager.buildRoad")
 
 -- Server-side event handler for building pipes
 buildPipeEvent.OnServerEvent:Connect(function(player, startCoord, endCoord, mode)
@@ -82,20 +88,20 @@ buildPipeEvent.OnServerEvent:Connect(function(player, startCoord, endCoord, mode
 	end
 
 	-- Handle pipe building logic
-	print("Received buildPipeEvent from", player.Name)
-	print("Start Coord:", startCoord.x, startCoord.z)
-	print("End Coord:", endCoord.x, endCoord.z)
-	print("Mode:", mode)
+	log("Received buildPipeEvent from", player.Name)
+	log("Start Coord:", startCoord.x, startCoord.z)
+	log("End Coord:", endCoord.x, endCoord.z)
+	log("Mode:", mode)
 
 	-- Call ZoneManager.buildPipe
 	local success, message = ZoneManager.buildPipe(player, startCoord, endCoord, mode)
 	if success then
-		print("Pipe built successfully.")
+		log("Pipe built successfully.")
 	else
 		warn("Failed to build pipe:", message)
 	end
 end)
-print("Server: 'BuildPipe' RemoteEvent connected to ZoneManager.buildPipe")
+log("Server: 'BuildPipe' RemoteEvent connected to ZoneManager.buildPipe")
 
 -- Handle PlaceWaterTower event
 placeWaterTowerEvent.OnServerEvent:Connect(function(player, gridPosition)
@@ -108,7 +114,7 @@ togglePipesEvent.OnServerEvent:Connect(function(player, visible)
 	-- Relay the event to the specific client
 	togglePipesEvent:FireClient(player, visible)
 end)
-print("Server: 'TogglePipesVisibility' RemoteEvent connected.")
+log("Server: 'TogglePipesVisibility' RemoteEvent connected.")
 ]]
 
 buildPowerLineEvent.OnServerEvent:Connect(function(player, startCoord, endCoord, mode)
@@ -123,15 +129,15 @@ buildPowerLineEvent.OnServerEvent:Connect(function(player, startCoord, endCoord,
 	end
 
 	-- Logging
-	print("Received buildPowerLineEvent from", player.Name)
-	print("Start Coord:", startCoord.x, startCoord.z)
-	print("End Coord:",   endCoord.x,   endCoord.z)
-	print("Mode:", mode)
+	log("Received buildPowerLineEvent from", player.Name)
+	log("Start Coord:", startCoord.x, startCoord.z)
+	log("End Coord:",   endCoord.x,   endCoord.z)
+	log("Mode:", mode)
 
 	-- Actual build call
 	local success, messageOrId = ZoneManager.buildPowerLine(player, startCoord, endCoord, mode)
 	if success then
-		print("PowerLines built successfully. ZoneId =", messageOrId)
+		log("PowerLines built successfully. ZoneId =", messageOrId)
 	else
 		warn("Failed to build power line:", messageOrId)
 	end
@@ -142,7 +148,7 @@ end)
 -- Connect BindableEvents to ZoneDisplayModule only
 local zoneCreatedEvent = BindableEvents:WaitForChild("ZoneCreated")
 zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, rotationYDeg)
-	print("ZoneManagerScript: 'ZoneCreated' event fired for zoneId:", zoneId)
+log("ZoneManagerScript: 'ZoneCreated' event fired for zoneId:", zoneId)
 	-- Notify ZoneDisplayModule to display the zone
 	--ZoneDisplayModule.displayZone(player, zoneId, mode, gridList, rotationYDeg or 0 )
 end)

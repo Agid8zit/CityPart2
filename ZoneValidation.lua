@@ -20,6 +20,7 @@ ZoneValidationModule.__index = ZoneValidationModule
 -- Configuration
 local DEBUG = false   -- Set to true for detailed debugging
 local EPS   = 1e-6    -- tiny nudge to avoid boundary ties
+local GRID_SIZE = GridConfig.GRID_SIZE or 4
 
 -- ------------------------------------------------------------------
 -- Debug helpers
@@ -143,6 +144,11 @@ local function getGlobalBoundsForPlot(plot)
 		table.insert(terrains, testTerrain)
 	end
 
+	-- If nothing defines terrain, bail early (callers should handle nil gracefully).
+	if #terrains == 0 then
+		return nil, terrains
+	end
+
 	local gb = GridConfig.calculateGlobalBounds(terrains)
 	local axisDirX, axisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
 	gb.axisDirX = axisDirX
@@ -156,8 +162,98 @@ local function convertGridToWorld(player, gx, gz)
 	if not plot then return Vector3.zero end
 
 	local gb, terrains = getGlobalBoundsForPlot(plot)
+	if not gb then return nil end
 	local wx, _, wz = GridUtils.globalGridToWorldPosition(gx, gz, gb, terrains)
 	return Vector3.new(wx, 1.025, wz)
+end
+
+-- ------------------------------------------------------------------
+-- Terrain support probe (lightweight version of the road checker)
+-- Returns "Land", "Water", "Cliff", or "Void".
+-- ------------------------------------------------------------------
+local function classifySupportAtGrid(player, gx, gz)
+	-- Safely resolve world position; if terrain/bounds missing, treat as land to avoid validation hard-fail.
+	local ok, pos = pcall(convertGridToWorld, player, gx, gz)
+	if not ok or not pos then
+		return "Land"
+	end
+
+	local origin = pos + Vector3.new(0, 50, 0)
+	local direction = Vector3.new(0, -500, 0)
+
+	local function classify(inst: Instance, mat: Enum.Material?)
+		if inst:IsA("BasePart") then
+			if mat == Enum.Material.Water or inst.Material == Enum.Material.Water then
+				return "Water"
+			end
+			if inst.Name:lower():find("cliff") or (inst.Parent and inst.Parent.Name:lower():find("cliff")) then
+				return "Cliff"
+			end
+			return "Land"
+		end
+		if mat == Enum.Material.Water then
+			return "Water"
+		end
+		return "Land"
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {}
+	params.IgnoreWater = false
+
+	local hit = Workspace:Raycast(origin, direction, params)
+	if not hit then
+		return "Void"
+	end
+
+	local primary = classify(hit.Instance, hit.Material)
+	local finalSupport = primary
+
+	-- If the first hit is water, probe again ignoring water to catch shallow cases.
+	if primary == "Water" then
+		local params2 = RaycastParams.new()
+		params2.FilterType = Enum.RaycastFilterType.Exclude
+		params2.FilterDescendantsInstances = {}
+		params2.IgnoreWater = true
+
+		local hit2 = Workspace:Raycast(origin, direction, params2)
+		if hit2 then
+			local secondary = classify(hit2.Instance, hit2.Material)
+			if secondary ~= "Water" then
+				finalSupport = secondary
+			end
+		end
+	end
+
+	-- If still water/void, treat unlock terrain segments as solid ground.
+	if finalSupport == "Water" or finalSupport == "Void" then
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = {}
+		local overlaps = Workspace:GetPartBoundsInBox(
+			CFrame.new(pos),
+			Vector3.new(GRID_SIZE, 200, GRID_SIZE),
+			op
+		)
+		for _, p in ipairs(overlaps) do
+			if p:IsA("BasePart") and p.Name:match("^Segment%d+$") then
+				finalSupport = "Land"
+				break
+			end
+		end
+	end
+
+	return finalSupport
+end
+
+local function gridListHasWater(player, gridList)
+	for _, coord in ipairs(gridList or {}) do
+		if classifySupportAtGrid(player, coord.x, coord.z) == "Water" then
+			return true, coord
+		end
+	end
+	return false, nil
 end
 
 -- ------------------------------------------------------------------
@@ -205,6 +301,9 @@ local function getUnlockGridSet(player)
 	if not unlockFolder then return {} end
 
 	local globalBounds = select(1, getGlobalBoundsForPlot(plot))
+	if not globalBounds then
+		return {}
+	end
 	local gridSize     = GridConfig.GRID_SIZE or 4
 	local rawAxisDirX, rawAxisDirZ = GridConfig.getAxisDirectionsForPlot(plot)
 	local axisDirX     = (rawAxisDirX == -1) and -1 or 1
@@ -219,8 +318,12 @@ local function getUnlockGridSet(player)
 
 	local function mark(gx, gz, src)
 		if gx < 0 or gz < 0 or gx >= gridSizeX or gz >= gridSizeZ then return end
+
+		-- Normalize into the same logical axis space used everywhere else
 		local logicalGX = (axisDirX == -1) and -gx or gx
-		local k = logicalGX .. "," .. gz
+		local logicalGZ = (axisDirZ == -1) and -gz or gz
+
+		local k = logicalGX .. "," .. logicalGZ
 		set[k] = true
 		if DEBUG and not whoFilled[k] then whoFilled[k] = src end
 	end
@@ -525,6 +628,14 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 		return false, "You cannot build over an unlockable item."
 	end
 
+	-- Block non-road placement on water
+	local isRoadMode = RoadTypes[mode] == true
+	local hasWater, waterCoord = gridListHasWater(player, gridList)
+	if hasWater and not isRoadMode then
+		pushLangNotification(player, "Cant build on water")
+		return false, string.format("Cannot place %s on water at (%d,%d).", mode, waterCoord.x, waterCoord.z)
+	end
+
 	-- Utilities can be built anywhere
 	if mode == "WaterPipe" or mode == "PowerLines" or mode == "MetroTunnel" then
 		debugPrint(mode, "can be built through other zones. Validation passed.")
@@ -631,6 +742,10 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 	OverlapExclusions["WaterPipe"]   = true
 	OverlapExclusions["PowerLines"]  = true
 	OverlapExclusions["MetroTunnel"] = true
+	local OccupantTypeExclusions = {
+		power = true,
+		water = true,
+	}
 
 	-- === Roads can cross buildings ===
 	if RoadTypes[mode] then
@@ -641,17 +756,18 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 
 		local filteredGridList = {}
 		for _, coord in ipairs(gridList) do
+			-- Deliberately check building occupants so IgnoreValidation/overlay types (e.g., WindTurbine) still block roads.
 			local occupied = ZoneTrackerModule.isGridOccupied(
 				player, coord.x, coord.z,
 				{
 					excludeZoneTypes    = OverlapExclusions,
-					excludeOccupantType = "building",
+					excludeOccupantType = OccupantTypeExclusions,
 				}
 			)
 			if not occupied then
 				table.insert(filteredGridList, coord)
 			else
-				debugPrint(string.format("Excluding grid (%d, %d) – blocked by non-crossable occupant.", coord.x, coord.z))
+				debugPrint(string.format("Excluding grid (%d, %d) - blocked by non-crossable occupant.", coord.x, coord.z))
 			end
 		end
 
@@ -676,7 +792,7 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 					player, coord.x, coord.z,
 					{
 						excludeZoneTypes    = OverlapExclusions,
-						excludeOccupantType = "building",
+						excludeOccupantType = OccupantTypeExclusions,
 					}
 					) then
 					cIsValid = false
@@ -709,7 +825,10 @@ function ZoneValidationModule.validateZone(player, mode, gridList)
 			for _, coord in ipairs(component) do
 				if ZoneTrackerModule.isGridOccupied(
 					player, coord.x, coord.z,
-					{ excludeZoneTypes = OverlapExclusions }
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
 					) then
 					cIsValid = false
 					debugPrint(string.format("Grid (%d, %d) is occupied by a non-road zone. Excluding component.", coord.x, coord.z))
@@ -781,6 +900,11 @@ end
 function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 	debugPrint("Validating single grid for player:", player and player.Name or "nil", "Mode:", mode)
 
+	local OccupantTypeExclusions = {
+		power = true,
+		water = true,
+	}
+
 	if not isValidPlayer(player) then
 		warn("validateSingleGrid: Invalid player provided.")
 		pushLangNotification(player, "Cant overlap zones")
@@ -790,6 +914,12 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 		warn("validateSingleGrid: Invalid grid position.")
 		pushLangNotification(player, "Cant overlap zones")
 		return false, "Invalid grid position."
+	end
+
+	local isRoadMode = RoadTypes[mode] == true
+	if classifySupportAtGrid(player, gridPosition.x, gridPosition.z) == "Water" and not isRoadMode then
+		pushLangNotification(player, "Cant build on water")
+		return false, "Cannot place that on water."
 	end
 
 	if IgnoreValidation[mode] then
@@ -811,7 +941,10 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 
 		if ZoneTrackerModule.isGridOccupied(
 			player, gridPosition.x, gridPosition.z,
-			{ excludeZoneTypes = exclusions }
+			{
+				excludeZoneTypes    = exclusions,
+				excludeOccupantType = OccupantTypeExclusions,
+			}
 			) then
 			pushLangNotification(player, "Cant build on unique buildings")
 			return false, ("You cannot place %s on top of existing zones."):format(mode)
@@ -837,7 +970,7 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 			player, gridPosition.x, gridPosition.z,
 			{
 				excludeZoneTypes    = exclusions,
-				excludeOccupantType = "building",
+				excludeOccupantType = OccupantTypeExclusions,
 			}
 		)
 		if blocked then
@@ -848,7 +981,10 @@ function ZoneValidationModule.validateSingleGrid(player, mode, gridPosition)
 	end
 
 	-- Default
-	if ZoneTrackerModule.isGridOccupied(player, gridPosition.x, gridPosition.z) then
+	if ZoneTrackerModule.isGridOccupied(
+		player, gridPosition.x, gridPosition.z,
+		{ excludeOccupantType = OccupantTypeExclusions }
+	) then
 		warn(string.format("validateSingleGrid: Grid position (%d, %d) is already occupied.", gridPosition.x, gridPosition.z))
 		pushLangNotification(player, "Cant overlap zones")
 		return false, "Selected grid is already occupied."
@@ -910,6 +1046,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 			return false, "Required infrastructure is not nearby."
 		end
 	end
+	if not RoadTypes[mode] then
+		local hasWater = gridListHasWater(player, gridList)
+		if hasWater then
+			pushLangNotification(player, "Cant build on water")
+			return false, "Cannot place non-road zones on water."
+		end
+	end
 
 	return withPlotLock(player, function()
 		local zoneIdsCommitted = {}
@@ -923,6 +1066,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 		OverlapExclusions["WaterPipe"]   = true
 		OverlapExclusions["PowerLines"]  = true
 		OverlapExclusions["MetroTunnel"] = true
+		local OccupantTypeExclusions = {
+			power = true,
+			water = true,
+		}
 
 		-- Utilities: commit as-is
 		if mode == "WaterPipe" or mode == "PowerLines" or mode == "MetroTunnel" then
@@ -951,7 +1098,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 			for zt,_ in pairs(BuildZoneTypes) do exclusions[zt] = true end
 
 			for _, c in ipairs(gridList) do
-				if ZoneTrackerModule.isGridOccupied(player, c.x, c.z, { excludeZoneTypes = exclusions }) then
+				if ZoneTrackerModule.isGridOccupied(
+					player, c.x, c.z,
+					{
+						excludeZoneTypes    = exclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
+				) then
 					pushLangNotification(player, "Cant build on unique buildings")
 					return false, ("You cannot place %s on top of existing zones."):format(mode)
 				end
@@ -976,9 +1129,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 
 			local filtered = {}
 			for _, c in ipairs(gridList) do
+				-- Keep building occupants in the check so overlay/IgnoreValidation zones remain blocking.
 				local blocked = ZoneTrackerModule.isGridOccupied(
 					player, c.x, c.z,
-					{ excludeZoneTypes = OverlapExclusions, excludeOccupantType = "building" }
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
 				)
 				if not blocked then table.insert(filtered, c) end
 			end
@@ -998,7 +1155,10 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 				for _, c in ipairs(comp) do
 					local blocked = ZoneTrackerModule.isGridOccupied(
 						player, c.x, c.z,
-						{ excludeZoneTypes = OverlapExclusions, excludeOccupantType = "building" }
+						{
+							excludeZoneTypes    = OverlapExclusions,
+							excludeOccupantType = OccupantTypeExclusions,
+						}
 					)
 					if blocked then
 						pushLangNotification(player, "Cant build on roads")
@@ -1029,7 +1189,13 @@ function ZoneValidationModule.tryAddZoneAtomic(player, mode, gridList, options)
 			-- ensure cells not occupied by non-excluded things
 			local compOk = true
 			for _, c in ipairs(comp) do
-				if ZoneTrackerModule.isGridOccupied(player, c.x, c.z, { excludeZoneTypes = OverlapExclusions }) then
+				if ZoneTrackerModule.isGridOccupied(
+					player, c.x, c.z,
+					{
+						excludeZoneTypes    = OverlapExclusions,
+						excludeOccupantType = OccupantTypeExclusions,
+					}
+				) then
 					compOk = false; break
 				end
 			end

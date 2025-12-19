@@ -15,7 +15,42 @@ local ZoneTrackerModule = require(ZoneManager:WaitForChild("ZoneTracker"))
 
 local GRID_SIZE = GridConfig.GRID_SIZE or 1
 
-local _removedByZone : { [string]: { [string]: { [number]: table } } } = {}
+-- Track removed objects per player/session to avoid cross-player leakage
+-- Shape: _removedByOwner[ownerKey][zoneId][objectType] = { records }
+local _removedByOwner : { [string]: { [string]: { [string]: { [number]: table } } } } = {}
+
+local function _ownerKey(player: Player?, zoneId: string?)
+	if player and player.UserId then
+		return tostring(player.UserId)
+	end
+	if type(zoneId) == "string" then
+		-- Common zone id patterns: "Zone_<uid>_<n>", "RoadZone_<uid>_<n>", "PowerLinesZone_<uid>_<n>"
+		local m = zoneId:match("_(%d+)_")
+		if not m then
+			m = zoneId:match("(%d+)")
+		end
+		if m then
+			return m
+		end
+	end
+	return "__global"
+end
+
+local function _ensureOwnerBucket(player: Player?, zoneId: string?)
+	local key = _ownerKey(player, zoneId)
+	_removedByOwner[key] = _removedByOwner[key] or {}
+	return _removedByOwner[key], key
+end
+
+local function _sourceZoneIsAlive(player: Player?, zoneId: string?)
+	if type(zoneId) ~= "string" then
+		return true
+	end
+	if ZoneTrackerModule.isZoneTombstoned and ZoneTrackerModule.isZoneTombstoned(player, zoneId) then
+		return false
+	end
+	return ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
+end
 
 local function getPlayerPlot(player: Player): Instance?
 	if not player then return nil end
@@ -222,7 +257,7 @@ local function applyOccupancy(player: Player, record: table)
 	end
 end
 
-function LayerManager.storeRemovedObject(objectType: string, zoneId: string, data: table)
+function LayerManager.storeRemovedObject(objectType: string, zoneId: string, data: table, player: Player?)
 	if type(objectType) ~= "string" or type(zoneId) ~= "string" then
 		warn("[LayerManager] storeRemovedObject requires objectType and zoneId strings")
 		return
@@ -253,8 +288,10 @@ function LayerManager.storeRemovedObject(objectType: string, zoneId: string, dat
 		record.footprintDepth = record.footprintDepth or depth
 	end
 
-	_removedByZone[zoneId] = _removedByZone[zoneId] or {}
-	local byType = _removedByZone[zoneId]
+	local ownerBucket = _ensureOwnerBucket(player, zoneId)
+
+	ownerBucket[zoneId] = ownerBucket[zoneId] or {}
+	local byType = ownerBucket[zoneId]
 	byType[objectType] = byType[objectType] or {}
 	table.insert(byType[objectType], record)
 end
@@ -264,7 +301,13 @@ function LayerManager.restoreRemovedObjects(player: Player, zoneId: string, obje
 		return 0
 	end
 
-	local zoneBucket = _removedByZone[zoneId]
+	local ownerKey = _ownerKey(player, zoneId)
+	local ownerBucket = _removedByOwner[ownerKey]
+	if not ownerBucket then
+		return 0
+	end
+
+	local zoneBucket = ownerBucket[zoneId]
 	if not zoneBucket then
 		return 0
 	end
@@ -277,6 +320,18 @@ function LayerManager.restoreRemovedObjects(player: Player, zoneId: string, obje
 	for _, record in ipairs(items) do
 		local clone = record.instanceClone
 		if clone and clone.Parent == nil then
+			local sourceZoneId = record.zoneId
+			if not sourceZoneId and clone.GetAttribute then
+				local attr = clone:GetAttribute("ZoneId")
+				if attr then
+					sourceZoneId = tostring(attr)
+				end
+			end
+			if not _sourceZoneIsAlive(player, sourceZoneId) then
+				clone:Destroy()
+				continue
+			end
+
 			local parent = resolveParent(player, containerName, record)
 			if parent then
 				clone.Parent = parent
@@ -293,15 +348,31 @@ function LayerManager.restoreRemovedObjects(player: Player, zoneId: string, obje
 
 	zoneBucket[objectType] = nil
 	if not next(zoneBucket) then
-		_removedByZone[zoneId] = nil
+		ownerBucket[zoneId] = nil
+	end
+	if not next(ownerBucket) then
+		_removedByOwner[ownerKey] = nil
 	end
 
 	return restored
 end
 
-function LayerManager.clearZone(zoneId: string)
+function LayerManager.clearZone(zoneId: string, player: Player?)
 	if type(zoneId) ~= "string" then return end
-	_removedByZone[zoneId] = nil
+	local ownerKey = _ownerKey(player, zoneId)
+	local ownerBucket = _removedByOwner[ownerKey]
+	if not ownerBucket then return end
+
+	ownerBucket[zoneId] = nil
+	if not next(ownerBucket) then
+		_removedByOwner[ownerKey] = nil
+	end
+end
+
+-- Clear all cached removals for a player (used on reload/cleanup)
+function LayerManager.clearPlayer(player: Player)
+	if not player then return end
+	_removedByOwner[tostring(player.UserId)] = nil
 end
 
 return LayerManager

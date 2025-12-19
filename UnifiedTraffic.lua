@@ -30,6 +30,12 @@ local BusSupportUnlocked   = BindableEvents:WaitForChild("BusSupportUnlocked")
 local BusSupportRevoked    = BindableEvents:WaitForChild("BusSupportRevoked")
 local SpawnCarToFarthestEvt = RemoteEvents:FindFirstChild("SpawnCarToFarthest")
 local CameraAttachEvt       = RemoteEvents:FindFirstChild("CameraAttachToCar")
+local TrafficClientDriveEvt = RemoteEvents:FindFirstChild("TrafficClientDrive") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientDriveEvt.Name = "TrafficClientDrive"
+local TrafficClientAckEvt   = RemoteEvents:FindFirstChild("TrafficClientDriveAck") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientAckEvt.Name   = "TrafficClientDriveAck"
+local TrafficClientArrivedEvt = RemoteEvents:FindFirstChild("TrafficClientArrived") or Instance.new("RemoteEvent", RemoteEvents)
+TrafficClientArrivedEvt.Name = "TrafficClientArrived"
 
 -- Save reload gates (optional, but your stack has them)
 local RequestReloadFromCurrentEvt = BindableEvents:FindFirstChild("RequestReloadFromCurrent")
@@ -132,6 +138,56 @@ local MAX_NEAR_ZONE_SINKS       = 16
 --   "OriginToSinks"        -> legacy behavior (SOURCE_COORD -> sinks [+ optional mirror])
 local DISPATCH_MODE = "ZoneToOriginAndBack"
 
+local TrafficTierConfig = {
+	["desktop-high"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC,
+		maxConcurrent    = MAX_CONCURRENT_PER_PLAYER,
+		tokenRate        = TOKEN_BUCKET_RATE,
+		tokenMax         = TOKEN_BUCKET_MAX,
+		maxNearZoneSinks = MAX_NEAR_ZONE_SINKS,
+		dispatchMode     = DISPATCH_MODE,
+	},
+	["desktop-balanced"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.2,
+		maxConcurrent    = math.max(6, math.floor(MAX_CONCURRENT_PER_PLAYER * 0.8 + 0.5)),
+		tokenRate        = TOKEN_BUCKET_RATE * 0.9,
+		tokenMax         = math.max(3, TOKEN_BUCKET_MAX - 1),
+		maxNearZoneSinks = math.max(10, MAX_NEAR_ZONE_SINKS - 4),
+		dispatchMode     = "ZoneToOriginOnly",
+	},
+	["desktop-low"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.35,
+		maxConcurrent    = math.max(4, math.floor(MAX_CONCURRENT_PER_PLAYER * 0.6 + 0.5)),
+		tokenRate        = TOKEN_BUCKET_RATE * 0.7,
+		tokenMax         = math.max(2, TOKEN_BUCKET_MAX - 2),
+		maxNearZoneSinks = math.max(8, MAX_NEAR_ZONE_SINKS - 6),
+		dispatchMode     = "ZoneToOriginOnly",
+	},
+	["mobile-low"] = {
+		spawnInterval    = SPAWN_INTERVAL_SEC * 1.6,
+		maxConcurrent    = 4,
+		tokenRate        = TOKEN_BUCKET_RATE * 0.5,
+		tokenMax         = 2,
+		maxNearZoneSinks = math.max(6, math.floor(MAX_NEAR_ZONE_SINKS * 0.5 + 0.5)),
+		dispatchMode     = "OriginToSinks",
+	},
+}
+
+local function perfTier(player)
+	local t = player and player:GetAttribute("PerfTier")
+	if t == "mobile" then return "mobile-low" end
+	if t == "desktop" then return "desktop-high" end
+	if t == "desktop-high" or t == "desktop-balanced" or t == "desktop-low" or t == "mobile-low" then
+		return t
+	end
+	return "desktop-high"
+end
+
+local function trafficConfigFor(player)
+	local tier = perfTier(player)
+	return TrafficTierConfig[tier] or TrafficTierConfig["desktop-high"]
+end
+
 --======================================================================
 --  STATE
 --======================================================================
@@ -145,11 +201,85 @@ local _busWarnedMissing = false
 local ctxByUserId = {}
 local ensureCtx -- forward declaration
 
+-- forward decl so early callbacks can call before definition
+local fadeOutAndDestroy
+local resolveOriginCoord -- forward
+local coordFromKey = nil -- forward
+
 local variantsWithAmbience = { Default = true, Bus = true }
 local variantsWithSiren    = { Fire = true, Police = true, Health = true }
 local activeAmbienceCount  = 0
 local activeSirenCount     = 0
 local lastHornAt           = 0
+
+local function applyTrafficConfig(ctx, player)
+	if not ctx then return end
+	local cfg = trafficConfigFor(player)
+	-- cache tier string on cfg so we can check changes
+	local tier = perfTier(player)
+	if ctx._tier == tier and ctx.config == cfg then return end
+	ctx._tier = tier
+	ctx.config = cfg
+	-- clamp tokens and live counts to the new caps
+	ctx.tokens = math.min(cfg.tokenMax or TOKEN_BUCKET_MAX, ctx.tokens or 0)
+	if ctx.carCount and cfg.maxConcurrent and ctx.carCount > cfg.maxConcurrent then
+		ctx.carCount = cfg.maxConcurrent
+	end
+end
+
+local function currentDispatchMode(ctx)
+	if ctx and ctx.config and ctx.config.dispatchMode then
+		return ctx.config.dispatchMode
+	end
+	return DISPATCH_MODE
+end
+
+local CLIENT_DRIVE_ENABLED = true  -- flip false to revert to server tweens
+local CLIENT_DRIVE_DEBUG   = false
+local CLIENT_DRIVE_MAX_POINTS = 120 -- gate client-drive on very long paths to limit payload size
+local CLIENT_DRIVE_ALLOWED_TIERS = {
+	["desktop-high"]     = true,
+	["desktop-balanced"] = true,
+}
+local function clientDriveAllowed(player: Player?)
+	if not CLIENT_DRIVE_ENABLED then return false end
+	local tier = perfTier(player)
+	return CLIENT_DRIVE_ALLOWED_TIERS[tier] == true
+end
+
+local function releaseCar(ctx, car)
+	if not ctx or not ctx.cars or not car then return end
+	if ctx.cars[car] then
+		ctx.cars[car] = nil
+		ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
+	end
+end
+
+local function _markClientArrived(car: Model?)
+	if not car then return end
+	local ownerId = tonumber(car:GetAttribute("TrafficOwner"))
+	if not ownerId then return end
+	local ctx = ctxByUserId[ownerId]
+	releaseCar(ctx, car)
+end
+
+TrafficClientAckEvt.OnServerEvent:Connect(function(player, car)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[TrafficClient] ack <- %s car=%s", player and player.Name or "?", car))
+	end
+	if not car or not car:IsA("Model") then return end
+	car:SetAttribute("ClientDriveActive", true)
+	car:SetAttribute("ClientDrivePending", false)
+end)
+
+TrafficClientArrivedEvt.OnServerEvent:Connect(function(player, car)
+	if CLIENT_DRIVE_DEBUG then
+		print(string.format("[TrafficClient] arrived <- %s car=%s", player and player.Name or "?", car))
+	end
+	if not car or not car:IsA("Model") then return end
+	_markClientArrived(car)
+	fadeOutAndDestroy(car, FADE_OUT_TIME)
+end)
 
 local templates = {
 	default = {},
@@ -192,10 +322,11 @@ local INCLUDE_TURNS_AS_STOPS = false
 -- [DRIVE MODE] CONFIG
 --========================
 local DRIVE_RESPAWN_DELAY   = 1.0     -- time between trips
-local DRIVE_MOVE_DIST_STOP  = 6.0     -- studs from start pos (2D)
-local DRIVE_MOVE_SPEED_STOP = 7.0     -- studs/sec (rough walking+)
+local DRIVE_MOVE_DIST_STOP  = 60.0    -- studs from start pos (2D) before we auto-cancel
+local DRIVE_MOVE_SPEED_STOP = 40.0    -- ignore normal walking or being seated in the drive car
 local DRIVE_TOGGLE_DEBOUNCE = 0.5     -- per-toggle server cooldown
-local DRIVE_MOVE_GRACE_SEC  = 0.75    -- grace window after toggling on
+local DRIVE_MOVE_GRACE_SEC  = 1.0     -- grace window after toggling on
+local DRIVE_NEAR_CAR_RADIUS = 45      -- if the player is near/inside a drive car, don't cancel
 local DRIVE_SPAWN_OVERRIDES = { skipTokens = true, skipCarLimit = true }
 
 --======================================================================
@@ -246,9 +377,12 @@ end
 
 -- Token bucket
 local function addTokens(ctx)
+	local cfg = ctx and ctx.config or TrafficTierConfig["desktop-high"]
 	local t = os.clock()
 	local dt = t - (ctx.last or t)
-	ctx.tokens = math.min(TOKEN_BUCKET_MAX, (ctx.tokens or 0) + dt * TOKEN_BUCKET_RATE)
+	local rate = cfg.tokenRate or TOKEN_BUCKET_RATE
+	local max  = cfg.tokenMax  or TOKEN_BUCKET_MAX
+	ctx.tokens = math.min(max, (ctx.tokens or 0) + dt * rate)
 	ctx.last = t
 end
 local function trySpend(ctx, cost)
@@ -271,12 +405,12 @@ local function buildEdgeKeysForPath(gridPath)
 	return edgeKeys
 end
 
-local function computePreIntersectionStops(gridPath)
+local function computePreIntersectionStops(player, gridPath)
 	if not gridPath or #gridPath < 3 then return {}, {} end
 	local preStops, keysByIdx = {}, {}
 	for i = 2, #gridPath - 1 do
 		local c = gridPath[i]
-		local cls = PathingModule.classifyNode(c)
+		local cls = PathingModule.classifyNode(c, player)
 		if cls == "4Way" or cls == "3Way" or (INCLUDE_TURNS_AS_STOPS and cls == "Turn") then
 			local preIdx = i - 1
 			if preIdx >= 1 then
@@ -605,10 +739,18 @@ local function refreshOwnRoadZones(player, ctx)
 	ctx.ownRoadZoneIds = set
 end
 
+local function adjacencyForPlayer(player)
+	if PathingModule.getAdjacencyForOwner then
+		return PathingModule.getAdjacencyForOwner(player) or PathingModule.globalAdjacency
+	end
+	return PathingModule.globalAdjacency
+end
+
 local function nodeOwnedByPlayer(player, key, ctx)
 	if not key then return false end
 	ctx = ctx or ensureCtx(player)
-	local meta = PathingModule.nodeMeta and PathingModule.nodeMeta[key]
+	local metaBucket = PathingModule.getNodeMetaForOwner and PathingModule.getNodeMetaForOwner(player) or nil
+	local meta = metaBucket and metaBucket[key]
 	if not meta then return false end
 	local zid = meta.groupId
 	if not zid then return false end
@@ -616,6 +758,218 @@ local function nodeOwnedByPlayer(player, key, ctx)
 		return ctx.ownRoadZoneIds[zid] == true
 	end
 	return ZoneTrackerModule.getZoneById(player, zid) ~= nil
+end
+
+-- Defensive: rebuild the pathing graph from ZoneTracker if it ever disappears.
+local GRAPH_REBUILD_COOLDOWN_SEC = 5
+
+local function isRoadMode(mode)
+	return mode == "DirtRoad" or mode == "Pavement" or mode == "Highway"
+end
+
+local function playerHasAnyRoads(player)
+	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
+		if isRoadMode(z.mode) and z.gridList and #z.gridList > 0 then
+			return true
+		end
+	end
+	return false
+end
+
+local function orderGridListAsPolyline(gridList)
+	if not gridList or #gridList == 0 then return nil, nil, nil end
+
+	local nodesList, nodesSet = {}, {}
+	local adj, degree = {}, {}
+	local function key(x, z) return tostring(x) .. "_" .. tostring(z) end
+
+	for _, c in ipairs(gridList) do
+		if c and type(c.x) == "number" and type(c.z) == "number" then
+			local k = key(c.x, c.z)
+			if not nodesSet[k] then
+				nodesSet[k] = { x = c.x, z = c.z }
+				nodesList[#nodesList + 1] = k
+				adj[k] = {}
+				degree[k] = 0
+			end
+		end
+	end
+	if #nodesList == 0 then return nil, nil, nil end
+
+	local offsets = { {1,0}, {-1,0}, {0,1}, {0,-1} }
+	for _, k in ipairs(nodesList) do
+		local c = nodesSet[k]
+		for _, o in ipairs(offsets) do
+			local nk = key(c.x + o[1], c.z + o[2])
+			if nodesSet[nk] then
+				adj[k][#adj[k] + 1] = nk
+				degree[k] += 1
+			end
+		end
+	end
+
+	local function bfsFrom(startKey)
+		local q, parent, dist = { startKey }, { [startKey] = false }, { [startKey] = 0 }
+		local head = 1
+		local last = startKey
+		while q[head] do
+			local cur = q[head]; head += 1
+			last = cur
+			for _, nb in ipairs(adj[cur]) do
+				if dist[nb] == nil then
+					parent[nb] = cur
+					dist[nb] = dist[cur] + 1
+					q[#q + 1] = nb
+				end
+			end
+		end
+		return parent, dist, last
+	end
+
+	local function reconstruct(parent, endKey)
+		local path, cur = {}, endKey
+		while cur do
+			path[#path + 1] = cur
+			cur = parent[cur]
+		end
+		for i = 1, math.floor(#path / 2) do
+			path[i], path[#path - i + 1] = path[#path - i + 1], path[i]
+		end
+		return path
+	end
+
+	local function pickEndpoints()
+		local s, e = nil, nil
+		for _, k in ipairs(nodesList) do
+			if degree[k] == 1 then
+				if not s then
+					s = k
+				else
+					e = k
+					return s, e
+				end
+			end
+		end
+		local seed = nodesList[1]
+		local _, _, farA = bfsFrom(seed)
+		local _, _, farB = bfsFrom(farA)
+		if farA ~= farB then
+			return farA, farB
+		end
+		for i = 2, #nodesList do
+			if nodesList[i] ~= seed then
+				return seed, nodesList[i]
+			end
+		end
+		return seed, seed
+	end
+
+	local startKey, endKey = pickEndpoints()
+	if not startKey or not endKey then return nil, nil, nil end
+	local parent = select(1, bfsFrom(startKey))
+	local pathKeys = reconstruct(parent, endKey)
+	if #pathKeys == 0 then return nil, nil, nil end
+
+	local ordered = table.create(#pathKeys)
+	for i = 1, #pathKeys do
+		local c = nodesSet[pathKeys[i]]
+		ordered[i] = { x = c.x, z = c.z }
+	end
+
+	local sc = nodesSet[pathKeys[1]]
+	local ec = nodesSet[pathKeys[#pathKeys]]
+	return ordered, { x = sc.x, z = sc.z }, { x = ec.x, z = ec.z }
+end
+
+local function rebuildPathingGraphFromZoneTracker(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	local now = os.clock()
+	if ctx._graphRebuildInFlight then return false end
+	if ctx._lastGraphRebuildAt and (now - ctx._lastGraphRebuildAt) < GRAPH_REBUILD_COOLDOWN_SEC then
+		return false
+	end
+	if not playerHasAnyRoads(player) then return false end
+
+	ctx._graphRebuildInFlight = true
+	ctx._lastGraphRebuildAt = now
+
+	local ok, err = pcall(function()
+		if PathingModule.resetForPlayer then
+			PathingModule.resetForPlayer(player)
+		end
+		for zoneId, z in pairs(ZoneTrackerModule.getAllZones(player)) do
+			if isRoadMode(z.mode) and type(z.gridList) == "table" and #z.gridList > 0 then
+				local ordered, startCoord, endCoord = orderGridListAsPolyline(z.gridList)
+				if ordered and #ordered > 0 and startCoord and endCoord then
+					PathingModule.registerRoad(zoneId, z.mode, ordered, startCoord, endCoord, player)
+				end
+			end
+		end
+		refreshOwnRoadZones(player, ctx)
+	end)
+
+	ctx._graphRebuildInFlight = false
+	if not ok then
+		warn("[UnifiedTraffic] Pathing rebuild failed: " .. tostring(err))
+		return false
+	end
+
+	warn(string.format("[UnifiedTraffic] Rebuilt pathing graph from ZoneTracker for %s", player and player.Name or "?"))
+	return true
+end
+
+-- Resolve which node acts as the "origin". Prefers SOURCE_COORD; falls back to nearest owned road node.
+function resolveOriginCoord(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	local preferred = SOURCE_COORD
+	local prefKey = PathingModule.nodeKey(preferred)
+	ctx.originAllowUnowned = false
+	if nodeOwnedByPlayer(player, prefKey, ctx) then
+		ctx.originCoord = preferred
+		ctx.originIsFallback = false
+		ctx.warnedFallback = nil
+		return preferred
+	end
+
+	-- Try nearest owned road node as a fallback (large radius to cover big cities)
+	local near = PathingModule.findNearestRoadNode(preferred, 4096, player)
+	if near and nodeOwnedByPlayer(player, near.key or PathingModule.nodeKey(near), ctx) then
+		ctx.originCoord = { x = near.x, z = near.z }
+		ctx.originIsFallback = true
+		ctx.originAllowUnowned = false
+		if not ctx.warnedFallback then
+			warn(string.format("[UnifiedTraffic] Using fallback origin at (%d,%d) because (%d,%d) is not owned.", near.x, near.z, preferred.x, preferred.z))
+			ctx.warnedFallback = true
+		end
+		return ctx.originCoord
+	end
+
+	-- Last resort: if we have ANY road nodes, pick the first even if unowned (avoid hard stall)
+	local anyAdj = adjacencyForPlayer(player)
+	if anyAdj then
+		for k,_ in pairs(anyAdj) do
+			local c = coordFromKey(k, ctx.coordCache or nil)
+			if c then
+				ctx.originCoord = { x = c.x, z = c.z }
+				ctx.originIsFallback = true
+				ctx.originAllowUnowned = true
+				if not ctx.warnedFallback then
+					warn(string.format("[UnifiedTraffic] Using unowned origin fallback at (%d,%d); prefer to rebuild a road at (%d,%d).", c.x, c.z, preferred.x, preferred.z))
+					ctx.warnedFallback = true
+				end
+				return ctx.originCoord
+			end
+		end
+	end
+
+	ctx.originCoord = nil
+	ctx.originIsFallback = false
+	ctx.originAllowUnowned = false
+	return nil
+end
+
+local function originCoordFor(ctx, player)
+	return resolveOriginCoord(player, ctx)
 end
 
 local function coordFromKey(key, cache)
@@ -673,16 +1027,23 @@ local function pathFromOrigin(ctx, coord)
 	return gridPathFromKeys(keys, ctx.coordCache)
 end
 
-local function ensureBfsSnapshot(player, ctx)
-	ctx = ctx or ensureCtx(player)
-	if not ctx then return nil end
-	local adj = PathingModule.globalAdjacency
+local function buildBfsSnapshot(player, ctx)
+	local adj = adjacencyForPlayer(player)
 	if not adj then
 		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
 		return nil
 	end
-	local originKey = PathingModule.nodeKey(SOURCE_COORD)
-	if not (adj[originKey] and nodeOwnedByPlayer(player, originKey, ctx)) then
+	local originCoord = originCoordFor(ctx, player)
+	if not originCoord then
+		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
+		return nil
+	end
+	local originKey = PathingModule.nodeKey(originCoord)
+	if not adj[originKey] then
+		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
+		return nil
+	end
+	if not ctx.originAllowUnowned and not nodeOwnedByPlayer(player, originKey, ctx) then
 		ctx.bfsOriginKey, ctx.bfsDist, ctx.bfsParent = nil, nil, nil
 		return nil
 	end
@@ -715,12 +1076,28 @@ local function ensureBfsSnapshot(player, ctx)
 	return dist
 end
 
+local function ensureBfsSnapshot(player, ctx)
+	ctx = ctx or ensureCtx(player)
+	if not ctx then return nil end
+
+	local dist = buildBfsSnapshot(player, ctx)
+	if dist then return dist end
+
+	if rebuildPathingGraphFromZoneTracker(player, ctx) then
+		return buildBfsSnapshot(player, ctx)
+	end
+
+	return nil
+end
+
 local function bfsPathOwned(player, ctx, startCoord, endCoord)
 	ctx = ctx or ensureCtx(player)
-	local originKey = PathingModule.nodeKey(SOURCE_COORD)
+	local originCoord = originCoordFor(ctx, player)
+	if not originCoord then return nil end
+	local originKey = PathingModule.nodeKey(originCoord)
 	local startKey = PathingModule.nodeKey(startCoord)
 	local endKey   = PathingModule.nodeKey(endCoord)
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	if ctx and ctx.bfsOriginKey == originKey and ctx.bfsDist then
 		if startKey == originKey then
 			local path = pathFromOrigin(ctx, endCoord)
@@ -785,7 +1162,7 @@ end
 
 local function pathIsValid(player, path)
 	if not path or #path < 2 then return false end
-	local adj = PathingModule.globalAdjacency
+	local adj = adjacencyForPlayer(player)
 	local ctx = ensureCtx(player)
 	if not adj then return false end
 	for i = 1, #path do
@@ -801,14 +1178,22 @@ end
 local function bfsToTarget(player, targetCoord)
 	if not targetCoord then return nil end
 	local ctx = ensureCtx(player)
-	return bfsPathOwned(player, ctx, SOURCE_COORD, targetCoord)
+	local origin = originCoordFor(ctx, player)
+	if not origin then return nil end
+	return bfsPathOwned(player, ctx, origin, targetCoord)
 end
 
 local function originLiveForPlayer(player, ctx)
 	ctx = ctx or ensureCtx(player)
-	local key = PathingModule.nodeKey(SOURCE_COORD)
-	local adj = PathingModule.globalAdjacency
-	return adj and adj[key] ~= nil and nodeOwnedByPlayer(player, key, ctx)
+	local origin = originCoordFor(ctx, player)
+	if not origin then return false end
+	local key = PathingModule.nodeKey(origin)
+	local adj = adjacencyForPlayer(player)
+	if not (adj and adj[key]) then return false end
+	if ctx.originAllowUnowned then
+		return true
+	end
+	return nodeOwnedByPlayer(player, key, ctx)
 end
 
 local function zoneCenterCoord(z)
@@ -826,16 +1211,18 @@ end
 
 local function collectNearZoneSinks(player, ctx)
 	ctx = ctx or ensureCtx(player)
+	applyTrafficConfig(ctx, player)
 	local sinks, count = {}, 0
+	local cap = (ctx.config and ctx.config.maxNearZoneSinks) or MAX_NEAR_ZONE_SINKS
 	for _, z in pairs(ZoneTrackerModule.getAllZones(player)) do
 		if z.mode ~= "DirtRoad" and z.mode ~= "Pavement" and z.mode ~= "Highway" then
 			local center = zoneCenterCoord(z)
 			if center then
-				local near = PathingModule.findNearestRoadNode(center, NEAR_ZONE_MAX_DIST_CELLS)
+				local near = PathingModule.findNearestRoadNode(center, NEAR_ZONE_MAX_DIST_CELLS, player)
 				if near and nodeOwnedByPlayer(player, near.key, ctx) then
 					sinks[#sinks+1] = { x = near.x, z = near.z }
 					count += 1
-					if count >= MAX_NEAR_ZONE_SINKS then break end
+					if count >= cap then break end
 				end
 			end
 		end
@@ -912,7 +1299,7 @@ end
 --======================================================================
 --  SPAWN / MOVE / CLEANUP
 --======================================================================
-local function fadeOutAndDestroy(model, t)
+fadeOutAndDestroy = function(model, t)
 	if not model then return end
 	local info  = TweenInfo.new(t, Enum.EasingStyle.Linear)
 	local tweens = {}
@@ -939,13 +1326,15 @@ end
 local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel, spawnConfig)
 	if ctx.suspended then return end
 	if not worldPath or #worldPath < 2 then return end
+	applyTrafficConfig(ctx, player)
+	local cfg = ctx.config or trafficConfigFor(player)
 	local skipTokens    = spawnConfig and spawnConfig.skipTokens
 	local skipCarLimit  = spawnConfig and spawnConfig.skipCarLimit
 	if not skipTokens and not trySpend(ctx, 1.0) then return end
 
 	if not skipCarLimit then
 		local live = ctx.carCount or 0
-		if live >= MAX_CONCURRENT_PER_PLAYER then return end
+		if live >= (cfg.maxConcurrent or MAX_CONCURRENT_PER_PLAYER) then return end
 	end
 
 	local template, chosenVariant = pickTemplateForPlayer(player)
@@ -965,9 +1354,15 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel,
 
 	ctx.cars[car] = true
 	ctx.carCount = (ctx.carCount or 0) + 1
+	-- If something else deletes the model (Debris, plot unload), drop the book-keeping so spawns can resume.
+	car.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			releaseCar(ctx, car)
+		end
+	end)
 	Debris:AddItem(car, CAR_LIFETIME_SEC)
 
-	local preStopIndices, preStopKeys = computePreIntersectionStops(gridPath)
+	local preStopIndices, preStopKeys = computePreIntersectionStops(player, gridPath)
 	local edgeKeyByIndex = buildEdgeKeysForPath(gridPath)
 
 	local opts = {
@@ -979,13 +1374,46 @@ local function spawnCarAlongPath(player, ctx, gridPath, worldPath, variantLabel,
 	}
 
 	local pathId = newPathId(player.UserId)
-	CarMovement.moveCarAlongPath(car, worldPath, opts, function(arrived)
-		if ctx.cars[car] then
-			ctx.cars[car] = nil
-			ctx.carCount = math.max(0, (ctx.carCount or 1) - 1)
-		end
+	local function onArrive(arrived)
+		releaseCar(ctx, arrived or car)
 		fadeOutAndDestroy(arrived, FADE_OUT_TIME)
-	end, pathId)
+	end
+
+	local clientDrove = false
+	if player and clientDriveAllowed(player) and #worldPath <= CLIENT_DRIVE_MAX_POINTS then
+		car:SetAttribute("ClientDrivePending", true)
+		car:SetAttribute("ClientDriveActive", false)
+		local okOwn = pcall(function()
+			if car.PrimaryPart then car.PrimaryPart:SetNetworkOwner(player) end
+		end)
+		if okOwn then
+			if CLIENT_DRIVE_DEBUG then
+				print(string.format("[TrafficClient] send -> %s car=%s pts=%d variant=%s", player.Name, tostring(car), #worldPath, tostring(variantLabel)))
+			end
+			task.defer(function()
+				if car and car.Parent then
+					TrafficClientDriveEvt:FireClient(player, car, worldPath, opts, pathId)
+				end
+			end)
+			clientDrove = true
+			-- Fallback if client never acks
+			task.delay(1.0, function()
+				if not car or not car.Parent then return end
+				if car:GetAttribute("ClientDriveActive") == true then return end
+				if CLIENT_DRIVE_DEBUG then
+					print(string.format("[TrafficClient] fallback server drive; no ack car=%s owner=%s", tostring(car), player.Name))
+				end
+				car:SetAttribute("ClientDrivePending", false)
+				car:SetAttribute("ClientDriveActive", false)
+				pcall(function() if car.PrimaryPart then car.PrimaryPart:SetNetworkOwner(nil) end end)
+				CarMovement.moveCarAlongPath(car, worldPath, opts, onArrive, pathId)
+			end)
+		end
+	end
+
+	if not clientDrove then
+		CarMovement.moveCarAlongPath(car, worldPath, opts, onArrive, pathId)
+	end
 	return car
 end
 
@@ -995,11 +1423,13 @@ local function spawnOnceOriginToSinksMode(player, ctx)
 	if not ctx.sinks or #ctx.sinks == 0 then return end
 	ensureBfsSnapshot(player, ctx)
 
+	local origin = originCoordFor(ctx, player)
+	if not origin then return end
 	local sink = ctx.sinks[math.random(1, #ctx.sinks)]
-	local gridPath = bfsPathOwned(player, ctx, SOURCE_COORD, sink)
+	local gridPath = bfsPathOwned(player, ctx, origin, sink)
 	if (not gridPath or #gridPath < MIN_PATH_CELLS) and #ctx.sinks > 1 then
 		sink = ctx.sinks[math.random(1, #ctx.sinks)]
-		gridPath = bfsPathOwned(player, ctx, SOURCE_COORD, sink)
+		gridPath = bfsPathOwned(player, ctx, origin, sink)
 	end
 	if not gridPath or #gridPath < MIN_PATH_CELLS then return end
 
@@ -1022,18 +1452,21 @@ local function spawnOnceZoneToOriginMode(player, ctx)
 	if not ctx.zoneSources or #ctx.zoneSources == 0 then return end
 	ensureBfsSnapshot(player, ctx)
 
+	local origin = originCoordFor(ctx, player)
+	if not origin then return end
 	local sourceCoord = ctx.zoneSources[math.random(1, #ctx.zoneSources)]
-	local gridPath = bfsPathOwned(player, ctx, sourceCoord, SOURCE_COORD)
+	local gridPath = bfsPathOwned(player, ctx, sourceCoord, origin)
 	if (not gridPath or #gridPath < MIN_PATH_CELLS) and #ctx.zoneSources > 1 then
 		sourceCoord = ctx.zoneSources[math.random(1, #ctx.zoneSources)]
-		gridPath = bfsPathOwned(player, ctx, sourceCoord, SOURCE_COORD)
+		gridPath = bfsPathOwned(player, ctx, sourceCoord, origin)
 	end
 	if not gridPath or #gridPath < MIN_PATH_CELLS then return end
 
 	local worldPath = worldPathFor(ctx.plot, gridPath)
 	spawnCarAlongPath(player, ctx, gridPath, worldPath, nil)
 
-	if DISPATCH_MODE ~= "ZoneToOriginAndBack" then return end
+	local mode = currentDispatchMode(ctx)
+	if mode ~= "ZoneToOriginAndBack" then return end
 	local revGrid = reversedGridPath(gridPath)
 	if not revGrid or #revGrid < MIN_PATH_CELLS then return end
 	local revWorld = worldPathFor(ctx.plot, revGrid)
@@ -1042,7 +1475,8 @@ local function spawnOnceZoneToOriginMode(player, ctx)
 end
 
 local function spawnOnce(player, ctx)
-	if DISPATCH_MODE == "OriginToSinks" then
+	local mode = currentDispatchMode(ctx or ensureCtx(player))
+	if mode == "OriginToSinks" then
 		return spawnOnceOriginToSinksMode(player, ctx)
 	else
 		return spawnOnceZoneToOriginMode(player, ctx)
@@ -1128,17 +1562,18 @@ local recomputeQueued = {} -- [uid] = true
 function ensureCtx(player)
 	local uid = player.UserId
 	local ctx = ctxByUserId[uid]
+	local cfg = trafficConfigFor(player)
 	if not ctx then
 		ctx = {
 			plot = getPlotForUserId(uid),
 			suspended = false,
-			tokens = TOKEN_BUCKET_MAX * 0.5,
+			tokens = (cfg.tokenMax or TOKEN_BUCKET_MAX) * 0.5,
 			last = os.clock(),
 			cars = {},
 			carCount = 0,
 			sinks = {},
 			zoneSources = {},
-			nextSpawnAt = os.clock() + math.random() * RANDOM_JITTER_SEC,
+			nextSpawnAt = os.clock() + (cfg.spawnInterval or SPAWN_INTERVAL_SEC) + math.random() * RANDOM_JITTER_SEC,
 
 			-- [DRIVE MODE] per-player session
 			drive = nil, -- { active=bool, loopTask=thread, startPos=Vector3 }
@@ -1146,6 +1581,9 @@ function ensureCtx(player)
 		}
 		ctxByUserId[uid] = ctx
 	end
+	ctx.config = cfg
+	ctx._tier = perfTier(player)
+	applyTrafficConfig(ctx, player)
 	-- keep a reference to player (for camera reset on stop)
 	ctx.player = player
 	if not ctx.plot or ctx.plot.Parent == nil then
@@ -1157,11 +1595,14 @@ end
 local function recomputeForPlayer(player)
 	local ctx = ensureCtx(player)
 	if ctx.suspended then return end
+	applyTrafficConfig(ctx, player)
 	refreshOwnRoadZones(player, ctx)
+	originCoordFor(ctx, player)
 
 	if originLiveForPlayer(player, ctx) then
 		ensureBfsSnapshot(player, ctx)
-		if DISPATCH_MODE == "OriginToSinks" then
+		local mode = currentDispatchMode(ctx)
+		if mode == "OriginToSinks" then
 			ctx.sinks = computeSinksForPlayer(player, ctx)
 			ctx.zoneSources = {}
 			dprint(("Player %s sinks=%d (origin->sinks mode)"):format(player.Name, #ctx.sinks))
@@ -1177,6 +1618,7 @@ local function recomputeForPlayer(player)
 		ctx.bfsDist = nil
 		ctx.bfsParent = nil
 		ctx.coordCache = nil
+		ctx.originCoord = nil
 	end
 end
 
@@ -1196,6 +1638,7 @@ local function ensureSpawnLoop(player)
 	if ctx.spawnLoop then return end
 	ctx.spawnLoop = task.spawn(function()
 		while Players:GetPlayerByUserId(uid) do
+			applyTrafficConfig(ctx, player)
 			if ctx.suspended then
 				task.wait(0.5)
 			else
@@ -1203,7 +1646,8 @@ local function ensureSpawnLoop(player)
 				local nextAt = ctx.nextSpawnAt or now
 				if now >= nextAt then
 					pcall(function() spawnOnce(player, ctx) end)
-					ctx.nextSpawnAt = os.clock() + SPAWN_INTERVAL_SEC + math.random() * RANDOM_JITTER_SEC
+					local cfg = ctx.config or trafficConfigFor(player)
+					ctx.nextSpawnAt = os.clock() + (cfg.spawnInterval or SPAWN_INTERVAL_SEC) + math.random() * RANDOM_JITTER_SEC
 				else
 					task.wait(math.min(nextAt - now, 0.5))
 				end
@@ -1221,6 +1665,19 @@ local function getHRP(player)
 	return char:FindFirstChild("HumanoidRootPart")
 end
 
+local function nearDriveCar(hrp: BasePart?, driveState)
+	if not (driveState and driveState.cars and hrp) then return false end
+	local pos = hrp.Position
+	for car,_ in pairs(driveState.cars) do
+		if car and car.Parent and car.PrimaryPart then
+			if (car.PrimaryPart.Position - pos).Magnitude <= DRIVE_NEAR_CAR_RADIUS then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 local function movedTooMuch(player, driveState)
 	if not driveState or not driveState.startPos then return false end
 	if driveState.moveGraceUntil and os.clock() < driveState.moveGraceUntil then
@@ -1228,12 +1685,16 @@ local function movedTooMuch(player, driveState)
 	end
 	local hrp = getHRP(player)
 	if not hrp then return false end
-	-- 2D distance (XZ) + linear speed check
+	if nearDriveCar(hrp, driveState) then
+		return false
+	end
+	-- 2D distance (XZ) + planar speed check
 	local a = Vector2.new(hrp.Position.X, hrp.Position.Z)
 	local b = Vector2.new(driveState.startPos.X, driveState.startPos.Z)
 	local dist = (a - b).Magnitude
-	local speed = hrp.AssemblyLinearVelocity.Magnitude
-	return (dist >= DRIVE_MOVE_DIST_STOP) or (speed >= DRIVE_MOVE_SPEED_STOP)
+	local vel = hrp.AssemblyLinearVelocity
+	local planarSpeed = Vector2.new(vel.X, vel.Z).Magnitude
+	return (dist >= DRIVE_MOVE_DIST_STOP) or (planarSpeed >= DRIVE_MOVE_SPEED_STOP)
 end
 
 local function trackDriveCar(driveState, car)
@@ -1521,5 +1982,6 @@ task.spawn(function()
 	end
 end)
 
+local defaultDispatchMode = (TrafficTierConfig["desktop-high"] and TrafficTierConfig["desktop-high"].dispatchMode) or DISPATCH_MODE
 print(("[UnifiedTraffic] online - DispatchMode=%s; origin=(%d,%d) - Bus/Service variants (Fire/Police/Health/Trash) where supported")
-	:format(DISPATCH_MODE, SOURCE_COORD.x, SOURCE_COORD.z))
+	:format(defaultDispatchMode, SOURCE_COORD.x, SOURCE_COORD.z))

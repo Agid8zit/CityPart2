@@ -12,12 +12,17 @@ local roadTypes = {
 	-- Add any other valid road modes here
 }
 
+local VERBOSE_LOG = false
+local function log(...)
+	if VERBOSE_LOG then print(...) end
+end
+
 -- Listen for ZoneCreated event
 local zoneCreatedEvent = BindableEvents:WaitForChild("ZoneCreated")
 zoneCreatedEvent.Event:Connect(function(player, zoneId, mode, selectedCoords)
 	-- Only handle recognized road modes
 	if roadTypes[mode] then
-		print(string.format(
+		log(string.format(
 			"RoadGeneratorScript: Generating road for Zone '%s' of type '%s'",
 			zoneId, mode
 			))
@@ -27,7 +32,7 @@ end)
 
 -- Listen for ZoneReCreated event (rebuild roads)
 local zoneReCreatedEvent = BindableEvents:WaitForChild("ZoneReCreated")
-zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved, rotation)
+zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved, rotation, isReload)
 	if not roadTypes[mode] then return end
 
 	--print(string.format("RoadGeneratorScript: Re-creating road zone '%s' (%s) for player '%s'",zoneId, mode, player.Name))
@@ -42,12 +47,12 @@ zoneReCreatedEvent.Event:Connect(function(player, zoneId, mode, gridList, saved,
 		(typeof(saved) == "table") and (#saved > 0) and (typeof(saved[1]) == "table") and (saved[1].gridX ~= nil)
 
 	if isSnapshot and typeof(RoadGeneratorModule.populateZoneFromSave) == "function" then
-		return RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation)
+		return RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation, isReload)
 	elseif isPlacedList then
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true, isReload)
 	else
 		-- Treat as no predefined content (procedural rebuild)
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true, isReload)
 	end
 end)
 
@@ -61,4 +66,4 @@ zoneRemovedEvent.Event:Connect(function(player, zoneId, mode)
 	end
 end)
 
-print("RoadGeneratorScript loaded.")
+log("RoadGeneratorScript loaded.")

@@ -590,10 +590,20 @@ local function ensureSingletonNode()
 	return _singletonNode
 end
 
+local function coalesceWindowFor(langKey: string?): number
+	if not langKey then return COALESCE_WINDOW_SECONDS end
+	local override = COALESCE_WINDOW_BY_KEY[langKey]
+	if type(override) == "number" then
+		return override
+	end
+	return COALESCE_WINDOW_SECONDS
+end
+
 -- ===== spawn/update toast =====
-local function showOrReplaceToast(langKey: string, explicitText: string?, duration: number?, forceDisplay: boolean?)
+local function showOrReplaceToast(langKey: string, explicitText: string?, duration: number?, forceDisplay: boolean?, forceText: boolean?)
 	-- Coalesce identical keys within a short window to avoid spam (per-key overrides)
 	local window = coalesceWindowFor(langKey)
+	forceDisplay = forceDisplay or forceText
 	if not forceDisplay and window > 0 then
 		local now = time()
 		local last = _lastKeyAt[langKey]
@@ -613,9 +623,11 @@ local function showOrReplaceToast(langKey: string, explicitText: string?, durati
 		label.Visible = true
 		label:SetAttribute("LangKey", langKey or "Unknown")
 
-		-- Priority: localization -> explicit server text -> key
+		-- Priority: (optional) forced server text -> localization -> explicit server text -> key
 		local textToShow
-		if PREFER_LOCALIZATION then
+		if forceText and explicitText and explicitText ~= "" then
+			textToShow = explicitText
+		elseif PREFER_LOCALIZATION then
 			textToShow = resolveNow(langKey)
 			if (not textToShow or textToShow == "") and explicitText and explicitText ~= "" then
 				textToShow = explicitText
@@ -703,9 +715,10 @@ function Notification.BindRemote(ev: RemoteEvent)
 				channel = channel or DEFAULT_CHANNEL,
 				key = key,
 				opts = {
-					text = (forceText and txt or nil),
+					text = txt,
 					duration = dur,
-					force = forceDisplay
+					force = forceDisplay or forceText, -- forceText also skips coalesce
+					forceText = forceText,
 				},
 			}
 			return
@@ -715,7 +728,7 @@ function Notification.BindRemote(ev: RemoteEvent)
 		Notification.ShowSingleton(
 			channel or DEFAULT_CHANNEL,
 			key,
-			{ text = (forceText and txt or nil), duration = dur, force = forceDisplay }
+			{ text = txt, duration = dur, force = forceDisplay or forceText, forceText = forceText }
 		)
 	end)
 end
@@ -727,7 +740,8 @@ function Notification.AutoBindAllKnownRemotes()
 		warn("[Notifications] Missing ReplicatedStorage/Events/RemoteEvents")
 		return
 	end
-	local names = { "Notify", "NotificationStack", "PushNotification", "Toast", "PushToast" }
+	-- Include legacy/alternate event names that servers may still fire (e.g., ZoneRequirementsCheck uses NotifyPlayer)
+	local names = { "Notify", "NotificationStack", "PushNotification", "Toast", "PushToast", "NotifyPlayer" }
 	for _, name in ipairs(names) do
 		local candidate = reFolder:FindFirstChild(name)
 		if typeof(candidate) == "Instance" and candidate:IsA("RemoteEvent") then
@@ -859,18 +873,19 @@ function Notification.Show(langKey: string, opts)
 	local txt = opts and opts.text or nil
 	local dur = opts and opts.duration or nil
 	local force = opts and opts.force or false
+	local forceText = opts and opts.forceText or false
 
 	if not isReadyNow() then
 		_pending = {
 			channel = DEFAULT_CHANNEL,
 			key = langKey,
-			opts = { text = txt, duration = dur, force = force },
+			opts = { text = txt, duration = dur, force = force, forceText = forceText },
 		}
 		return
 	end
 
 	-- Route through ShowSingleton so we always reuse an existing toast for channel
-	return Notification.ShowSingleton(DEFAULT_CHANNEL, langKey, { text = txt, duration = dur, force = force })
+	return Notification.ShowSingleton(DEFAULT_CHANNEL, langKey, { text = txt, duration = dur, force = force, forceText = forceText })
 end
 
 local function findSingleton(channel: string)
@@ -880,14 +895,7 @@ local function findSingleton(channel: string)
 	return _findExistingToastForChannel(channel)
 end
 
-local function coalesceWindowFor(langKey: string?): number
-	if not langKey then return COALESCE_WINDOW_SECONDS end
-	local override = COALESCE_WINDOW_BY_KEY[langKey]
-	if type(override) == "number" then
-		return override
-	end
-	return COALESCE_WINDOW_SECONDS
-end
+
 
 -- implement hide + optional channel param
 function hideAndClearSingleton(channel: string?)
@@ -922,12 +930,13 @@ function Notification.ShowSingleton(channel: string, langKey: string, opts)
 	local txt = opts and opts.text or nil
 	local dur = opts and opts.duration or nil
 	local force = opts and opts.force or false
+	local forceText = opts and opts.forceText or false
 
 	if not isReadyNow() then
 		_pending = {
 			channel = channel,
 			key = langKey,
-			opts = { text = txt, duration = dur, force = force },
+			opts = { text = txt, duration = dur, force = force, forceText = forceText },
 		}
 		return
 	end
@@ -940,7 +949,7 @@ function Notification.ShowSingleton(channel: string, langKey: string, opts)
 		_singletonNode = node
 	end
 
-	return showOrReplaceToast(langKey, txt, dur, force)
+	return showOrReplaceToast(langKey, txt, dur, force, forceText)
 end
 
 function Notification.ClearChannel(channel: string)

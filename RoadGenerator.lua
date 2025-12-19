@@ -43,11 +43,16 @@ local LayerManagerModule = require(Build.LayerManager)
 -- Debug toggles
 local DEBUG_LOGS          = false
 local DEBUG_ROAD_ROTATION = false
+local DEBUG_SUPPORT_RAYCAST = true  -- set true to print what each support probe hits
+
+local _recalcIntersectionsInProgress = {} -- [uid] = true
+local _recalcIntersectionsPending    = {} -- [uid] = true
 
 local GRID_SIZE      = GridConfig.GRID_SIZE
 local BUILD_INTERVAL = 0.1
 local Y_OFFSET       = 0.625
 local SEARCH_RADIUS  = 4 
+local INTERSECTION_RESCAN_RADIUS = 8  -- how far around a newly placed cell we re-evaluate intersections
 
 local function debugPrint(...)
 	if DEBUG_LOGS then
@@ -125,6 +130,8 @@ local function getGlobalBoundsForPlot(plot)
 		for _, zone in ipairs(unlocks:GetChildren()) do
 			for _, seg in ipairs(zone:GetChildren()) do
 				if seg:IsA("BasePart") and seg.Name:match("^Segment%d+$") then
+					-- Ensure terrain segments can be detected by raycasts
+					if seg.CanQuery == false then seg.CanQuery = true end
 					table.insert(terrains, seg)
 				end
 			end
@@ -189,7 +196,7 @@ local function removeOverlappingObjects(player, zoneId, roadPos, gridCoord)
 									occupantId     = occId,
 									mode           = mode,
 									zoneId         = origZoneId,
-								})
+								}, player)
 
 								-- Clear occupancy & quadtree for the entire footprint
 								for x = gx, gx + w - 1 do
@@ -235,7 +242,7 @@ local function removeOverlappingObjects(player, zoneId, roadPos, gridCoord)
 						instanceClone  = item:Clone(),
 						originalParent = item.Parent,
 						cframe         = itemCF,
-					})
+					}, player)
 					item:Destroy()
 				end
 			end
@@ -291,9 +298,29 @@ local function logPartBelow(part : BasePart)
 end
 
 local function getSupportTypeForCell(part : BasePart)
-	-- Same ray spec you already use
-	local origin    = part.Position - Vector3.new(0, part.Size.Y*0.5 + 0.05, 0)
-	local direction = Vector3.new(0, -100, 0)
+	local function dbg(...)
+		if DEBUG_SUPPORT_RAYCAST then
+			print("[RoadSupport]", ...)
+		end
+	end
+	local function classify(inst: Instance, mat: Enum.Material?)
+		if inst:IsA("MeshPart") or inst:IsA("Part") then
+			if (inst.Name:lower():find("cliff") or (inst.Parent and inst.Parent.Name:lower():find("cliff"))) then
+				return "Cliff"
+			end
+			if mat == Enum.Material.Water then
+				return "Water"
+			end
+			return "Land"
+		end
+		if mat == Enum.Material.Water then
+			return "Water"
+		end
+		return "Land"
+	end
+	-- Cast from above the cell downward (robust for shallow water/meshes)
+	local origin    = part.Position + Vector3.new(0, 50, 0)
+	local direction = Vector3.new(0, -500, 0)
 
 	local p = RaycastParams.new()
 	p.FilterDescendantsInstances = { part }
@@ -301,27 +328,85 @@ local function getSupportTypeForCell(part : BasePart)
 	p.IgnoreWater = false
 
 	local hit = workspace:Raycast(origin, direction, p)
-	if not hit then      return "Void" end
+	if not hit then
+		dbg("void", string.format("origin=(%.1f,%.1f,%.1f)", origin.X, origin.Y, origin.Z))
+		return "Void"
+	end
 
-	-- Mesh cliffs live in folders called “Cliffs” (adjust as needed)
 	local inst = hit.Instance
-	if inst:IsA("MeshPart") or inst:IsA("Part") then
-		if (inst.Name:lower():find("cliff") or
-			(inst.Parent and inst.Parent.Name:lower():find("cliff"))) then
-			return "Cliff"
+	local mat  = hit.Material
+	local primarySupport = classify(inst, mat)
+	local finalSupport = primarySupport
+
+	-- If we struck water, do a second pass ignoring water to detect solid under shallow water.
+	if primarySupport == "Water" then
+		local p2 = RaycastParams.new()
+		p2.FilterDescendantsInstances = { part }
+		p2.FilterType  = Enum.RaycastFilterType.Exclude
+		p2.IgnoreWater = true
+		local hit2 = workspace:Raycast(origin, direction, p2)
+		if hit2 then
+			local inst2 = hit2.Instance
+			local mat2  = hit2.Material
+			local secondary = classify(inst2, mat2)
+			if secondary ~= "Water" then
+				finalSupport = secondary
+				dbg(
+					primarySupport .. "->" .. secondary,
+					string.format(
+						"hit=%s parent=%s class=%s material=%s pos=(%.1f,%.1f,%.1f) second=%s parent=%s class=%s material=%s pos=(%.1f,%.1f,%.1f)",
+						inst.Name, inst.Parent and inst.Parent.Name or "nil", inst.ClassName, mat and mat.Name or "nil",
+						hit.Position.X, hit.Position.Y, hit.Position.Z,
+						inst2.Name, inst2.Parent and inst2.Parent.Name or "nil", inst2.ClassName, mat2 and mat2.Name or "nil",
+						hit2.Position.X, hit2.Position.Y, hit2.Position.Z
+					)
+				)
+			end
 		end
-		if inst.Material == Enum.Material.Water then
-			return "Water"
-		end
-		return "Land"
 	end
 
-	-- Terrain voxel
-	if hit.Material == Enum.Material.Water then
-		return "Water"
-	else
-		return "Land"
+	-- If still Water/Void, do an overlap check for Segment# parts (e.g. unlock terrain pieces).
+	if finalSupport == "Water" or finalSupport == "Void" then
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Exclude
+		op.FilterDescendantsInstances = { part }
+		local overlaps = workspace:GetPartBoundsInBox(
+			CFrame.new(part.Position),
+			Vector3.new(GRID_SIZE, 200, GRID_SIZE),
+			op
+		)
+		for _, hitPart in ipairs(overlaps) do
+			if hitPart:IsA("BasePart") and hitPart.Name:match("^Segment%d+$") then
+				finalSupport = "Land"
+				dbg(
+					(primarySupport .. "->OverlapLand"),
+					string.format(
+						"overlap hit=%s parent=%s class=%s CanQuery=%s pos=(%.1f,%.1f,%.1f) size=(%.1f,%.1f,%.1f)",
+						hitPart.Name,
+						hitPart.Parent and hitPart.Parent.Name or "nil",
+						hitPart.ClassName,
+						tostring(hitPart.CanQuery),
+						hitPart.Position.X, hitPart.Position.Y, hitPart.Position.Z,
+						hitPart.Size.X, hitPart.Size.Y, hitPart.Size.Z
+					)
+				)
+				break
+			end
+		end
 	end
+
+	dbg(
+		finalSupport,
+		string.format(
+			"hit=%s parent=%s class=%s material=%s pos=(%.1f,%.1f,%.1f)",
+			inst.Name,
+			inst.Parent and inst.Parent.Name or "nil",
+			inst.ClassName,
+			mat and mat.Name or "nil",
+			hit.Position.X, hit.Position.Y, hit.Position.Z
+		)
+	)
+	return finalSupport
 end
 
 --Ohaiyo gozaimasu! Genkideska?
@@ -449,16 +534,78 @@ local function convertGridToWorld(player, gx, gz)
 	return Vector3.new(wx, 1.025, wz)   
 end
 
+-- Bridge-aware resolver for ambiguous saved names
+local function inferBridgeAwareRoadName(player, gx, gz, roadName)
+	local name = roadName or "Road"
+	if name ~= "Road" then
+		return name
+	end
+	if not (player and gx and gz) then
+		return name
+	end
+
+	local probePos = convertGridToWorld(player, gx, gz)
+	local probe = Instance.new("Part")
+	probe.Size = Vector3.new(1, 1, 1)
+	probe.CFrame = CFrame.new(probePos)
+	probe.Anchored = true
+	probe.CanCollide = false
+	probe.Transparency = 1
+	probe.Parent = Workspace
+
+	local support = getSupportTypeForCell(probe)
+	probe:Destroy()
+
+	if support == "Water" or support == "Cliff" or support == "Void" then
+		return "Bridge"
+	end
+	return name
+end
+
 local function _plotAxisDirs(player)
 	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
 	if not plot then
 		return 1, 1
 	end
-	local ax = plot:GetAttribute("GridAxisDirX")
-	local az = plot:GetAttribute("GridAxisDirZ")
+
+	-- Prefer the GridConfig context (mirrors BuildingGenerator axis handling)
+	local ax, az = GridConfig.getAxisDirectionsForPlot(plot)
+
+	-- Fallback to attributes if the context was never seeded for this plot
+	if ax ~= 1 and ax ~= -1 then
+		ax = plot:GetAttribute("GridAxisDirX")
+	end
+	if az ~= 1 and az ~= -1 then
+		az = plot:GetAttribute("GridAxisDirZ")
+	end
+
+	-- Last resort: derive from any terrain instance (matches BuildingGenerator fallback)
+	if (ax ~= -1 and ax ~= 1) or (az ~= -1 and az ~= 1) then
+		local _, terrains = getGlobalBoundsForPlot(plot)
+		for _, inst in ipairs(terrains or {}) do
+			if typeof(inst) == "Instance" then
+				ax, az = GridConfig.getAxisDirectionsForInstance(inst)
+				break
+			end
+		end
+	end
+
+	-- Normalize to either -1 or +1
 	if ax ~= -1 then ax = 1 end
 	if az ~= -1 then az = 1 end
 	return ax, az
+end
+
+-- Axis-aware yaw adjustment: mirror yaw when plot axes are flipped (even plots)
+local function _adjustYawForAxis(yaw, axisDirX, axisDirZ)
+	yaw = norm360(yaw or 0)
+	if axisDirX == -1 then
+		yaw = 180 - yaw
+	end
+	if axisDirZ == -1 then
+		yaw = -yaw
+	end
+	return norm360(yaw)
 end
 
 local function _normalizeLegacyList(entries, axisDir, field)
@@ -486,6 +633,11 @@ local function _normalizeLegacyList(entries, axisDir, field)
 end
 
 local function normalizeLegacyEvenPlotData(player, gridList, saved)
+	-- New-format snapshots already store logical, parity-normalized coords; don't flip them.
+	if type(saved) == "table" and saved.version ~= nil then
+		return
+	end
+
 	local axisDirX, axisDirZ = _plotAxisDirs(player)
 
 	_normalizeLegacyList(gridList, axisDirX, "x")
@@ -685,7 +837,7 @@ function RoadGeneratorModule.generateRoadSegment(
 	local roadClone
 	if actualInstance:IsA("Model") then
 		roadClone = actualInstance:Clone()
-		roadClone.Name = "Road"
+		roadClone.Name = assetName
 
 		if roadClone.PrimaryPart then
 			roadClone:SetPrimaryPartCFrame(
@@ -709,7 +861,7 @@ function RoadGeneratorModule.generateRoadSegment(
 	else
 		-- BasePart
 		roadClone = actualInstance:Clone()
-		roadClone.Name = "Road"
+		roadClone.Name = assetName
 		roadClone.Position    = finalPosition
 		roadClone.Orientation = Vector3.new(0, yawApplied, 0)
 	end
@@ -748,6 +900,7 @@ function RoadGeneratorModule.generateRoadSegment(
 	roadClone:SetAttribute("GridX", gridCoord.x)
 	roadClone:SetAttribute("GridZ", gridCoord.z)
 	roadClone:SetAttribute("TimePlaced", os.clock())
+	roadClone:SetAttribute("RoadAssetName", assetName)
 	roadClone:SetAttribute("YawBuilt", yawApplied)  -- <<< STICKY yaw
 	
 	-- if we just placed at (0,0), update the RoadStart transparency
@@ -782,7 +935,7 @@ end
 
 
 -- getIntersectionRotation
-function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification)
+function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification, ownerId)
 	-- --- safe local helpers (don’t collide with any globals you may already have)
 	local function _norm360(d) d = (d or 0) % 360; if d < 0 then d = d + 360 end; return d end
 	local function _iprint(...)
@@ -799,7 +952,7 @@ function RoadGeneratorModule.getIntersectionRotation(cellCoord, classification)
 		right = PathingModule.nodeKey({ x = cellCoord.x+1, z = cellCoord.z     }),
 	}
 
-	local adjacency = PathingModule.globalAdjacency
+	local adjacency = PathingModule.getAdjacencyForOwner(ownerId) or PathingModule.globalAdjacency
 	if not adjacency then
 		warn("getIntersectionRotation: adjacency data not found!")
 		return 0
@@ -1008,7 +1161,7 @@ local function placeStraightRoadDecorations(player, zoneFolder, placedRoadsData,
 					* CFrame.Angles(0, rotationY, 0)
 				toggle = not toggle
 
-				local decorationName = (math.random() < 0.5) and "Billboard" or "BillboardStanding"
+				local decorationName = "BillboardStanding"
 				local deco = BuildingMasterList.getBuildingByName(decorationName)
 				if deco and deco.stages and deco.stages.Stage3 then
 					local clone = deco.stages.Stage3:Clone()
@@ -1017,48 +1170,28 @@ local function placeStraightRoadDecorations(player, zoneFolder, placedRoadsData,
 					clone:SetAttribute("IsRoadDecoration", true)
 					clone:SetAttribute("GridX", cell.gridX)
 					clone:SetAttribute("GridZ", cell.gridZ)
-					
 
-				if clone:IsA("Model") and clone.PrimaryPart then
-					clone:SetPrimaryPartCFrame(decorationCF)
-				elseif clone:IsA("BasePart") then
-					clone.CFrame = decorationCF
-				end
-
-				for _, p in ipairs(clone:GetDescendants()) do
-					if p:IsA("BasePart") then
-						p.CanQuery = false
+					if clone:IsA("Model") and clone.PrimaryPart then
+						clone:SetPrimaryPartCFrame(decorationCF)
+					elseif clone:IsA("BasePart") then
+						clone.CFrame = decorationCF
 					end
-				end
-					
-					if decorationName == "Billboard" then
-						-- Alternate the lateral offset: one side +1.2, the other -1.2 (in LOCAL Z)
-						-- Decide side from which road-side offset we chose above
-						local sideSign
-						if     offset == eastWestOffsetA or offset == northSouthOffsetA then
-							sideSign =  1
-						else
-							sideSign = -1
-						end
 
-						if clone:IsA("Model") and clone.PrimaryPart then
-							-- Move in local space: down 1.5, then ±1.2 forward (model’s Z)
-							clone:SetPrimaryPartCFrame(clone:GetPrimaryPartCFrame() * CFrame.new(0, -1.5, 1.2 * sideSign))
-						elseif clone:IsA("BasePart") then
-							-- Same idea for a lone part
-							clone.CFrame = clone.CFrame * CFrame.new(0, -1.5, 1.2 * sideSign)
+					for _, p in ipairs(clone:GetDescendants()) do
+						if p:IsA("BasePart") then
+							p.CanQuery = false
 						end
 					end
 
-				clone.Parent = zoneFolder
-				attachRandomAd(clone)
-				debugPrint(
-					"[placeStraightRoadDecorations] Placed",
-					decorationName,
-					"at",
-					cell.gridX,
-					cell.gridZ
-				)
+					clone.Parent = zoneFolder
+					attachRandomAd(clone)
+					debugPrint(
+						"[placeStraightRoadDecorations] Placed",
+						decorationName,
+						"at",
+						cell.gridX,
+						cell.gridZ
+					)
 				else
 					warn("Missing model or Stage3 for decoration:", decorationName)
 				end
@@ -1074,6 +1207,33 @@ end
 function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder, opts)
 	opts = opts or {}
 	local SPAWN_INTERSECTION_DECOS = (opts.noDecorations ~= true)
+	if typeof(placedRoadsData) ~= "table" then
+		placedRoadsData = {}
+	end
+
+	local recalcRadius = tonumber(opts.recalcRadius)
+	if recalcRadius then
+		recalcRadius = math.max(1, math.floor(recalcRadius))
+	else
+		recalcRadius = 1
+	end
+
+	-- Axis directions for this plot (needed to mirror yaw on even plots)
+	local axisDirX, axisDirZ = 1, 1
+	if roadsFolder and roadsFolder.Parent then
+		axisDirX, axisDirZ = GridConfig.getAxisDirectionsForPlot(roadsFolder.Parent)
+	end
+
+	local ownerId = opts.ownerId
+	if not ownerId and roadsFolder and roadsFolder.Parent then
+		local match = tostring(roadsFolder.Parent.Name):match("Plot_(%d+)")
+		if match then ownerId = tonumber(match) end
+	end
+	if not ownerId and zoneId then
+		local match = tostring(zoneId):match("_(%d+)_") or tostring(zoneId):match("_(%d+)$")
+		if match then ownerId = tonumber(match) end
+	end
+	local adjacency = PathingModule.getAdjacencyForOwner(ownerId) or PathingModule.globalAdjacency
 
 	----------------------------------------------------------------------
 	-- Index existing road-ish objects (visible pieces) by cell
@@ -1219,7 +1379,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	-- Optional: adjacency flags (kept for parity with your debug paths)
 	----------------------------------------------------------------------
 	local function neighborFlagsFromAdjacency(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey   = PathingModule.nodeKey(cellCoord)
 		local neighborKeys = adjacency and adjacency[cellKey] or {}
 		local upKey    = PathingModule.nodeKey({ x = cellCoord.x,   z = cellCoord.z - 1 })
@@ -1235,7 +1394,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	end
 
 	local function flagsPreferAdj(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey = PathingModule.nodeKey(cellCoord)
 		if adjacency and adjacency[cellKey] then
 			return neighborFlagsFromAdjacency(cellCoord), "adj"
@@ -1327,6 +1485,7 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 		clone:SetAttribute("GridX",      cellCoord.x)
 		clone:SetAttribute("GridZ",      cellCoord.z)
 		clone:SetAttribute("TimePlaced", oldTime)
+		clone:SetAttribute("RoadAssetName", newRoadName)
 
 		local parentFolder = roadsFolder:FindFirstChild(oldZoneId) or roadsFolder
 		clone.Parent = parentFolder
@@ -1340,8 +1499,13 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 		end
 
 		local chosenYaw = customRotation
-		if chosenYaw == nil and prevYaw ~= nil then chosenYaw = prevYaw end
-		chosenYaw = _applyOffset(newRoadName, chosenYaw or 0)
+		if chosenYaw == nil then
+			if prevYaw ~= nil then chosenYaw = prevYaw end
+			chosenYaw = _applyOffset(newRoadName, chosenYaw or 0)
+			chosenYaw = _adjustYawForAxis(chosenYaw, axisDirX, axisDirZ)
+		else
+			chosenYaw = norm360(chosenYaw)
+		end
 
 		if clone:IsA("Model") and clone.PrimaryPart then
 			clone:SetPrimaryPartCFrame(CFrame.new(oldPos) * CFrame.Angles(0, math.rad(chosenYaw), 0))
@@ -1399,7 +1563,6 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	-- neighbor flags source (visible preferred unless adjacency present)
 	----------------------------------------------------------------------
 	local function flagsForCell(cellCoord)
-		local adjacency = PathingModule.globalAdjacency
 		local cellKey = PathingModule.nodeKey(cellCoord)
 		if adjacency and adjacency[cellKey] then
 			local f = neighborFlagsFromAdjacency(cellCoord)
@@ -1413,19 +1576,23 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 	----------------------------------------------------------------------
 	-- 1) Expand cells to check
 	----------------------------------------------------------------------
-	local cellsToCheck = {}
+	local unique, finalCellsToCheck = {}, {}
+	local function addCell(x, z)
+		local key = string.format("%d_%d", x, z)
+		if unique[key] then return end
+		unique[key] = true
+		table.insert(finalCellsToCheck, { x = x, z = z })
+	end
+
 	for _, cellInfo in ipairs(placedRoadsData) do
 		local gx, gz = cellInfo.gridX, cellInfo.gridZ
-		table.insert(cellsToCheck, { x = gx,   z = gz   })
-		table.insert(cellsToCheck, { x = gx+1, z = gz   })
-		table.insert(cellsToCheck, { x = gx-1, z = gz   })
-		table.insert(cellsToCheck, { x = gx,   z = gz+1 })
-		table.insert(cellsToCheck, { x = gx,   z = gz-1 })
-	end
-	local unique, finalCellsToCheck = {}, {}
-	for _, c in ipairs(cellsToCheck) do
-		local key = string.format("%d_%d", c.x, c.z)
-		if not unique[key] then unique[key] = true; table.insert(finalCellsToCheck, c) end
+		if gx and gz then
+			for dx = -recalcRadius, recalcRadius do
+				for dz = -recalcRadius, recalcRadius do
+					addCell(gx + dx, gz + dz)
+				end
+			end
+		end
 	end
 
 	----------------------------------------------------------------------
@@ -1453,6 +1620,7 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 		if kind == "3Way" or kind == "4Way" or kind == "Turn" then
 			local rotFromVis = (kind == "4Way") and 0 or rotationFromFlags(kind, flags)
 			local finalYaw   = _applyOffset(kind, rotFromVis)
+			finalYaw = _adjustYawForAxis(finalYaw, axisDirX, axisDirZ)
 
 			if newestPart.Name ~= kind then
 				-- If we are moving AWAY from 4Way, clear any leftover intersection decos.
@@ -1541,8 +1709,10 @@ function RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsF
 				finalYaw = norm360(newestPrevYaw)
 			end
 			finalYaw = _applyOffset(newestPart.Name or "Road", finalYaw)
+			finalYaw = _adjustYawForAxis(finalYaw, axisDirX, axisDirZ)
 
-			if newestPart.Name ~= "Road" then
+			-- Keep bridges as bridges when the cell classifies as straight; only swap other non-straight pieces.
+			if newestPart.Name ~= "Road" and newestPart.Name ~= "Bridge" then
 				newestPart = swapRoadModel(newestPart, "Road", cellCoord, finalYaw)
 			else
 				if newestPart:IsA("Model") and newestPart.PrimaryPart then
@@ -1580,14 +1750,15 @@ end
 
 
 -- populateZone
-function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedRoads)
+function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predefinedRoads, rotation, skipStages, isReload)
 	task.spawn(function()
+		local isFastReload = isReload == true
 		local _roadReserve = nil
 		-- ===== pre-populate guards / cleanup =====================================
 		ZoneTrackerModule.setZonePopulating(player, zoneId, true)
 		-- Reserve the footprint so we can safely coexist with power/others (roads only block roads)
 		local _roadReserve = select(1, GridUtils.reserveArea(player, zoneId, "road", gridList, { ttl = 20.0 }))
-		if not _roadReserve then
+		if not _roadReserve and not isFastReload then
 			-- One gentle retry after transient in-flight work clears
 			local tries = 0
 			while tries < 5 do
@@ -1701,7 +1872,8 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 
 		if predefinedRoads then
 			for _, rData in ipairs(predefinedRoads) do
-				local selectedAsset = BuildingMasterList.getBuildingByName(rData.roadName)
+				local roadName = inferBridgeAwareRoadName(player, rData.gridX, rData.gridZ, rData.roadName)
+				local selectedAsset = BuildingMasterList.getBuildingByName(roadName)
 				if selectedAsset then
 					RoadGeneratorModule.generateRoadSegment(
 						terrain, zoneFolder, player, zoneId, mode,
@@ -1709,7 +1881,7 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 						selectedAsset, rData.rotation, onRoadPlaced
 					)
 					table.insert(placedRoadsData, {
-						roadName = rData.roadName, rotation = rData.rotation,
+						roadName = roadName, rotation = rData.rotation,
 						gridX    = rData.gridX,    gridZ    = rData.gridZ
 					})
 				else
@@ -1720,6 +1892,9 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 		else
 			-- Road / Bridge state machine
 			local bridging = false
+			local function needsBridge(supportType)
+				return supportType == "Cliff" or supportType == "Water" or supportType == "Void"
+			end
 
 			for i, cell in ipairs(gridList) do
 				-- Roads are allowed to overlap overlays/utilities; only block on non-utility conflicts.
@@ -1742,18 +1917,15 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 				local support = getSupportTypeForCell(probe)
 				probe:Destroy()
 
-				-- 2) Choose asset & toggle bridging
-				local asset = forcedRoad
-				if not bridging then
-					if support == "Cliff" and bridgeAsset then
-						bridging, asset = true, bridgeAsset
-					end
-				else
-					if support == "Cliff" then
-						asset, bridging = bridgeAsset, false -- tail
-					else
-						asset = bridgeAsset                  -- mid-span
-					end
+				-- 2) Choose asset & toggle bridging based on terrain support
+				local spanCell = needsBridge(support)
+				if not bridging and spanCell and bridgeAsset then
+					bridging = true
+				end
+
+				local asset = (bridging and bridgeAsset) or forcedRoad
+				if bridging and not spanCell then
+					bridging = false -- first land cell after a span gets the tail piece
 				end
 
 				-- 3) Compute rotation
@@ -1778,7 +1950,9 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 					gridZ    = cell.z
 				})
 
-				task.wait(BUILD_INTERVAL)
+				if not isFastReload then
+					task.wait(BUILD_INTERVAL)
+				end
 			end
 		end
 
@@ -1790,10 +1964,12 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 			for _, rData in ipairs(placedRoadsData) do
 				coordsForAdj[#coordsForAdj+1] = { x = rData.gridX, z = rData.gridZ }
 			end
-			PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj])
+			PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj], player and player.UserId)
 		end
 
-		RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder)
+		RoadGeneratorModule.updateIntersections(zoneId, placedRoadsData, roadsFolder, {
+			recalcRadius = INTERSECTION_RESCAN_RADIUS,
+		})
 		pcall(function()
 			placeStraightRoadDecorations(player, zoneFolder, placedRoadsData, zoneId)
 		end)
@@ -1813,7 +1989,7 @@ function RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, predef
 end
 
 
-function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation)
+function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList, saved, rotation, isReload)
 	normalizeLegacyEvenPlotData(player, gridList, saved)
 	-- Case A: full snapshot
 	if typeof(saved) == "table" and saved.segments and #saved.segments > 0 then
@@ -1821,106 +1997,132 @@ function RoadGeneratorModule.populateZoneFromSave(player, zoneId, mode, gridList
 	end
 	-- Case B: legacy "placedRoadsData" list
 	if typeof(saved) == "table" and #saved > 0 and saved[1].gridX then
-		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved)
+		return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, saved, rotation, true, isReload)
 	end
 	-- Fallback: procedural
-	return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil)
+	return RoadGeneratorModule.populateZone(player, zoneId, mode, gridList, nil, rotation, true, isReload)
 end
 
 function RoadGeneratorModule.recalculateIntersectionsForPlot(player, zoneWhitelist)  -- zoneWhitelist: array of zoneIds or nil
-	print(("[RoadFix] Re-calculating intersections for %s"):format(player.Name))
+	local uid = player and player.UserId
+	if not uid then return end
+	if _recalcIntersectionsInProgress[uid] then
+		_recalcIntersectionsPending[uid] = true
+		return
+	end
+	_recalcIntersectionsInProgress[uid] = true
 
-	local function _norm360(d) d = (tonumber(d) or 0) % 360; if d < 0 then d = d + 360 end; return d end
-	local function _dprint(...)
+	repeat
+		_recalcIntersectionsPending[uid] = nil
+
 		if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
-			print("[RoadFix][Recalc]", ...)
+			print(('[RoadFix] Re-calculating intersections for %s'):format(player.Name))
 		end
-	end
 
-	local plot = Workspace.PlayerPlots:FindFirstChild("Plot_" .. player.UserId)
-	if not plot then
-		_dprint("No plot for player.")
-		return
-	end
-
-	local roadsFolder = plot:FindFirstChild("Roads")
-	if not roadsFolder then
-		_dprint("No Roads folder.")
-		return
-	end
-	
-	local allowed = nil
-	if typeof(zoneWhitelist) == "table" then
-		allowed = {}
-		for _, z in ipairs(zoneWhitelist) do allowed[z] = true end
-	end
-	
-	-- Build a synthetic placedRoadsData table from *visible road pieces only*
-	local placedRoadsData = {}
-	local nScanned, nAdded, nSkipped = 0, 0, 0
-
-	for _, obj in ipairs(roadsFolder:GetDescendants()) do
-		if obj:IsA("Model") or obj:IsA("BasePart") then
-			nScanned += 1
-
-			-- Skip decorations; they carry GridX/Z but shouldn't drive intersections
-			if obj:GetAttribute("IsRoadDecoration") == true then
-				nSkipped += 1
-				continue
+		local function _norm360(d) d = (tonumber(d) or 0) % 360; if d < 0 then d = d + 360 end; return d end
+		local function _dprint(...)
+			if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
+				print('[RoadFix][Recalc]', ...)
 			end
-			
-			if allowed then
-				local zid = obj:GetAttribute("ZoneId")
-				if not (zid and allowed[zid]) then
+		end
+
+		local plot = Workspace.PlayerPlots:FindFirstChild('Plot_' .. uid)
+		if not plot then
+			_dprint('No plot for player.')
+			break
+		end
+
+		local roadsFolder = plot:FindFirstChild('Roads')
+		if not roadsFolder then
+			_dprint('No Roads folder.')
+			break
+		end
+		
+		local allowed = nil
+		if typeof(zoneWhitelist) == 'table' then
+			allowed = {}
+			for _, z in ipairs(zoneWhitelist) do allowed[z] = true end
+		end
+		
+		-- Build a synthetic placedRoadsData table from *visible road pieces only*
+		local placedRoadsData = {}
+		local nScanned, nAdded, nSkipped = 0, 0, 0
+
+		for _, obj in ipairs(roadsFolder:GetDescendants()) do
+			if obj:IsA('Model') or obj:IsA('BasePart') then
+				nScanned += 1
+
+				-- Skip decorations; they carry GridX/Z but shouldn't drive intersections
+				if obj:GetAttribute('IsRoadDecoration') == true then
 					nSkipped += 1
 					continue
 				end
-			end
-
-
-			local gx, gz = obj:GetAttribute("GridX"), obj:GetAttribute("GridZ")
-			if gx and gz then
-				-- Prefer sticky yaw; fall back to live orientation
-				local yaw = obj:GetAttribute("YawBuilt")
-				if yaw == nil then
-					if obj:IsA("Model") and obj.PrimaryPart then
-						yaw = obj.PrimaryPart.Orientation.Y
-					elseif obj:IsA("BasePart") then
-						yaw = obj.Orientation.Y
-					else
-						yaw = 0
+				
+				if allowed then
+					local zid = obj:GetAttribute('ZoneId')
+					if not (zid and allowed[zid]) then
+						nSkipped += 1
+						continue
 					end
 				end
-				yaw = _norm360(yaw)
 
-				table.insert(placedRoadsData, {
-					roadName = obj.Name,  -- "Road","Bridge","Turn","3Way","4Way"
-					rotation = yaw,
-					gridX    = gx,
-					gridZ    = gz,
-				})
-				nAdded += 1
-			else
-				nSkipped += 1
+
+				local gx, gz = obj:GetAttribute('GridX'), obj:GetAttribute('GridZ')
+				if gx and gz then
+					-- Prefer sticky yaw; fall back to live orientation
+					local yaw = obj:GetAttribute('YawBuilt')
+					if yaw == nil then
+						if obj:IsA('Model') and obj.PrimaryPart then
+							yaw = obj.PrimaryPart.Orientation.Y
+						elseif obj:IsA('BasePart') then
+							yaw = obj.Orientation.Y
+						else
+							yaw = 0
+						end
+					end
+					yaw = _norm360(yaw)
+
+					local roadAssetName = inferBridgeAwareRoadName(
+						player,
+						gx,
+						gz,
+						obj:GetAttribute('RoadAssetName') or obj.Name
+					)
+
+					table.insert(placedRoadsData, {
+						roadName = roadAssetName,  -- "Road","Bridge","Turn","3Way","4Way"
+						rotation = yaw,
+						gridX    = gx,
+						gridZ    = gz,
+					})
+					nAdded += 1
+				else
+					nSkipped += 1
+				end
+			end
+
+			if (nScanned % 300) == 0 then
+				task.wait()
 			end
 		end
-	end
 
-	if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
-		_dprint(string.format("Scanned=%d  Added=%d  Skipped=%d", nScanned, nAdded, nSkipped))
-	end
+		if DEBUG_LOGS or DEBUG_ROAD_ROTATION then
+			_dprint(string.format('Scanned=%d  Added=%d  Skipped=%d', nScanned, nAdded, nSkipped))
+		end
 
-	-- Nothing left → nothing to do
-	if #placedRoadsData == 0 then
-		_dprint("No road cells found; aborting.")
-		return
-	end
+		-- Nothing left -- nothing to do
+		if #placedRoadsData == 0 then
+			_dprint('No road cells found; aborting.')
+			break
+		end
 
-	-- Run the existing intersection logic against the reconstructed data.
-	-- We pass nil for zoneId; swapRoadModel will pull ZoneId from each part as needed.
-	RoadGeneratorModule.updateIntersections(nil, placedRoadsData, roadsFolder)
+		-- Run the existing intersection logic against the reconstructed data.
+		-- We pass nil for zoneId; swapRoadModel will pull ZoneId from each part as needed.
+		RoadGeneratorModule.updateIntersections(nil, placedRoadsData, roadsFolder)
+	until not _recalcIntersectionsPending[uid]
+
+	_recalcIntersectionsInProgress[uid] = nil
 end
-
 
 -- Capture a precise snapshot of what exists for this zone (visible piece per cell + decos)
 function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)
@@ -1956,7 +2158,9 @@ function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)
 	end
 	for _, rec in pairs(latest) do
 		local obj = rec.inst
-		-- Prefer sticky yaw if present; it’s what you wrote at place time
+		local gx  = obj:GetAttribute("GridX")
+		local gz  = obj:GetAttribute("GridZ")
+		-- Prefer sticky yaw if present; keep the built yaw
 		local rot = tonumber(obj:GetAttribute("YawBuilt"))
 		if rot == nil then
 			if obj:IsA("Model") and obj.PrimaryPart then
@@ -1967,10 +2171,16 @@ function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)
 				rot = 0
 			end
 		end
+		local roadAssetName = inferBridgeAwareRoadName(
+			player,
+			gx,
+			gz,
+			obj:GetAttribute("RoadAssetName") or obj.Name
+		)
 		table.insert(snapshot.segments, {
-			gridX = obj:GetAttribute("GridX"),
-			gridZ = obj:GetAttribute("GridZ"),
-			roadName = obj.Name,                -- "Road","Bridge","Turn","3Way","4Way"
+			gridX = gx,
+			gridZ = gz,
+			roadName = roadAssetName,           -- "Road","Bridge","Turn","3Way","4Way"
 			rotation = rot,
 			timePlaced = rec.time,
 		})
@@ -2001,8 +2211,9 @@ function RoadGeneratorModule.captureRoadZoneSnapshot(player, zoneId)
 						localPos={x=lp.X,y=lp.Y,z=lp.Z}, localYaw=lyaw,
 					})
 				elseif (obj.Name == "BillboardStanding" or obj.Name == "Billboard") then
+					local modelName = (obj.Name == "Billboard") and "BillboardStanding" or obj.Name
 					table.insert(snapshot.strDecos, {
-						gridX = gx, gridZ = gz, modelName = obj.Name,  -- << keep the real model name
+						gridX = gx, gridZ = gz, modelName = modelName,
 						localPos = { x = lp.X, y = lp.Y, z = lp.Z }, localYaw = lyaw,
 						adName = obj:GetAttribute("AdName"),
 					})
@@ -2110,6 +2321,7 @@ function RoadGeneratorModule.regenerateRoadSegment(player, zoneId, mode, segData
 	modelOrPart:SetAttribute("GridX", segData.gridX)
 	modelOrPart:SetAttribute("GridZ", segData.gridZ)
 	modelOrPart:SetAttribute("TimePlaced", segData.timePlaced or os.clock())
+	modelOrPart:SetAttribute("RoadAssetName", segData.roadName)
 	modelOrPart:SetAttribute("YawBuilt", yawApply)  -- <<< sticky yaw for future salvage
 	
 	-- handle origin during replay-from-save, too
@@ -2188,12 +2400,15 @@ function RoadGeneratorModule.recreateStraightDecoration(player, zoneId, hostRota
 	local roadsFolder = plot:FindFirstChild("Roads"); if not roadsFolder then return end
 	local zoneFolder  = roadsFolder:FindFirstChild(zoneId); if not zoneFolder then return end
 
-	local asset = BuildingMasterList.getBuildingByName(d.modelName)
+	local requestedName = d and d.modelName or "BillboardStanding"
+	local modelName = (requestedName == "Billboard") and "BillboardStanding" or requestedName
+
+	local asset = BuildingMasterList.getBuildingByName(modelName)
 	if asset and not (asset.stages and asset.stages.Stage3) then
-		asset.stages = BuildingMasterList.loadBuildingStages("Road","Default",d.modelName)
+		asset.stages = BuildingMasterList.loadBuildingStages("Road","Default", modelName)
 	end
 	if not (asset and asset.stages and asset.stages.Stage3) then
-		warn("[recreateStraightDecoration] Missing asset:", d.modelName); return
+		warn("[recreateStraightDecoration] Missing asset:", modelName); return
 	end
 
 	local hostCF  = _baseCellCF(player, d.gridX, d.gridZ, hostRotation or 0)
@@ -2202,7 +2417,7 @@ function RoadGeneratorModule.recreateStraightDecoration(player, zoneId, hostRota
 	local finalCF = _applyLocal(hostCF, localCF)
 
 	local clone = asset.stages.Stage3:Clone()
-	clone.Name = d.modelName
+	clone.Name = modelName
 	clone:SetAttribute("ZoneId", zoneId)
 	clone:SetAttribute("IsRoadDecoration", true)
 	clone:SetAttribute("GridX", d.gridX)
@@ -2323,8 +2538,9 @@ function RoadGeneratorModule.recreateZoneExact(player, zoneId, mode, snapshot)
 	table.clear(hostYawByCell)
 	for _, seg in ipairs(snapshot.segments) do
 		local yawRecorded = _norm360(tonumber(seg.rotation) or 0)  -- world yaw we captured
+		local resolvedName = inferBridgeAwareRoadName(player, seg.gridX, seg.gridZ, seg.roadName)
 		local s = {
-			roadName = seg.roadName,
+			roadName = resolvedName,
 			rotation = yawRecorded,
 			gridX    = seg.gridX,
 			gridZ    = seg.gridZ,
@@ -2339,7 +2555,7 @@ function RoadGeneratorModule.recreateZoneExact(player, zoneId, mode, snapshot)
 
 	-- ===== 2) Register with pathing so adjacency matches the exact layout =======
 	if #coordsForAdj > 0 then
-		PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj])
+		PathingModule.registerRoad(zoneId, mode, coordsForAdj, coordsForAdj[1], coordsForAdj[#coordsForAdj], player and player.UserId)
 	end
 
 	-- ===== 3) Recreate intersection decorations ================================
@@ -2362,9 +2578,10 @@ function RoadGeneratorModule.recreateZoneExact(player, zoneId, mode, snapshot)
 			if roadsFolder then
 				local placed = {}
 				for _, seg in ipairs(snapshot.segments) do
-					local yawApplied = _applyOffset(seg.roadName or "Road", seg.rotation or 0)
+					local roadName = inferBridgeAwareRoadName(player, seg.gridX, seg.gridZ, seg.roadName)
+					local yawApplied = _applyOffset(roadName or "Road", seg.rotation or 0)
 					placed[#placed+1] = {
-						roadName = seg.roadName,
+						roadName = roadName,
 						rotation = yawApplied, -- feed the applied yaw
 						gridX    = seg.gridX,
 						gridZ    = seg.gridZ,
@@ -2402,8 +2619,15 @@ function RoadGeneratorModule.removeRoad(player, zoneId)
 	local zoneFolder = roadsFolder:FindFirstChild(zoneId)
 	if not zoneFolder then return end
 
+	-- If the road zone still exists in the tracker (e.g., a reload/recreate pass),
+	-- skip any refill fallback because the road is coming back right away.
+	local roadZoneStillExists = ZoneTrackerModule.getZoneById(player, zoneId) ~= nil
+
 	-- Optional: track cells we truly removed (in case you want a localized recalc)
 	-- local removedCells = {}
+	-- Track any underlying buildable zones touched by this road so we can refill
+	-- them if there were no stored suppressions to restore (common after a reload).
+	local impactedZones = {}  -- [zoneId] = { mode = ..., seeds = { ["x|z"]=true } }
 
 	for _, child in ipairs(zoneFolder:GetChildren()) do
 		if (child:IsA("Model") or child:IsA("BasePart"))
@@ -2436,6 +2660,20 @@ function RoadGeneratorModule.removeRoad(player, zoneId)
 			local gz = tonumber(child:GetAttribute("GridZ"))
 
 			if gx and gz then
+				-- Remember which underlying buildable zones this road covered.
+				local underlyingZoneId = ZoneTrackerModule.getOtherZoneIdAtGrid(player, gx, gz, zoneId)
+				if underlyingZoneId then
+					local oz = ZoneTrackerModule.getZoneById(player, underlyingZoneId)
+					if oz and SUPPRESSIBLE[oz.mode] then
+						local bucket = impactedZones[underlyingZoneId]
+						if not bucket then
+							bucket = { mode = oz.mode, seeds = {} }
+							impactedZones[underlyingZoneId] = bucket
+						end
+						bucket.seeds[string.format("%d|%d", gx, gz)] = true
+					end
+				end
+
 				local occId = ("%s_road_%d_%d"):format(zoneId, gx, gz)
 
 				-- (optional) If you maintain a quadtree remove API, do it here:
@@ -2475,7 +2713,7 @@ function RoadGeneratorModule.removeRoad(player, zoneId)
 
 	-- Restore layers removed during road placement
 	LayerManagerModule.restoreRemovedObjects(player, zoneId, "NatureZones", "NatureZones")
-	LayerManagerModule.restoreRemovedObjects(player, zoneId, "Buildings",   "Buildings")
+	local restoredBuildings = LayerManagerModule.restoreRemovedObjects(player, zoneId, "Buildings",   "Buildings")
 
 	-- NEW: restore suppressed power poles for this road and rebuild ropes
 	LayerManagerModule.restoreRemovedObjects(player, zoneId, "PowerLines",  "PowerLines")
@@ -2485,6 +2723,44 @@ function RoadGeneratorModule.removeRoad(player, zoneId)
 		-- fallback: rebuild all ropes if the targeted helper isn't available
 		if PowerGeneratorModule2 and PowerGeneratorModule2.rebuildRopesForAll then
 			PowerGeneratorModule2.rebuildRopesForAll(player)
+		end
+	end
+
+	-- If there was nothing cached to restore (e.g., after a reload) and the road is
+	-- actually being removed, ask the building generator to refill the uncovered gaps.
+	if not roadZoneStillExists
+		and restoredBuildings == 0
+		and BuildingGeneratorModule
+		and type(BuildingGeneratorModule._refillZoneGaps) == "function"
+	then
+		for targetZoneId, info in pairs(impactedZones) do
+			if info and info.mode and info.seeds and next(info.seeds) then
+				local seeds = {}
+				for key in pairs(info.seeds) do
+					local sep = string.find(key, "|", 1, true)
+					if sep then
+						local sx = tonumber(string.sub(key, 1, sep - 1))
+						local sz = tonumber(string.sub(key, sep + 1))
+						if sx and sz then
+							table.insert(seeds, { x = sx, z = sz })
+						end
+					end
+				end
+				if #seeds > 0 then
+					task.defer(function()
+						BuildingGeneratorModule._refillZoneGaps(
+							player,
+							targetZoneId,
+							info.mode,
+							nil, -- wealthOverride
+							nil, -- rotation
+							nil, -- styleOverride
+							nil, -- refillSourceZoneId (road gone; these are permanent refills)
+							seeds
+						)
+					end)
+				end
+			end
 		end
 	end
 	

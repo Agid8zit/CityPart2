@@ -53,6 +53,13 @@ local TUNNEL1_PATH = ReplicatedStorage
 	:WaitForChild("FuncTestGroundRS").Buildings.Individual.Default.Metro
 	:WaitForChild("MetroTunnel")
 
+local function yieldEveryN(counter: number, interval: number?)
+	interval = interval or 150
+	if interval > 0 and counter % interval == 0 then
+		task.wait()
+	end
+end
+
 ---------------------------------------------------------------------
 --  Global-bounds cache per plot (same pattern as pipes)
 ---------------------------------------------------------------------
@@ -96,6 +103,7 @@ end
 
 -- Idempotent per-zone pre-clear: remove visuals + zone/quad occupancy for this zone only
 local function _clearZoneFolderAndFootprint(player, zoneId, zoneFolder)
+	local cleared = 0
 	for _, child in ipairs(zoneFolder:GetChildren()) do
 		local gx   = tonumber(child:GetAttribute("GridX"))
 		local gz   = tonumber(child:GetAttribute("GridZ"))
@@ -109,6 +117,8 @@ local function _clearZoneFolderAndFootprint(player, zoneId, zoneFolder)
 			end
 		end
 		child:Destroy()
+		cleared += 1
+		yieldEveryN(cleared, 200)
 	end
 end
 
@@ -189,7 +199,7 @@ end)
 --  Public: generateMetro – overlay-friendly, idempotent per zone
 --  pathCoords: array of {x=int, z=int}
 ---------------------------------------------------------------------
-function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoords)
+function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoords, isReload)
 	-- Validate / locate plot
 	local myPlot = plots and plots:FindFirstChild("Plot_" .. _uid(player))
 	if not myPlot then return end
@@ -299,7 +309,9 @@ function MetroTunnelGeneratorModule.generateMetro(player, zoneId, mode, pathCoor
 			end
 
 			_releaseHandle(handle)
-			task.wait(BUILD_INTERVAL)
+			if not isReload then
+				task.wait(BUILD_INTERVAL)
+			end
 		end
 	end
 
